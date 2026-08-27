@@ -61,9 +61,11 @@ PLAYERBOT_OVERLAY="$REPO_ROOT/linux-port/overlays/playerbot"
 PLAYERBOT_SRC="$PLAYERBOT_OVERLAY/src/game/src"
 PLAYERBOT_CORE_PATCH="$PLAYERBOT_OVERLAY/patches/0001-core-integration.patch"
 PLAYERBOT_ECONOMY_PATCH="$PLAYERBOT_OVERLAY/patches/0002-economy-yang-x5.patch"
+PLAYERBOT_LOG_PATCH="$PLAYERBOT_OVERLAY/patches/0003-suppress-refine-find-log.patch"
 PLAYERBOT_SEED_GENERATOR="$PLAYERBOT_OVERLAY/tools/generate_seed.py"
 PLAYERBOT_SEED="$PLAYERBOT_OVERLAY/sql/playerbots_seed.sql"
 PLAYERBOT_MIGRATOR="$HERE/mariadb/playerbot/apply.sh"
+PLAYERBOT_M3_DROPS="$PLAYERBOT_OVERLAY/serverfiles/mob_drop_item.m3.append.txt"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -95,9 +97,11 @@ for p in \
   "$PLAYERBOT_SRC/playerbot_manager.h" \
   "$PLAYERBOT_CORE_PATCH" \
   "$PLAYERBOT_ECONOMY_PATCH" \
+  "$PLAYERBOT_LOG_PATCH" \
   "$PLAYERBOT_SEED_GENERATOR" \
   "$PLAYERBOT_SEED" \
-  "$PLAYERBOT_MIGRATOR"
+  "$PLAYERBOT_MIGRATOR" \
+  "$PLAYERBOT_M3_DROPS"
 do
   [ -s "$p" ] || die "Playerbot overlay input is missing or empty: $p"
 done
@@ -158,9 +162,14 @@ if ! (cd "$GAME_CTX/server" && \
       patch --batch --forward --fuzz=0 -p1 --dry-run < "$PLAYERBOT_ECONOMY_PATCH"); then
   die "the Playerbot economy patch does not apply cleanly to the staged port source"
 fi
+if ! (cd "$GAME_CTX/server" && \
+      patch --batch --forward --fuzz=0 -p1 --dry-run < "$PLAYERBOT_LOG_PATCH"); then
+  die "the Playerbot log-noise patch does not apply cleanly to the staged port source"
+fi
 (cd "$GAME_CTX/server" && \
   patch --batch --forward --fuzz=0 -p1 < "$PLAYERBOT_CORE_PATCH" && \
-  patch --batch --forward --fuzz=0 -p1 < "$PLAYERBOT_ECONOMY_PATCH") \
+  patch --batch --forward --fuzz=0 -p1 < "$PLAYERBOT_ECONOMY_PATCH" && \
+  patch --batch --forward --fuzz=0 -p1 < "$PLAYERBOT_LOG_PATCH") \
   || die "the Playerbot source overlay could not be applied"
 
 cp -a "$PLAYERBOT_SRC/playerbot_manager.cpp" "$GAME_CTX/server/game/src/playerbot_manager.cpp"
@@ -184,12 +193,13 @@ cmp -s "$PLAYERBOT_SRC/playerbot_manager.h" "$GAME_CTX/server/game/src/playerbot
 {
   printf 'core_patch=%s\n' "$(git hash-object "$PLAYERBOT_CORE_PATCH")"
   printf 'economy_patch=%s\n' "$(git hash-object "$PLAYERBOT_ECONOMY_PATCH")"
+  printf 'log_patch=%s\n' "$(git hash-object "$PLAYERBOT_LOG_PATCH")"
   printf 'manager_cpp=%s\n' "$(git hash-object "$PLAYERBOT_SRC/playerbot_manager.cpp")"
   printf 'manager_h=%s\n' "$(git hash-object "$PLAYERBOT_SRC/playerbot_manager.h")"
   printf 'seed_generator=%s\n' "$(git hash-object "$PLAYERBOT_SEED_GENERATOR")"
   printf 'seed_sql=%s\n' "$(git hash-object "$PLAYERBOT_SEED")"
 } > "$GAME_CTX/.playerbot-overlay"
-info "core integration, manager sources and 5x Yang economy adjustment staged"
+info "core integration, manager sources, 5x Yang economy and quiet refine lookup staged"
 
 # The regression that must be present. Checked here as well as in the
 # Dockerfile so that a bad context is caught before a 10-minute build.
@@ -205,6 +215,9 @@ for d in conf data locale package; do
   cp -a "$RUNTIME_SRC/share/$d" "$GAME_CTX/serverfiles/share/$d"
   info "share/$d  $(du -sh "$GAME_CTX/serverfiles/share/$d" | cut -f1)"
 done
+
+cp -a "$PLAYERBOT_M3_DROPS" "$HERE/game/mob_drop_item.m3.append.txt"
+info "M3/Waryong level-30 weapon and level-21 shield drop overlay staged"
 
 # share/bin is deliberately NOT copied. The binaries in the image come from the
 # builder stage; the tree also still carries the original FreeBSD game.freebsd
@@ -259,6 +272,14 @@ cp -a "$PANEL_SRC/admin_panel.py" "$HERE/panel/app/"
 for f in items.json favicon.png; do
   [ -f "$PANEL_SRC/$f" ] && cp -a "$PANEL_SRC/$f" "$HERE/panel/app/" && info "$f"
 done
+# The live map's Polish mode uses the complete server locale rather than a
+# partial hand-maintained dictionary.  Keep this optional for custom source
+# trees that genuinely do not ship Polish, in which case the panel falls back
+# to its small built-in family translator.
+if [ -f "$RUNTIME_SRC/share/conf/item_names_pl.txt" ]; then
+  cp -a "$RUNTIME_SRC/share/conf/item_names_pl.txt" "$HERE/panel/app/"
+  info "item_names_pl.txt"
+fi
 # The version, and the changelog that explains it. Both are plain text and both
 # are read by the panel at runtime: VERSION is what it reports and what it
 # compares against the published one, CHANGELOG.md is what its patch log shows
