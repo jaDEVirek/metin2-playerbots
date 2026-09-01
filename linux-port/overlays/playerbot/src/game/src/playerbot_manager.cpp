@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "playerbot_manager.h"
+#include "playerbot_world_rules.h"
 
 #include "char.h"
 #include "char_manager.h"
@@ -7,6 +8,7 @@
 #include "desc.h"
 #include "desc_client.h"
 #include "desc_manager.h"
+#include "db.h"
 #include "event.h"
 #include "input.h"
 #include "item.h"
@@ -28,6 +30,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <climits>
+#include <cstdio>
+#include <cstring>
 
 extern int passes_per_sec;
 
@@ -35,6 +39,9 @@ namespace
 {
 	const int PLAYERBOT_SEARCH_RANGE = 6000;
 	const size_t PLAYERBOT_TARGET_CHOICE_WINDOW = 16;
+	// Ordinary grinders chain into a nearby free pack before considering a
+	// distant high-score target. Claims still spread a crowd over different mobs.
+	const int PLAYERBOT_LOCAL_CHAIN_RANGE = 2500;
 	const int PLAYERBOT_MELEE_RANGE = 250;
 	const int PLAYERBOT_MELEE_SPLASH_RANGE = 300;
 	const size_t PLAYERBOT_MAX_MELEE_TARGETS = 4;
@@ -47,6 +54,20 @@ namespace
 	const DWORD PLAYERBOT_LOOT_VISIBLE_DELAY_MAX = 1800;
 	const DWORD PLAYERBOT_LOOT_PICKUP_INTERVAL_MIN = 450;
 	const DWORD PLAYERBOT_LOOT_PICKUP_INTERVAL_MAX = 850;
+	// A combat pickup is a cheap-looking action but an expensive query: Metin2's
+	// ForEachAround snapshots every entity in nine neighbouring sectrees before
+	// the callback can apply the 3 m pickup radius.  Throttle empty scans as well
+	// as successful pickups, otherwise hundreds of fighting bots repeat the same
+	// work several thousand times per second.
+	const DWORD PLAYERBOT_COMBAT_LOOT_SCAN_INTERVAL_MIN = 750;
+	const DWORD PLAYERBOT_COMBAT_LOOT_SCAN_INTERVAL_MAX = 1000;
+	const DWORD PLAYERBOT_EMPTY_LOOT_SCAN_INTERVAL_MIN = 750;
+	const DWORD PLAYERBOT_EMPTY_LOOT_SCAN_INTERVAL_MAX = 1000;
+	const DWORD PLAYERBOT_LOOT_THREAT_SCAN_INTERVAL_MIN = 900;
+	const DWORD PLAYERBOT_LOOT_THREAT_SCAN_INTERVAL_MAX = 1300;
+	const DWORD PLAYERBOT_LOOT_CLEANUP_INTERVAL = 10000;
+	const DWORD PLAYERBOT_INVENTORY_MAINTENANCE_MIN = 30000;
+	const DWORD PLAYERBOT_INVENTORY_MAINTENANCE_MAX = 60000;
 	const int PLAYERBOT_POTION_HP_PERCENT = 65;
 	const int PLAYERBOT_POTION_SP_PERCENT = 30;
 	const int PLAYERBOT_RECOVERY_HP_PERCENT = 75;
@@ -62,6 +83,10 @@ namespace
 	const DWORD PLAYERBOT_EQUIPMENT_CHECK_INTERVAL = 1000;
 	const DWORD PLAYERBOT_EQUIPMENT_COMBAT_DELAY = 1700;
 	const DWORD PLAYERBOT_GEAR_LOG_INTERVAL = 10000;
+	const DWORD PLAYERBOT_WOODEN_ARROW_VNUM = 8000;
+	const int PLAYERBOT_ARROW_RESTOCK_THRESHOLD = 100;
+	const int PLAYERBOT_ARROW_SMALL_BUNDLE = 100;
+	const int PLAYERBOT_ARROW_LARGE_BUNDLE = 200;
 	const DWORD PLAYERBOT_POTION_LOG_INTERVAL = 10000;
 	const DWORD PLAYERBOT_PERSIST_INTERVAL = 30000;
 	const DWORD PLAYERBOT_RECOVERY_PROTECTION_INTERVAL = 3000;
@@ -74,6 +99,16 @@ namespace
 	const DWORD PLAYERBOT_SPIRIT_STONE_CHECK_INTERVAL = 10000;
 	const DWORD PLAYERBOT_PARTY_SHARE_INTERVAL = 20000;
 	const DWORD PLAYERBOT_GOAL_PLAN_INTERVAL = 5000;
+	const DWORD PLAYERBOT_STATUS_SNAPSHOT_INTERVAL = 2000;
+	// A Metin which repeatedly heals all dealt damage is not progress. Sample its
+	// lowest observed HP at a deliberately cheap cadence, give a newcomer time to
+	// change the outcome, and only then let the bot look for a productive target.
+	const DWORD PLAYERBOT_STONE_PROGRESS_CHECK_INTERVAL = 4000;
+	const DWORD PLAYERBOT_STONE_INITIAL_GRACE = 18000;
+	const DWORD PLAYERBOT_STONE_SOLO_STALL_TIMEOUT = 26000;
+	const DWORD PLAYERBOT_STONE_GROUP_STALL_TIMEOUT = 42000;
+	const DWORD PLAYERBOT_STONE_FAILED_COOLDOWN = 90000;
+	const int PLAYERBOT_STONE_SUPPORT_RANGE = 2200;
 	const DWORD PLAYERBOT_BUFF_INTERVAL = 2000;
 	const DWORD PLAYERBOT_SKILL_ATTACK_INTERVAL = 2500;
 	// A client-side skill motion is longer than one normal attack tick.  Without
@@ -96,6 +131,19 @@ namespace
 	const int PLAYERBOT_PARTY_CHALLENGE_RADIUS = 3000;
 	const int PLAYERBOT_PARTY_READY_HP_PERCENT = 55;
 	const int PLAYERBOT_PARTY_LEVEL_BONUS_PER_MEMBER = 5;
+	// Strong solo builds sometimes play like an experienced Metin2 tank: wake a
+	// few separate packs, bring them together and then clear them with the normal
+	// melee splash. The limits deliberately favour survival over maximum XP.
+	const DWORD PLAYERBOT_MULTI_PULL_MIN_COOLDOWN = 45000;
+	const DWORD PLAYERBOT_MULTI_PULL_MAX_COOLDOWN = 90000;
+	const DWORD PLAYERBOT_MULTI_PULL_TIMEOUT = 12000;
+	const DWORD PLAYERBOT_MULTI_PULL_ACTION_DELAY = 500;
+	const int PLAYERBOT_MULTI_PULL_MIN_HP_PERCENT = 70;
+	const int PLAYERBOT_MULTI_PULL_START_HP_PERCENT = 90;
+	const int PLAYERBOT_MULTI_PULL_MAX_HP_LOSS_PERCENT = 12;
+	const int PLAYERBOT_MULTI_PULL_MAX_AGGRESSORS = 14;
+	const int PLAYERBOT_MULTI_PULL_SEARCH_RANGE = 2200;
+	const int PLAYERBOT_MULTI_PULL_GROUP_SEPARATION = 600;
 	const DWORD PLAYERBOT_MERCHANT_WAIT_MIN = 3000;
 	const DWORD PLAYERBOT_MERCHANT_WAIT_MAX = 15000;
 	const DWORD PLAYERBOT_BLACKSMITH_WAIT_MIN = 6000;
@@ -148,6 +196,17 @@ namespace
 	// there is no artificial M2 -> M1 return trip.
 	const long PLAYERBOT_M2_STABLE_BOY_X = 146900;
 	const long PLAYERBOT_M2_STABLE_BOY_Y = 232400;
+	// Real Bokjung NPC positions from metin2_map_b3/npc.txt. M2 therefore has
+	// every routine service needed by a level 20-35 character; only profession
+	// trainers and the Biologist still require a trip back to Joan (M1).
+	const long PLAYERBOT_M2_WEAPON_MERCHANT_X = 147200;
+	const long PLAYERBOT_M2_WEAPON_MERCHANT_Y = 243500;
+	const long PLAYERBOT_M2_ARMOR_MERCHANT_X = 148500;
+	const long PLAYERBOT_M2_ARMOR_MERCHANT_Y = 242200;
+	const long PLAYERBOT_M2_MISC_MERCHANT_X = 141300;
+	const long PLAYERBOT_M2_MISC_MERCHANT_Y = 240400;
+	const long PLAYERBOT_M2_BLACKSMITH_X = 142000;
+	const long PLAYERBOT_M2_BLACKSMITH_Y = 239200;
 	// The M2 teleporter leads to Waryong (the infected-animal area commonly
 	// called M3).  The return portal is NPC 10021 on map 24.
 	const long PLAYERBOT_M2_TO_M3_TELEPORTER_X = 136900;
@@ -174,8 +233,17 @@ namespace
 	const DWORD PLAYERBOT_HORSE_RIDE_RETRY_INTERVAL = 10000;
 	const DWORD PLAYERBOT_HORSE_TRAVEL_MIN_DELAY = 30000;
 	const DWORD PLAYERBOT_HORSE_TRAVEL_MAX_DELAY = 300000;
-	const DWORD PLAYERBOT_WORLD_TRAVEL_MIN_DELAY = 180000;
-	const DWORD PLAYERBOT_WORLD_TRAVEL_MAX_DELAY = 900000;
+	const DWORD PLAYERBOT_WORLD_TRAVEL_MIN_DELAY = 60000;
+	const DWORD PLAYERBOT_WORLD_TRAVEL_MAX_DELAY = 360000;
+	// Level 22 is past M1's useful experience range.  These bots still leave in a
+	// staggered wave, but do not spend another six minutes farming weak mobs after
+	// completing their town errands.
+	const DWORD PLAYERBOT_LEVEL22_TRAVEL_MIN_DELAY = 15000;
+	const DWORD PLAYERBOT_LEVEL22_TRAVEL_MAX_DELAY = 90000;
+	// Refining remains important, but it is a planned town run rather than a reason
+	// to bounce M2 -> M1 after every newly affordable +1 attempt.
+	const DWORD PLAYERBOT_REMOTE_REFINE_RETURN_MIN_DELAY = 720000;
+	const DWORD PLAYERBOT_REMOTE_REFINE_RETURN_MAX_DELAY = 1500000;
 	const DWORD PLAYERBOT_MONKEY_MAX_VISIT_TIME = 1800000;
 	const DWORD PLAYERBOT_M3_MAX_VISIT_TIME = 1200000;
 	const DWORD PLAYERBOT_MONKEY_REVERSE_PORTAL_BLOCK_TIME = 10000;
@@ -321,6 +389,26 @@ namespace
 		BOT_ACTION_STABLE
 	};
 
+	enum EPlayerBotPersonality
+	{
+		BOT_PERSONALITY_STEADY_ADVENTURER = 0,
+		BOT_PERSONALITY_METIN_BREAKER,
+		BOT_PERSONALITY_TEAM_COMPANION,
+		BOT_PERSONALITY_GEAR_SPECIALIST,
+		BOT_PERSONALITY_CAREFUL_COLLECTOR,
+		BOT_PERSONALITY_WANDERER
+	};
+
+	enum EPlayerBotAmbition
+	{
+		BOT_AMBITION_LEVEL = 0,
+		BOT_AMBITION_EQUIPMENT,
+		BOT_AMBITION_METINS,
+		BOT_AMBITION_HORSE,
+		BOT_AMBITION_BIOLOGIST,
+		BOT_AMBITION_SKILLS
+	};
+
 	struct TPlayerBotAIState
 	{
 		TPlayerBotAIState() :
@@ -344,6 +432,7 @@ namespace
 			dwNextSkillCheckTime(0),
 			dwNextSkillBookTime(0),
 			dwNextSpiritStoneTime(0),
+			dwNextProgressionChestCheckTime(0),
 			dwNextBuffCheckTime(0),
 			dwNextSkillCastTime(0),
 			dwNextGearLogTime(0),
@@ -364,20 +453,34 @@ namespace
 			dwNextHorseActionTime(0),
 			dwNextHorseRideCheckTime(0),
 			dwNextWorldTravelTime(0),
+			dwNextRemoteRefineReturnTime(0),
 			dwDungeonEnteredTime(0),
 			dwM3EnteredTime(0),
 			dwMonkeyReversePortalBlockUntil(0),
 			dwNextLootPickupTime(0),
+			dwNextLootSearchTime(0),
+			dwNextLootThreatCheckTime(0),
+			dwNextLootCleanupTime(0),
+			dwNextInventoryMaintenanceTime(0),
 			dwNextWanderTime(0),
 			dwNextPartyCheckTime(0),
 			dwNextPartyShareTime(0),
 			dwPartyExpireTime(0),
 			dwNextLureTime(0),
+			dwNextMultiPullTime(0),
+			dwMultiPullStartedTime(0),
+			dwNextMultiPullActionTime(0),
+			dwMultiPullTargetVID(0),
 			dwNextShopCheckTime(0),
+			dwEmergencyScavengeUntil(0),
 			dwTownWaitUntil(0),
 			dwStoneFightStartTime(0),
+			dwStoneProgressVID(0),
+			dwStoneLastProgressTime(0),
+			dwNextStoneProgressCheckTime(0),
 			dwNextNavPlanTime(0),
 			dwNextNavProgressTime(0),
+			dwNextNavErrorLogTime(0),
 			dwNavFailedTargetVID(0),
 			dwNextGoalPlanTime(0),
 			dwGoalStartedTime(0),
@@ -385,10 +488,16 @@ namespace
 			dwLastMeaningfulActivityTime(0),
 			dwLastCombatActionTime(0),
 			iLastStoneHP(0),
+			iMultiPullStartHPPercent(0),
+			bLastStoneAttackerCount(0),
 			bLastPersistedLevel(0),
 			bRouteAllowsHorse(false),
 			bRecoveringAfterDeath(false),
 			bTacticalRetreat(false),
+			bMultiPullActive(false),
+			bMultiPullGroups(0),
+			bMultiPullDesiredGroups(0),
+			bLootThreatNearby(false),
 			bEquipPending(false),
 			bVisitingShop(false),
 			bTownNeedMisc(false),
@@ -417,6 +526,8 @@ namespace
 			bNavFailedTargetCount(0),
 			bNavDeferredCount(0),
 			bBotRole(BOT_ROLE_MOB_GRINDER),
+			bPersonality(BOT_PERSONALITY_STEADY_ADVENTURER),
+			bAmbition(BOT_AMBITION_LEVEL),
 			uMetinHotspotIndex(0),
 			bLongTermGoal(BOT_GOAL_LEVEL_UP),
 			bCurrentAction(BOT_ACTION_IDLE),
@@ -447,6 +558,7 @@ namespace
 		DWORD dwNextSkillCheckTime;
 		DWORD dwNextSkillBookTime;
 		DWORD dwNextSpiritStoneTime;
+		DWORD dwNextProgressionChestCheckTime;
 		DWORD dwNextBuffCheckTime;
 		DWORD dwNextSkillCastTime;
 		DWORD dwNextGearLogTime;
@@ -467,20 +579,34 @@ namespace
 		DWORD dwNextHorseActionTime;
 		DWORD dwNextHorseRideCheckTime;
 		DWORD dwNextWorldTravelTime;
+		DWORD dwNextRemoteRefineReturnTime;
 		DWORD dwDungeonEnteredTime;
 		DWORD dwM3EnteredTime;
 		DWORD dwMonkeyReversePortalBlockUntil;
 		DWORD dwNextLootPickupTime;
+		DWORD dwNextLootSearchTime;
+		DWORD dwNextLootThreatCheckTime;
+		DWORD dwNextLootCleanupTime;
+		DWORD dwNextInventoryMaintenanceTime;
 		DWORD dwNextWanderTime;
 		DWORD dwNextPartyCheckTime;
 		DWORD dwNextPartyShareTime;
 		DWORD dwPartyExpireTime;
 		DWORD dwNextLureTime;
+		DWORD dwNextMultiPullTime;
+		DWORD dwMultiPullStartedTime;
+		DWORD dwNextMultiPullActionTime;
+		DWORD dwMultiPullTargetVID;
 		DWORD dwNextShopCheckTime;
+		DWORD dwEmergencyScavengeUntil;
 		DWORD dwTownWaitUntil;
 		DWORD dwStoneFightStartTime;
+		DWORD dwStoneProgressVID;
+		DWORD dwStoneLastProgressTime;
+		DWORD dwNextStoneProgressCheckTime;
 		DWORD dwNextNavPlanTime;
 		DWORD dwNextNavProgressTime;
+		DWORD dwNextNavErrorLogTime;
 		DWORD dwNavFailedTargetVID;
 		DWORD dwNextGoalPlanTime;
 		DWORD dwGoalStartedTime;
@@ -488,10 +614,16 @@ namespace
 		DWORD dwLastMeaningfulActivityTime;
 		DWORD dwLastCombatActionTime;
 		int iLastStoneHP;
+		int iMultiPullStartHPPercent;
+		BYTE bLastStoneAttackerCount;
 		BYTE bLastPersistedLevel;
 		bool bRouteAllowsHorse;
 		bool bRecoveringAfterDeath;
 		bool bTacticalRetreat;
+		bool bMultiPullActive;
+		BYTE bMultiPullGroups;
+		BYTE bMultiPullDesiredGroups;
+		bool bLootThreatNearby;
 		bool bEquipPending;
 		bool bVisitingShop;
 		bool bTownNeedMisc;
@@ -521,6 +653,8 @@ namespace
 		BYTE bNavFailedTargetCount;
 		BYTE bNavDeferredCount;
 		BYTE bBotRole;
+		BYTE bPersonality;
+		BYTE bAmbition;
 		BYTE uMetinHotspotIndex;
 		BYTE bLongTermGoal;
 		BYTE bCurrentAction;
@@ -533,6 +667,7 @@ namespace
 		std::map<DWORD, DWORD> mapFailedStones;
 		std::map<DWORD, DWORD> mapFailedTargets;
 		std::map<DWORD, DWORD> mapBuffActiveUntil;
+		std::vector<PIXEL_POSITION> vecMultiPullCenters;
 	};
 
 	typedef std::map<DWORD, TPlayerBotAIState> TPlayerBotAIStateMap;
@@ -1376,14 +1511,14 @@ namespace
 	// moving target; SegmentClearWorld still validates every new segment.
 	const int PLAYERBOT_NAV_ARRIVAL_DISTANCE = 100;
 	const int PLAYERBOT_NAV_GOAL_REPLAN_DISTANCE = 400;
-	// Component-corridor planning only searches the handful of clusters crossed
-	// by a route. With 350 bots, eight plans per manager tick still let recurring
-	// low-PID retries starve later characters for minutes after a cold start or a
-	// mass town trip. Sixty-four drains that queue in a few seconds while retaining
-	// a hard per-frame cap. It also guarantees early/mid PID service during the
-	// first pass; the live container remained far below its CPU limit at 32.
-	const int PLAYERBOT_NAV_MAX_HEAVY_PLANS_PER_TICK = 64;
+	// This is one global budget for the manager update, not one budget per map.
+	// Giving M1, M2, M3 and the Monkey Dungeon 64 searches each multiplied the
+	// old M1 load by four. Already built routes still advance every update; only
+	// new expensive HPA/A* requests wait for a later staggered slot.
+	const int PLAYERBOT_NAV_MAX_HEAVY_PLANS_PER_TICK = 32;
 	const int PLAYERBOT_NAV_MAX_EXPANDED_NODES = 120000;
+	DWORD s_dwPlayerBotNavBudgetStamp = 0;
+	int s_iPlayerBotNavHeavyPlansThisTick = 0;
 
 	enum EPlayerBotNavPlanResult
 	{
@@ -1400,6 +1535,47 @@ namespace
 		value *= 0x846ca68bU;
 		value ^= value >> 16;
 		return value;
+	}
+
+	BYTE GetPlayerBotStablePersonality(LPCHARACTER ch, BYTE role)
+	{
+		if (!ch)
+			return BOT_PERSONALITY_STEADY_ADVENTURER;
+		if (role == BOT_ROLE_PARTY_FIGHTER)
+			return BOT_PERSONALITY_TEAM_COMPANION;
+		if (role == BOT_ROLE_METIN_HUNTER)
+			return BOT_PERSONALITY_METIN_BREAKER;
+
+		switch (PlayerBotNavHash(ch->GetPlayerID() ^ 0x50524f46U) % 4U)
+		{
+			case 0: return BOT_PERSONALITY_GEAR_SPECIALIST;
+			case 1: return BOT_PERSONALITY_CAREFUL_COLLECTOR;
+			case 2: return BOT_PERSONALITY_WANDERER;
+			default: return BOT_PERSONALITY_STEADY_ADVENTURER;
+		}
+	}
+
+	BYTE GetPlayerBotStableAmbition(LPCHARACTER ch, BYTE personality)
+	{
+		if (!ch)
+			return BOT_AMBITION_LEVEL;
+		switch (personality)
+		{
+			case BOT_PERSONALITY_METIN_BREAKER:
+				return BOT_AMBITION_METINS;
+			case BOT_PERSONALITY_GEAR_SPECIALIST:
+				return BOT_AMBITION_EQUIPMENT;
+			case BOT_PERSONALITY_CAREFUL_COLLECTOR:
+				return BOT_AMBITION_BIOLOGIST;
+			case BOT_PERSONALITY_WANDERER:
+				return BOT_AMBITION_HORSE;
+			case BOT_PERSONALITY_TEAM_COMPANION:
+				return ch->GetJob() == JOB_SHAMAN
+						? BOT_AMBITION_SKILLS : BOT_AMBITION_LEVEL;
+			default:
+				return (PlayerBotNavHash(ch->GetPlayerID() ^ 0x414d4249U) % 5U) == 0
+						? BOT_AMBITION_SKILLS : BOT_AMBITION_LEVEL;
+		}
 	}
 
 	bool IsPlayerBotPositionBlocked(long lMapIndex, long x, long y)
@@ -1470,9 +1646,7 @@ namespace
 				m_width(0),
 				m_height(0),
 				m_searchToken(0),
-				m_regionSearchToken(0),
-				m_budgetStamp(0),
-				m_heavyPlansThisTick(0)
+				m_regionSearchToken(0)
 			{
 			}
 
@@ -1707,14 +1881,14 @@ namespace
 						!IsInsideWorld(targetX, targetY))
 					return PLAYERBOT_NAV_PLAN_UNREACHABLE;
 
-				if (m_budgetStamp != now)
+				if (s_dwPlayerBotNavBudgetStamp != now)
 				{
-					m_budgetStamp = now;
-					m_heavyPlansThisTick = 0;
+					s_dwPlayerBotNavBudgetStamp = now;
+					s_iPlayerBotNavHeavyPlansThisTick = 0;
 				}
-				if (m_heavyPlansThisTick >= PLAYERBOT_NAV_MAX_HEAVY_PLANS_PER_TICK)
+				if (s_iPlayerBotNavHeavyPlansThisTick >= PLAYERBOT_NAV_MAX_HEAVY_PLANS_PER_TICK)
 					return PLAYERBOT_NAV_PLAN_DEFERRED;
-				++m_heavyPlansThisTick;
+				++s_iPlayerBotNavHeavyPlansThisTick;
 
 				int sx, sy, tx, ty;
 				WorldToCell(startX, startY, sx, sy);
@@ -1730,7 +1904,7 @@ namespace
 					if (!FindNearestWalkableCell(tx, ty, targetSnapRadius, component,
 							seed ^ 0x9e3779b9U))
 					{
-						sys_err("PLAYERBOT_NAV: goal snap failed map=%ld from=(%ld,%ld) to=(%ld,%ld) component=%u radius=%d",
+						sys_log(1, "PLAYERBOT_NAV: goal snap failed map=%ld from=(%ld,%ld) to=(%ld,%ld) component=%u radius=%d",
 								m_mapIndex, startX, startY, targetX, targetY,
 								(unsigned int)component, targetSnapRadius);
 						return PLAYERBOT_NAV_PLAN_UNREACHABLE;
@@ -1741,13 +1915,13 @@ namespace
 					if (!FindNearestWalkableCell(tx, ty, targetSnapRadius, 0,
 							seed ^ 0x9e3779b9U))
 					{
-						sys_err("PLAYERBOT_NAV: strict goal snap failed map=%ld from=(%ld,%ld) to=(%ld,%ld) radius=%d",
+						sys_log(1, "PLAYERBOT_NAV: strict goal snap failed map=%ld from=(%ld,%ld) to=(%ld,%ld) radius=%d",
 								m_mapIndex, startX, startY, targetX, targetY, targetSnapRadius);
 						return PLAYERBOT_NAV_PLAN_UNREACHABLE;
 					}
 					if (m_component[Index(tx, ty)] != component)
 					{
-						sys_err("PLAYERBOT_NAV: disconnected goal map=%ld from=(%ld,%ld) to=(%ld,%ld) start_component=%u target_component=%u",
+						sys_log(1, "PLAYERBOT_NAV: disconnected goal map=%ld from=(%ld,%ld) to=(%ld,%ld) start_component=%u target_component=%u",
 								m_mapIndex, startX, startY, targetX, targetY,
 								(unsigned int)component, (unsigned int)m_component[Index(tx, ty)]);
 						return PLAYERBOT_NAV_PLAN_UNREACHABLE;
@@ -1774,7 +1948,7 @@ namespace
 				std::vector<int> rawPath;
 				if (!FindHierarchicalRawPath(startIndex, targetIndex, seed, rawPath))
 				{
-					sys_err("PLAYERBOT_NAV: hierarchical route failed map=%ld from=(%ld,%ld) to=(%ld,%ld) start_region=%u target_region=%u",
+					sys_log(1, "PLAYERBOT_NAV: hierarchical route failed map=%ld from=(%ld,%ld) to=(%ld,%ld) start_region=%u target_region=%u",
 							m_mapIndex, startX, startY, targetX, targetY,
 							(unsigned int)m_cellRegion[startIndex],
 							(unsigned int)m_cellRegion[targetIndex]);
@@ -2707,8 +2881,6 @@ namespace
 			std::vector<int> m_regionParent;
 			std::vector<int> m_regionParentEdge;
 			DWORD m_regionSearchToken;
-			DWORD m_budgetStamp;
-			int m_heavyPlansThisTick;
 	};
 
 	struct TPlayerBotMonkeyPortal
@@ -2890,6 +3062,17 @@ namespace
 		}
 	}
 
+	bool IsPlayerBotMetinWorthFighting(LPCHARACTER ch, LPCHARACTER stone)
+	{
+		if (!ch || !stone || !stone->IsStone() || stone->IsDead())
+			return false;
+		// The server drop multiplier still has useful value at a ten-level
+		// advantage. Below that it collapses sharply (15% at -11 and 1% at -15),
+		// so a level-25 bot should pass level-5/10 stones and keep level-15+.
+		return stone->GetLevel() <= ch->GetLevel() + 9 &&
+				ch->GetLevel() <= stone->GetLevel() + 10;
+	}
+
 	BYTE ChoosePlayerBotMetinHotspot(DWORD playerID, BYTE currentIndex, DWORD dwNow)
 	{
 		BYTE best = currentIndex % 12;
@@ -2917,12 +3100,25 @@ namespace
 
 	void ReservePlayerBotMetin(LPCHARACTER ch, LPCHARACTER stone, DWORD dwNow)
 	{
-		if (!ch || !stone || !stone->IsStone())
+		if (!IsPlayerBotMetinWorthFighting(ch, stone))
 			return;
 		RememberPlayerBotMetin(stone, dwNow);
 		TKnownPlayerBotMetin& known = s_mapKnownPlayerBotMetins[stone->GetVID()];
 		known.dwReservedByPID = GetPlayerBotPartyReservationPID(ch);
 		known.dwReserveUntil = dwNow + 45000;
+	}
+
+	void ReleasePlayerBotMetinReservation(LPCHARACTER ch, LPCHARACTER stone)
+	{
+		if (!ch || !stone || ch->GetParty())
+			return;
+		TKnownPlayerBotMetinMap::iterator it =
+				s_mapKnownPlayerBotMetins.find(stone->GetVID());
+		if (it == s_mapKnownPlayerBotMetins.end() ||
+				it->second.dwReservedByPID != ch->GetPlayerID())
+			return;
+		it->second.dwReservedByPID = 0;
+		it->second.dwReserveUntil = 0;
 	}
 
 	LPCHARACTER FindKnownPlayerBotMetin(LPCHARACTER ch, DWORD dwNow)
@@ -2948,7 +3144,7 @@ namespace
 			TKnownPlayerBotMetin& known = it->second;
 			++it;
 			if (known.lMapIndex != ch->GetMapIndex() ||
-					known.bLevel > ch->GetLevel() + 9)
+					!IsPlayerBotMetinWorthFighting(ch, stone))
 				continue;
 			if (known.dwReserveUntil > dwNow && known.dwReservedByPID != 0 &&
 					known.dwReservedByPID != myReservationPID)
@@ -3077,11 +3273,16 @@ namespace
 	{
 		if (!ch)
 			return false;
+		TPlayerBotAIState& state = s_mapPlayerBotAIStates[ch->GetPlayerID()];
 		if (!ch->GetSectree())
 		{
-			sys_err("PLAYERBOT_NAV: missing sectree pid=%u name=%s map=%ld pos=(%ld,%ld) dest=(%ld,%ld)",
-					ch->GetPlayerID(), ch->GetName(), ch->GetMapIndex(), ch->GetX(), ch->GetY(),
-					destX, destY);
+			if (dwNow >= state.dwNextNavErrorLogTime)
+			{
+				state.dwNextNavErrorLogTime = dwNow + 10000;
+				sys_err("PLAYERBOT_NAV: missing sectree pid=%u name=%s map=%ld pos=(%ld,%ld) dest=(%ld,%ld)",
+						ch->GetPlayerID(), ch->GetName(), ch->GetMapIndex(), ch->GetX(), ch->GetY(),
+						destX, destY);
+			}
 			return false;
 		}
 
@@ -3091,7 +3292,6 @@ namespace
 			return false;
 		navigation.ClampWorld(destX, destY);
 
-		TPlayerBotAIState& state = s_mapPlayerBotAIStates[ch->GetPlayerID()];
 		bool redirectedToMonkeyPortal = false;
 		if (mapIndex == PLAYERBOT_MAP_MONKEY_EASY &&
 				!navigation.CanReach(ch->GetX(), ch->GetY(), destX, destY))
@@ -3177,8 +3377,8 @@ namespace
 								ch->GetPlayerID(), ch->GetName(), ch->GetX(), ch->GetY(), destX, destY);
 					// Desynchronise retries so the same low PIDs do not consume every
 					// planning slot on each pass through the ordered bot map.
-					state.dwNextNavPlanTime = dwNow + 250 +
-							(PlayerBotNavHash(ch->GetPlayerID()) % 500U);
+					state.dwNextNavPlanTime = dwNow + 750 +
+							(PlayerBotNavHash(ch->GetPlayerID()) % 1251U);
 					if (ch->IsStateMove())
 						ch->Stop();
 					return true;
@@ -3337,7 +3537,7 @@ namespace
 			{
 				case JOB_ASSASSIN:
 					if (ch->GetSkillGroup() == 2)
-						return subType == WEAPON_BOW || subType == WEAPON_ARROW;
+						return subType == WEAPON_BOW;
 					// Before selecting a profession and on Dagger training, never equip
 					// a bow: melee Ninja skills ask CalcMeleeDamage and reject bows.
 					return subType == WEAPON_DAGGER || subType == WEAPON_SWORD;
@@ -3362,7 +3562,6 @@ namespace
 			case WEAPON_MOUNT_SPEAR:
 				return true;
 			case WEAPON_BOW:
-			case WEAPON_ARROW:
 				return true;
 		}
 
@@ -3463,6 +3662,13 @@ namespace
 		}
 	}
 
+	bool IsPlayerBotSpecialLevel30WeaponVnum(DWORD vnum)
+	{
+		return (vnum >= 290 && vnum <= 299) || (vnum >= 1170 && vnum <= 1179) ||
+				(vnum >= 2150 && vnum <= 2159) || (vnum >= 3210 && vnum <= 3219) ||
+				(vnum >= 5110 && vnum <= 5119) || (vnum >= 7160 && vnum <= 7169);
+	}
+
 	long long GetPlayerBotEquipmentScore(LPITEM item, LPCHARACTER ch = NULL)
 	{
 		if (!item || !item->GetProto())
@@ -3473,10 +3679,7 @@ namespace
 		{
 			score += (long long)(item->GetValue(3) + item->GetValue(4) + 2 * item->GetValue(5)) * 1000;
 			const DWORD vnum = item->GetVnum();
-			const bool specialLevel30 = (vnum >= 290 && vnum <= 299) ||
-					(vnum >= 1170 && vnum <= 1179) || (vnum >= 2100 && vnum <= 2109) ||
-					(vnum >= 3210 && vnum <= 3219) || (vnum >= 5110 && vnum <= 5119) ||
-					(vnum >= 7160 && vnum <= 7169);
+			const bool specialLevel30 = IsPlayerBotSpecialLevel30WeaponVnum(vnum);
 			if (specialLevel30)
 				score += 350000; // Average-damage level-30 families stay meaningful.
 
@@ -3771,6 +3974,12 @@ namespace
 		return 10;
 	}
 
+	long long GetPlayerBotEmergencyWeaponPrice(LPCHARACTER ch)
+	{
+		const DWORD vnum = GetPlayerBotEmergencyWeaponVnum(ch);
+		return vnum == 7000 ? 600 : 100;
+	}
+
 	int GetPlayerBotProtoLevelLimit(const TItemTable* proto)
 	{
 		if (!proto)
@@ -3840,7 +4049,55 @@ namespace
 
 	DWORD GetPlayerBotProgressionShieldVnum(LPCHARACTER ch)
 	{
-		return ch ? 13000 : 0; // Battle Shield +0, sold by the armour merchant.
+		if (!ch)
+			return 0;
+		DWORD bestVnum = 13000;
+		for (int tier = 0; tier < 8; ++tier)
+		{
+			const DWORD candidateVnum = 13000 + tier * 20;
+			TItemTable* proto = ITEM_MANAGER::instance().GetTable(candidateVnum);
+			if (proto && GetPlayerBotProtoLevelLimit(proto) <= ch->GetLevel())
+				bestVnum = candidateVnum;
+		}
+		return bestVnum;
+	}
+
+	DWORD GetPlayerBotProgressionHelmetVnum(LPCHARACTER ch)
+	{
+		if (!ch)
+			return 0;
+		DWORD baseVnum = 12200;
+		switch (ch->GetJob())
+		{
+			case JOB_ASSASSIN: baseVnum = 12340; break;
+			case JOB_SURA:     baseVnum = 12480; break;
+			case JOB_SHAMAN:   baseVnum = 12620; break;
+			default: break;
+		}
+		DWORD bestVnum = baseVnum;
+		for (int tier = 0; tier < 8; ++tier)
+		{
+			const DWORD candidateVnum = baseVnum + tier * 20;
+			TItemTable* proto = ITEM_MANAGER::instance().GetTable(candidateVnum);
+			if (proto && GetPlayerBotProtoLevelLimit(proto) <= ch->GetLevel())
+				bestVnum = candidateVnum;
+		}
+		return bestVnum;
+	}
+
+	DWORD GetPlayerBotProgressionBootsVnum(LPCHARACTER ch)
+	{
+		if (!ch)
+			return 0;
+		DWORD bestVnum = 15000;
+		for (int tier = 0; tier < 12; ++tier)
+		{
+			const DWORD candidateVnum = 15000 + tier * 20;
+			TItemTable* proto = ITEM_MANAGER::instance().GetTable(candidateVnum);
+			if (proto && GetPlayerBotProtoLevelLimit(proto) <= ch->GetLevel())
+				bestVnum = candidateVnum;
+		}
+		return bestVnum;
 	}
 
 	bool HasPlayerBotProgressionGear(LPCHARACTER ch, DWORD desiredVnum, int wearCell)
@@ -3888,14 +4145,23 @@ namespace
 				ch, GetPlayerBotProgressionShieldVnum(ch), WEAR_SHIELD);
 	}
 
+	bool NeedsPlayerBotProgressionHelmet(LPCHARACTER ch)
+	{
+		return ch && !HasPlayerBotProgressionGear(
+				ch, GetPlayerBotProgressionHelmetVnum(ch), WEAR_HEAD);
+	}
+
+	bool NeedsPlayerBotProgressionBoots(LPCHARACTER ch)
+	{
+		return ch && !HasPlayerBotProgressionGear(
+				ch, GetPlayerBotProgressionBootsVnum(ch), WEAR_FOOTS);
+	}
+
 	bool IsPlayerBotSpecialLevel30Weapon(LPITEM item)
 	{
 		if (!item || item->GetType() != ITEM_WEAPON)
 			return false;
-		const DWORD vnum = item->GetVnum();
-		return (vnum >= 290 && vnum <= 299) || (vnum >= 1170 && vnum <= 1179) ||
-				(vnum >= 2100 && vnum <= 2109) || (vnum >= 3210 && vnum <= 3219) ||
-				(vnum >= 5110 && vnum <= 5119) || (vnum >= 7160 && vnum <= 7169);
+		return IsPlayerBotSpecialLevel30WeaponVnum(item->GetVnum());
 	}
 
 	bool HasPlayerBotSpecialLevel30Weapon(LPCHARACTER ch, bool requireAverageDamage)
@@ -3928,7 +4194,9 @@ namespace
 		LPITEM weapon = ch->GetWear(WEAR_WEAPON);
 		LPITEM armor = ch->GetWear(WEAR_BODY);
 		LPITEM shield = ch->GetWear(WEAR_SHIELD);
-		if (!weapon || !armor || !shield)
+		LPITEM helmet = ch->GetWear(WEAR_HEAD);
+		LPITEM boots = ch->GetWear(WEAR_FOOTS);
+		if (!weapon || !armor || !shield || !helmet || !boots)
 			return false;
 		if (ch->GetLevel() >= 20)
 			return true;
@@ -3957,6 +4225,14 @@ namespace
 		{
 			desiredVnum = GetPlayerBotProgressionShieldVnum(ch);
 		}
+		else if (wearCell == WEAR_HEAD)
+		{
+			desiredVnum = GetPlayerBotProgressionHelmetVnum(ch);
+		}
+		else if (wearCell == WEAR_FOOTS)
+		{
+			desiredVnum = GetPlayerBotProgressionBootsVnum(ch);
+		}
 		else
 		{
 			return false;
@@ -3970,10 +4246,40 @@ namespace
 
 	BYTE GetPlayerBotRefineTarget(LPCHARACTER ch, LPITEM item)
 	{
-		// The only level-appropriate weapon/body item is essential equipment.
-		// A cautious real player stops it at +4 instead of gambling it away on +5/+6.
-		// Secondary gear and spare loot may still be developed to the existing +6 cap.
-		return IsPlayerBotCoreProgressionItem(ch, item) ? 4 : 6;
+		if (!ch || !item)
+			return 0;
+
+		// Equipment is a primary progression system, not a side activity. Every bot
+		// aims for at least +6, while a stable per-character/per-family personality
+		// decides who risks +7, +8 or +9. The actual attempt still goes through
+		// DoRefine(false), so every result pays the real fee, consumes real materials
+		// and can burn at the normal server success rate.
+		const DWORD familyVnum = item->GetVnum() >= item->GetRefineLevel()
+				? item->GetVnum() - item->GetRefineLevel() : item->GetVnum();
+		const int wearCell = item->FindEquipCell(ch);
+		const DWORD seed = ch->GetPlayerID() ^ (familyVnum * 0x9e3779b9U) ^
+				((DWORD)(wearCell + 2) * 0x85ebca6bU);
+		const DWORD ambition = PlayerBotNavHash(seed ^ 0x52454649U) % 1000U;
+		TPlayerBotAIStateMap::const_iterator stateIt =
+				s_mapPlayerBotAIStates.find(ch->GetPlayerID());
+		const BYTE personality = stateIt != s_mapPlayerBotAIStates.end()
+				? stateIt->second.bPersonality : BOT_PERSONALITY_STEADY_ADVENTURER;
+		// Gear specialists deliberately accept more upgrade risk. Careful collectors
+		// still has a small chance to become the lucky +8/+9 outlier, but normally
+		// protects the equipment already earned.
+		const DWORD plusNineChance = personality == BOT_PERSONALITY_GEAR_SPECIALIST
+				? 120U : (personality == BOT_PERSONALITY_CAREFUL_COLLECTOR ? 20U : 50U);
+		const DWORD plusEightChance = personality == BOT_PERSONALITY_GEAR_SPECIALIST
+				? 320U : (personality == BOT_PERSONALITY_CAREFUL_COLLECTOR ? 90U : 150U);
+		const DWORD plusSevenChance = personality == BOT_PERSONALITY_GEAR_SPECIALIST
+				? 650U : (personality == BOT_PERSONALITY_CAREFUL_COLLECTOR ? 290U : 400U);
+		if (ambition < plusNineChance)
+			return 9; // exceptional 5% cohort
+		if (ambition < plusEightChance)
+			return 8; // another 10%
+		if (ambition < plusSevenChance)
+			return 7; // another 25%
+		return 6;
 	}
 
 	bool BuyPlayerBotProgressionGear(LPCHARACTER ch, DWORD vnum, const char* category)
@@ -4038,26 +4344,284 @@ namespace
 	{
 		if (!ch || ch->GetJob() != JOB_ASSASSIN || ch->GetSkillGroup() != 2)
 			return false;
-		return CountPlayerBotArrows(ch) < 100;
+		return CountPlayerBotArrows(ch) < PLAYERBOT_ARROW_RESTOCK_THRESHOLD;
+	}
+
+	long long GetPlayerBotNpcPurchasePrice(const TItemTable* proto, int count)
+	{
+		if (!proto || count <= 0)
+			return 0;
+		if (IS_SET(proto->dwFlags, ITEM_FLAG_COUNT_PER_1GOLD))
+			return proto->dwGold == 0 ? count : count / proto->dwGold;
+		return (long long)proto->dwGold * count;
+	}
+
+	DWORD GetPlayerBotNpcSellUnitPrice(LPITEM item)
+	{
+		if (!item || !item->GetProto() || IS_SET(item->GetAntiFlag(), ITEM_ANTIFLAG_SELL))
+			return 0;
+
+		DWORD price = item->GetShopBuyPrice();
+		if (IS_SET(item->GetFlag(), ITEM_FLAG_COUNT_PER_1GOLD))
+			price = price == 0 ? 1 : 1 / price;
+		price /= 5;
+		price -= price * 3 / 100;
+		return price;
+	}
+
+	enum EPlayerBotPotionSupply
+	{
+		PLAYERBOT_POTION_SUPPLY_HP = 0,
+		PLAYERBOT_POTION_SUPPLY_SP,
+		PLAYERBOT_POTION_SUPPLY_GREEN,
+		PLAYERBOT_POTION_SUPPLY_PURPLE,
+		PLAYERBOT_POTION_SUPPLY_NONE
+	};
+
+	EPlayerBotPotionSupply GetPlayerBotPotionSupply(DWORD vnum)
+	{
+		if (vnum == 27051 || (vnum >= 27001 && vnum <= 27003))
+			return PLAYERBOT_POTION_SUPPLY_HP;
+		if (vnum == 27052 || (vnum >= 27004 && vnum <= 27006))
+			return PLAYERBOT_POTION_SUPPLY_SP;
+		if (vnum == 27053 || (vnum >= 27100 && vnum <= 27102))
+			return PLAYERBOT_POTION_SUPPLY_GREEN;
+		if (vnum == 27054 || (vnum >= 27103 && vnum <= 27105))
+			return PLAYERBOT_POTION_SUPPLY_PURPLE;
+		return PLAYERBOT_POTION_SUPPLY_NONE;
+	}
+
+	DWORD GetPlayerBotPotionSupplyLimit(LPCHARACTER ch,
+			EPlayerBotPotionSupply supply)
+	{
+		const bool lowLevel = !ch || ch->GetLevel() <= 10;
+		const bool mage = ch && (ch->GetJob() == JOB_SHAMAN || ch->GetJob() == JOB_SURA);
+		switch (supply)
+		{
+			case PLAYERBOT_POTION_SUPPLY_HP:     return lowLevel ? 160 : 300;
+			case PLAYERBOT_POTION_SUPPLY_SP:     return lowLevel ? (mage ? 100 : 50) : (mage ? 200 : 80);
+			case PLAYERBOT_POTION_SUPPLY_GREEN:  return 30;
+			case PLAYERBOT_POTION_SUPPLY_PURPLE: return 30;
+			default: return 0;
+		}
+	}
+
+	DWORD CountPlayerBotPotionSupply(LPCHARACTER ch,
+			EPlayerBotPotionSupply supply)
+	{
+		if (!ch || supply == PLAYERBOT_POTION_SUPPLY_NONE)
+			return 0;
+		DWORD count = 0;
+		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
+		{
+			LPITEM item = ch->GetInventoryItem(cell);
+			if (item && GetPlayerBotPotionSupply(item->GetVnum()) == supply)
+				count += item->GetCount();
+		}
+		return count;
+	}
+
+	bool HasPlayerBotExcessPotions(LPCHARACTER ch)
+	{
+		if (!ch || !ch->IsItemLoaded())
+			return false;
+		for (int supply = PLAYERBOT_POTION_SUPPLY_HP;
+				supply < PLAYERBOT_POTION_SUPPLY_NONE; ++supply)
+		{
+			const EPlayerBotPotionSupply kind = (EPlayerBotPotionSupply)supply;
+			if (CountPlayerBotPotionSupply(ch, kind) >
+					GetPlayerBotPotionSupplyLimit(ch, kind))
+				return true;
+		}
+		return false;
+	}
+
+	bool CanMergePlayerBotPotionStacks(LPITEM destination, LPITEM source)
+	{
+		if (!destination || !source || destination == source ||
+				destination->GetVnum() != source->GetVnum() ||
+				GetPlayerBotPotionSupply(destination->GetVnum()) == PLAYERBOT_POTION_SUPPLY_NONE ||
+				!destination->IsStackable() || !source->IsStackable() ||
+				IS_SET(destination->GetAntiFlag(), ITEM_ANTIFLAG_STACK) ||
+				IS_SET(source->GetAntiFlag(), ITEM_ANTIFLAG_STACK))
+			return false;
+		for (int socket = 0; socket < ITEM_SOCKET_MAX_NUM; ++socket)
+			if (destination->GetSocket(socket) != source->GetSocket(socket))
+				return false;
+		for (int attr = 0; attr < ITEM_ATTRIBUTE_MAX_NUM; ++attr)
+			if (destination->GetAttributeType(attr) != source->GetAttributeType(attr) ||
+					destination->GetAttributeValue(attr) != source->GetAttributeValue(attr))
+				return false;
+		return true;
+	}
+
+	bool CompactPlayerBotPotionStacks(LPCHARACTER ch)
+	{
+		if (!ch || !ch->IsItemLoaded())
+			return false;
+		DWORD movedUnits = 0;
+		DWORD removedStacks = 0;
+		for (WORD destinationCell = 0; destinationCell < INVENTORY_MAX_NUM; ++destinationCell)
+		{
+			LPITEM destination = ch->GetInventoryItem(destinationCell);
+			if (!destination || destination->GetCount() >= 200 ||
+					GetPlayerBotPotionSupply(destination->GetVnum()) == PLAYERBOT_POTION_SUPPLY_NONE)
+				continue;
+			for (WORD sourceCell = destinationCell + 1;
+					sourceCell < INVENTORY_MAX_NUM && destination->GetCount() < 200;
+					++sourceCell)
+			{
+				LPITEM source = ch->GetInventoryItem(sourceCell);
+				if (!CanMergePlayerBotPotionStacks(destination, source))
+					continue;
+				const DWORD sourceCount = source->GetCount();
+				const DWORD transfer = std::min<DWORD>(200 - destination->GetCount(), sourceCount);
+				if (transfer == 0)
+					continue;
+				destination->SetCount(destination->GetCount() + transfer);
+				source->SetCount(sourceCount - transfer);
+				movedUnits += transfer;
+				if (transfer == sourceCount)
+					++removedStacks;
+			}
+		}
+		if (movedUnits > 0)
+			sys_log(0, "PLAYERBOT_INVENTORY: compacted potions pid=%u name=%s moved=%u freed_stacks=%u",
+					ch->GetPlayerID(), ch->GetName(), movedUnits, removedStacks);
+		return movedUnits > 0;
+	}
+
+	bool SellPlayerBotExcessPotions(LPCHARACTER ch)
+	{
+		if (!ch || !ch->IsItemLoaded())
+			return false;
+		// Sell weaker variants first, while retaining a bounded combat/travel reserve.
+		const DWORD saleOrder[] = {
+			27051, 27001, 27002, 27003,
+			27052, 27004, 27005, 27006,
+			27053, 27100, 27101, 27102,
+			27054, 27103, 27104, 27105
+		};
+		DWORD soldUnits = 0;
+		long long earnedGold = 0;
+		for (int supply = PLAYERBOT_POTION_SUPPLY_HP;
+				supply < PLAYERBOT_POTION_SUPPLY_NONE; ++supply)
+		{
+			const EPlayerBotPotionSupply kind = (EPlayerBotPotionSupply)supply;
+			DWORD total = CountPlayerBotPotionSupply(ch, kind);
+			const DWORD keep = GetPlayerBotPotionSupplyLimit(ch, kind);
+			if (total <= keep)
+				continue;
+			DWORD excess = total - keep;
+			for (size_t order = 0;
+					order < sizeof(saleOrder) / sizeof(saleOrder[0]) && excess > 0; ++order)
+			{
+				if (GetPlayerBotPotionSupply(saleOrder[order]) != kind)
+					continue;
+				for (WORD cell = 0; cell < INVENTORY_MAX_NUM && excess > 0; ++cell)
+				{
+					LPITEM item = ch->GetInventoryItem(cell);
+					if (!item || item->GetVnum() != saleOrder[order])
+						continue;
+					const DWORD unitPrice = GetPlayerBotNpcSellUnitPrice(item);
+					if (unitPrice == 0)
+						continue;
+					const DWORD count = std::min<DWORD>(excess, item->GetCount());
+					item->SetCount(item->GetCount() - count);
+					ch->PointChange(POINT_GOLD, (long long)unitPrice * count);
+					excess -= count;
+					soldUnits += count;
+					earnedGold += (long long)unitPrice * count;
+				}
+			}
+		}
+		if (soldUnits > 0)
+			sys_log(0, "PLAYERBOT_INVENTORY: sold excess potions pid=%u name=%s units=%u earned=%lld gold=%lld",
+					ch->GetPlayerID(), ch->GetName(), soldUnits, earnedGold,
+					(long long)ch->GetGold());
+		return soldUnits > 0;
+	}
+
+	bool RaisePlayerBotEmergencyGold(LPCHARACTER ch, long long requiredGold,
+			const char* reason)
+	{
+		if (!ch || ch->GetGold() >= requiredGold)
+			return false;
+
+		// The native NPC shop accepts potions too. Sell only as many surplus units
+		// as are required to restore an essential weapon/ammunition purchase. Blue
+		// potions go first and both HP/SP reserves remain protected.
+		const DWORD potionVnums[] = {
+			27004, 27005, 27006, 27052,
+			27001, 27002, 27003, 27051
+		};
+		for (size_t v = 0; v < sizeof(potionVnums) / sizeof(potionVnums[0]); ++v)
+		{
+			const bool bluePotion = v < 4;
+			const DWORD reserve = bluePotion ? 10 : 30;
+			for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
+			{
+				LPITEM item = ch->GetInventoryItem(cell);
+				if (!item || item->GetVnum() != potionVnums[v] || item->GetCount() <= reserve)
+					continue;
+
+				const DWORD price = GetPlayerBotNpcSellUnitPrice(item);
+				if (price == 0)
+					continue;
+
+				const long long deficit = requiredGold - ch->GetGold();
+				const DWORD available = item->GetCount() - reserve;
+				DWORD count = (DWORD)((deficit + price - 1) / price);
+				count = std::max<DWORD>(1, std::min<DWORD>(count, available));
+				item->SetCount(item->GetCount() - count);
+				ch->PointChange(POINT_GOLD, (long long)price * count);
+				sys_log(0, "PLAYERBOT_GEAR: emergency sale pid=%u name=%s reason=%s vnum=%u count=%u earned=%lld total_gold=%lld required=%lld",
+						ch->GetPlayerID(), ch->GetName(), reason ? reason : "supply",
+						potionVnums[v], count, (long long)price * count,
+						(long long)ch->GetGold(), requiredGold);
+				if (ch->GetGold() >= requiredGold)
+					return true;
+			}
+		}
+		return ch->GetGold() >= requiredGold;
 	}
 
 	bool BuyPlayerBotArrowsAtMerchant(LPCHARACTER ch)
 	{
 		if (!NeedsPlayerBotArrows(ch))
 			return false;
-		TItemTable* proto = ITEM_MANAGER::instance().GetTable(8001);
-		const int bundle = 200;
-		const long long unitPrice = proto ? std::max<DWORD>(1, proto->dwShopBuyPrice) : 1;
-		const long long price = unitPrice * bundle;
-		if (ch->GetGold() < price)
+		TItemTable* proto = ITEM_MANAGER::instance().GetTable(PLAYERBOT_WOODEN_ARROW_VNUM);
+		if (!proto)
 			return false;
-		LPITEM arrows = ch->AutoGiveItem(8001, bundle, -1, false);
+
+		const long long smallPrice = GetPlayerBotNpcPurchasePrice(
+				proto, PLAYERBOT_ARROW_SMALL_BUNDLE);
+		if (ch->GetGold() < smallPrice)
+			RaisePlayerBotEmergencyGold(ch, smallPrice, "arrows");
+
+		int bundle = 0;
+		long long price = GetPlayerBotNpcPurchasePrice(
+				proto, PLAYERBOT_ARROW_LARGE_BUNDLE);
+		if (price > 0 && ch->GetGold() >= price)
+			bundle = PLAYERBOT_ARROW_LARGE_BUNDLE;
+		else
+		{
+			price = smallPrice;
+			if (price > 0 && ch->GetGold() >= price)
+				bundle = PLAYERBOT_ARROW_SMALL_BUNDLE;
+		}
+		if (bundle == 0)
+			return false;
+
+		LPITEM arrows = ch->AutoGiveItem(
+				PLAYERBOT_WOODEN_ARROW_VNUM, bundle, -1, false);
 		if (!arrows)
 			return false;
 		ch->PointChange(POINT_GOLD, -price);
-		EnsurePlayerBotArrowsEquipped(ch);
-		sys_log(0, "PLAYERBOT_GEAR: bought arrows pid=%u name=%s count=%d price=%lld",
-				ch->GetPlayerID(), ch->GetName(), bundle, price);
+		const bool equipped = EnsurePlayerBotArrowsEquipped(ch);
+		sys_log(0, "PLAYERBOT_GEAR: bought wooden arrows pid=%u name=%s vnum=%u count=%d price=%lld equipped=%d",
+				ch->GetPlayerID(), ch->GetName(), PLAYERBOT_WOODEN_ARROW_VNUM,
+				bundle, price, equipped ? 1 : 0);
 		return true;
 	}
 
@@ -4090,8 +4654,12 @@ namespace
 			return ch && ch->GetWear(WEAR_WEAPON);
 
 		const DWORD vnum = GetPlayerBotEmergencyWeaponVnum(ch);
-		const long long price = (vnum == 7000) ? 600 : 100;
-		if (vnum == 0 || ch->GetGold() < price)
+		const long long price = GetPlayerBotEmergencyWeaponPrice(ch);
+		if (vnum == 0)
+			return false;
+		if (ch->GetGold() < price)
+			RaisePlayerBotEmergencyGold(ch, price, "weapon");
+		if (ch->GetGold() < price)
 			return false;
 
 		LPITEM weapon = ch->AutoGiveItem(vnum, 1, -1, false);
@@ -4111,6 +4679,7 @@ namespace
 		LPITEM equippedWeapon = ch->GetWear(WEAR_WEAPON);
 		if (equippedWeapon && IsPlayerBotWeapon(ch, equippedWeapon))
 		{
+			state.dwEmergencyScavengeUntil = 0;
 			if (equippedWeapon->GetSubType() == WEAPON_BOW)
 				return EnsurePlayerBotArrowsEquipped(ch);
 			return true;
@@ -4135,6 +4704,7 @@ namespace
 
 		if (EquipFirstAvailablePlayerBotWeapon(ch))
 		{
+			state.dwEmergencyScavengeUntil = 0;
 			LPITEM weapon = ch->GetWear(WEAR_WEAPON);
 			return weapon && (weapon->GetSubType() != WEAPON_BOW ||
 					EnsurePlayerBotArrowsEquipped(ch));
@@ -4174,6 +4744,85 @@ namespace
 					ch->GetPlayerID(), ch->GetName(), dwStarterChestVnum);
 		}
 
+		return false;
+	}
+
+	bool ManagePlayerBotProgressionChests(LPCHARACTER ch,
+			TPlayerBotAIState& state, DWORD dwNow)
+	{
+		if (!ch || !ch->IsItemLoaded() || ch->IsDead() ||
+			dwNow < state.dwNextProgressionChestCheckTime)
+			return false;
+		state.dwNextProgressionChestCheckTime = dwNow + 10000 +
+				(PlayerBotNavHash(ch->GetPlayerID()) % 5001U);
+
+		// The seed historically supplied one starter chest and the stock
+		// give_basic_weapon quest supplied another on first login. Since every
+		// apprentice chest contains the next tier, that duplicated the entire
+		// progression chain. These boxes are one-per-character rewards: retain one
+		// copy of each tier and remove only the artificial duplicates.
+		std::map<DWORD, bool> seenProgressionChests;
+		DWORD removedChestUnits = 0;
+		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
+		{
+			LPITEM item = ch->GetInventoryItem(cell);
+			if (!item)
+				continue;
+			const DWORD vnum = item->GetVnum();
+			const bool progression = (vnum >= 50187 && vnum <= 50196) ||
+					vnum == 50212 || vnum == 50213;
+			if (!progression)
+				continue;
+
+			const DWORD count = std::max<DWORD>(1, item->GetCount());
+			if (seenProgressionChests.find(vnum) != seenProgressionChests.end())
+			{
+				removedChestUnits += count;
+				ITEM_MANAGER::instance().RemoveItem(item, "PLAYERBOT_DUPLICATE_CHEST");
+				continue;
+			}
+
+			seenProgressionChests[vnum] = true;
+			if (count > 1)
+			{
+				removedChestUnits += count - 1;
+				item->SetCount(1);
+			}
+		}
+		if (removedChestUnits > 0)
+			sys_log(0, "PLAYERBOT_GEAR: removed duplicate progression chests pid=%u name=%s units=%u",
+					ch->GetPlayerID(), ch->GetName(), removedChestUnits);
+
+		LPCHARACTER target = state.dwTargetVID != 0
+				? CHARACTER_MANAGER::instance().Find(state.dwTargetVID) : NULL;
+		if ((target && !target->IsDead()) ||
+				(state.dwLastCombatActionTime != 0 &&
+				 dwNow - state.dwLastCombatActionTime < 3000))
+			return false;
+
+		const DWORD starterVnum = GetStarterChestVnum(ch->GetJob());
+		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
+		{
+			LPITEM item = ch->GetInventoryItem(cell);
+			if (!item)
+				continue;
+			const DWORD chestVnum = item->GetVnum();
+			const bool classStarter = starterVnum != 0 && chestVnum == starterVnum;
+			const bool progression = chestVnum >= 50187 && chestVnum <= 50196;
+			const int requiredLevel = chestVnum == 50187
+					? 1 : (int)(chestVnum - 50187) * 10;
+			if (!classStarter && (!progression || ch->GetLevel() < requiredLevel))
+				continue;
+
+			if (!ch->UseItem(TItemPos(INVENTORY, cell)))
+				continue;
+			state.dwNextEquipmentCheckTime = 0;
+			state.bEquipPending = true;
+			state.dwNextGearAttemptTime = 0;
+			sys_log(0, "PLAYERBOT_GEAR: opened progression chest pid=%u name=%s vnum=%u level=%u",
+					ch->GetPlayerID(), ch->GetName(), chestVnum, ch->GetLevel());
+			return true;
+		}
 		return false;
 	}
 
@@ -4254,9 +4903,25 @@ namespace
 	{
 		if (!ch)
 			return false;
+		LPCHARACTER target = state.dwTargetVID != 0
+				? CHARACTER_MANAGER::instance().Find(state.dwTargetVID) : NULL;
+		const bool activeCombat = target && !target->IsDead() &&
+				(target->IsMonster() || target->IsStone());
+		const bool importantFight = activeCombat && (target->IsStone() ||
+				(target->IsMonster() && target->GetMobRank() >= MOB_RANK_BOSS));
+		// One third of ordinary grinders plans a longer session and uses attack-speed
+		// potions as well. Every bot uses them for Metins/bosses, but nobody drinks
+		// one merely while waiting at an NPC or recovering from death.
+		const bool longGrindingSession = activeCombat && target->IsMonster() &&
+				state.bLongTermGoal == BOT_GOAL_LEVEL_UP &&
+				(PlayerBotNavHash(ch->GetPlayerID() ^ 0x47524545U) % 3U) == 0;
+		const bool shouldUseGreen = !state.bVisitingShop &&
+				!state.bRecoveringAfterDeath && !state.bTacticalRetreat &&
+				(importantFight || longGrindingSession);
 
 		// 1. Green Potion (Zielona Mikstura - Attack Speed)
-		if (ch->FindAffect(AFFECT_ATT_SPEED) == NULL && state.mapBuffActiveUntil[27102] <= dwNow)
+		if (shouldUseGreen && ch->FindAffect(AFFECT_ATT_SPEED) == NULL &&
+				state.mapBuffActiveUntil[27102] <= dwNow)
 		{
 			const DWORD greenPotionVnums[] = { 27102, 27101, 27100, 27053 };
 			for (size_t i = 0; i < sizeof(greenPotionVnums) / sizeof(greenPotionVnums[0]); ++i)
@@ -4267,19 +4932,28 @@ namespace
 					if (!item || item->GetVnum() != greenPotionVnums[i])
 						continue;
 
+					const DWORD potionVnum = item->GetVnum();
 					if (ch->UseItem(TItemPos(INVENTORY, cell)))
 					{
-						state.mapBuffActiveUntil[27102] = dwNow + 600000; // 10 min duration
+						// FindAffect is authoritative for the real item duration. This short
+						// guard only prevents a broken proto from being consumed every tick.
+						state.mapBuffActiveUntil[27102] = dwNow + 30000;
 						sys_log(0, "PLAYERBOT_AI: used green potion pid=%u name=%s vnum=%u",
-								ch->GetPlayerID(), ch->GetName(), item->GetVnum());
+								ch->GetPlayerID(), ch->GetName(), potionVnum);
 						return true;
 					}
 				}
 			}
 		}
 
-		// 2. Purple Potion (Fioletowa Mikstura - Movement Speed)
-		if (ch->FindAffect(AFFECT_MOV_SPEED) == NULL && state.mapBuffActiveUntil[27105] <= dwNow)
+		// 2. Purple Potion (Fioletowa Mikstura - Movement Speed). Use it for travel,
+		// loot runs and the approach to a distant target, not while standing at NPCs.
+		const bool shouldUsePurple = !state.bVisitingShop &&
+				!state.bRecoveringAfterDeath && !state.bTacticalRetreat &&
+				(!activeCombat || DISTANCE_APPROX(ch->GetX() - target->GetX(),
+					target->GetY() - ch->GetY()) > 500);
+		if (shouldUsePurple && ch->FindAffect(AFFECT_MOV_SPEED) == NULL &&
+				state.mapBuffActiveUntil[27105] <= dwNow)
 		{
 			const DWORD purplePotionVnums[] = { 27105, 27104, 27103, 27054 };
 			for (size_t i = 0; i < sizeof(purplePotionVnums) / sizeof(purplePotionVnums[0]); ++i)
@@ -4290,11 +4964,12 @@ namespace
 					if (!item || item->GetVnum() != purplePotionVnums[i])
 						continue;
 
+					const DWORD potionVnum = item->GetVnum();
 					if (ch->UseItem(TItemPos(INVENTORY, cell)))
 					{
-						state.mapBuffActiveUntil[27105] = dwNow + 600000; // 10 min duration
+						state.mapBuffActiveUntil[27105] = dwNow + 30000;
 						sys_log(0, "PLAYERBOT_AI: used purple potion pid=%u name=%s vnum=%u",
-								ch->GetPlayerID(), ch->GetName(), item->GetVnum());
+								ch->GetPlayerID(), ch->GetName(), potionVnum);
 						return true;
 					}
 				}
@@ -5054,10 +5729,12 @@ namespace
 	{
 		if (!ch || !target || ch->GetSkillGroup() == 0 || dwNow < state.dwNextSkillCastTime)
 			return false;
+		LPITEM archerBow = NULL;
+		LPITEM archerArrow = NULL;
 		if (ch->GetJob() == JOB_ASSASSIN && ch->GetSkillGroup() == 2)
 		{
-			LPITEM bow = ch->GetWear(WEAR_WEAPON);
-			if (!bow || bow->GetSubType() != WEAPON_BOW || !EnsurePlayerBotArrowsEquipped(ch))
+			if (!EnsurePlayerBotArrowsEquipped(ch) ||
+					ch->GetArrowAndBow(&archerBow, &archerArrow, 1) != 1)
 				return false;
 		}
 
@@ -5078,6 +5755,8 @@ namespace
 				// packet follows the same order as the build verified in the client.
 				ch->ComputeSkill(skillVnum, target);
 				SendPlayerBotSkillPacket(ch, skillVnum);
+				if (archerArrow)
+					ch->UseArrow(archerArrow, 1);
 				state.dwLastBotSkillTime = dwNow;
 				state.dwLastCombatActionTime = dwNow;
 				// Shamans should weave weapon attacks between spells.  Casting an
@@ -5153,11 +5832,11 @@ namespace
 				PLAYERBOT_PARTY_COHESION_RADIUS))
 			return false;
 
-		LPITEM weapon = ch->GetWear(WEAR_WEAPON);
-		if (!weapon || weapon->GetType() != ITEM_WEAPON || weapon->GetSubType() != WEAPON_BOW)
+		LPITEM weapon = NULL;
+		LPITEM arrow = NULL;
+		if (!EnsurePlayerBotArrowsEquipped(ch) ||
+				ch->GetArrowAndBow(&weapon, &arrow, 1) != 1)
 			return false; // Only lure when equipped with a Bow!
-		if (!EnsurePlayerBotArrowsEquipped(ch))
-			return false;
 
 		if (dwNow < state.dwNextLureTime)
 			return false;
@@ -5211,12 +5890,12 @@ namespace
 				// Use a normal bow shot for the pull. Fire Arrow is part of the normal
 				// offensive rotation and was almost always on its real skill cooldown,
 				// which made the old lure silently fail even in a valid six-person PT.
-				LPITEM arrow = ch->GetWear(WEAR_ARROW);
 				int damage = CalcArrowDamage(ch, mob, weapon, arrow, false);
 				if (damage < 5)
 					damage = number(10, 20) + ch->GetLevel() * 2;
 				SendPlayerBotAttackPacket(ch, mob, MOTION_COMBO_ATTACK_1);
 				mob->Damage(ch, damage, DAMAGE_TYPE_NORMAL);
+				ch->UseArrow(arrow, 1);
 				mob->SetSyncOwner(ch);
 				state.dwNextAttackTime = dwNow + PLAYERBOT_SKILL_ANIMATION_LOCK;
 				state.dwLastCombatActionTime = dwNow;
@@ -5296,7 +5975,8 @@ namespace
 		for (size_t i = 0; i < gear.size(); ++i)
 		{
 			LPITEM item = gear[i];
-			if (!item || item->GetRefinedVnum() == 0 || item->GetRefineLevel() >= 6)
+			if (!item || item->GetRefinedVnum() == 0 ||
+					item->GetRefineLevel() >= GetPlayerBotRefineTarget(ch, item))
 				continue;
 			const TRefineTable* recipe = CRefineManager::instance().GetRefineRecipe(item->GetRefineSet());
 			if (!recipe)
@@ -5321,11 +6001,30 @@ namespace
 
 		const DWORD vnum = item->GetVnum();
 
+		// Level-30 weapons with average/skill damage are strategic market assets.
+		// Never vendor them: this also applies when the current owner is below level
+		// 30 or belongs to another class. They remain available for future playerbot
+		// trading/private shops instead of disappearing for a trivial NPC price.
+		if (IsPlayerBotSpecialLevel30Weapon(item))
+			return false;
+
 		// Quest progress must survive every merchant visit. In particular, Horse
 		// Medals used to look like ordinary miscellaneous loot and could be sold
 		// before the world-travel state machine returned the bot to the Stable Boy.
 		if (vnum == PLAYERBOT_HORSE_MEDAL_VNUM || (vnum >= 50701 && vnum <= 50706))
 			return false;
+
+		// Arrows are ammunition, not a primary weapon/equipment candidate. Keep all
+		// spare stacks for an Archer (including a Ninja which is about to choose the
+		// deterministic Bow profession), while other classes may sell accidental
+		// arrow drops at the Weapon Merchant.
+		if (item->GetType() == ITEM_WEAPON && item->GetSubType() == WEAPON_ARROW)
+		{
+			const bool isOrWillBeArcher = ch->GetJob() == JOB_ASSASSIN &&
+					(ch->GetSkillGroup() == 2 ||
+					 (ch->GetSkillGroup() == 0 && (ch->GetPlayerID() % 2) != 0));
+			return !isOrWillBeArcher;
+		}
 
 		if (item->GetType() == ITEM_SKILLBOOK)
 		{
@@ -5342,8 +6041,10 @@ namespace
 			(vnum >= 27100 && vnum <= 27105) || vnum == 27053 || vnum == 27054)
 			return false;
 
-		// Preserve starter chest
-		if (vnum == GetStarterChestVnum(ch->GetJob()))
+		// Preserve every Apprentice Chest until the bot can open it. Class-specific
+		// first chests use 50212/50213, while later progression boxes use 50187-50196.
+		if (vnum == GetStarterChestVnum(ch->GetJob()) ||
+				(vnum >= 50187 && vnum <= 50196))
 			return false;
 
 		// Preserve only materials on this bot's current two-attempt refine wishlist.
@@ -5654,6 +6355,9 @@ namespace
 		if (!ch || !ch->IsItemLoaded())
 			return false;
 
+		CompactPlayerBotPotionStacks(ch);
+		SellPlayerBotExcessPotions(ch);
+
 		// Count red and blue potions
 		size_t redCount = 0;
 		size_t blueCount = 0;
@@ -5711,6 +6415,12 @@ namespace
 			}
 		}
 
+		// Even the level-one shoes add movement speed. Missing footwear is therefore
+		// a progression problem, not cosmetic equipment.
+		if (NeedsPlayerBotProgressionBoots(ch))
+			BuyPlayerBotProgressionGear(ch,
+					GetPlayerBotProgressionBootsVnum(ch), "boots");
+
 		return true;
 	}
 
@@ -5721,12 +6431,19 @@ namespace
 		const bool sold = SellPlayerBotJunkAtMerchant(
 				ch, BOT_MERCHANT_WEAPON, "weapon_merchant");
 		bool bought = false;
-		if (NeedsPlayerBotProgressionWeapon(ch))
-			bought = BuyPlayerBotProgressionGear(ch,
-					GetPlayerBotProgressionWeaponVnum(ch), "weapon");
-		if (!bought && !ch->GetWear(WEAR_WEAPON))
+		const bool isArcher = ch->GetJob() == JOB_ASSASSIN && ch->GetSkillGroup() == 2;
+		// A missing weapon is essential, so restore the cheap functional weapon
+		// first. With a bow already equipped, ammunition takes priority over a
+		// level-tier upgrade: buying a better bow and leaving zero Yang for arrows
+		// merely creates a better-equipped idle bot.
+		if (!ch->GetWear(WEAR_WEAPON))
 			bought = BuyPlayerBotEmergencyWeapon(ch) || bought;
-		bought = BuyPlayerBotArrowsAtMerchant(ch) || bought;
+		if (isArcher)
+			bought = BuyPlayerBotArrowsAtMerchant(ch) || bought;
+		if (NeedsPlayerBotProgressionWeapon(ch) &&
+				(!isArcher || CountPlayerBotArrows(ch) >= PLAYERBOT_ARROW_RESTOCK_THRESHOLD))
+			bought = BuyPlayerBotProgressionGear(ch,
+					GetPlayerBotProgressionWeaponVnum(ch), "weapon") || bought;
 		return sold || bought;
 	}
 
@@ -5742,6 +6459,9 @@ namespace
 		if (NeedsPlayerBotProgressionShield(ch))
 			bought = BuyPlayerBotProgressionGear(ch,
 					GetPlayerBotProgressionShieldVnum(ch), "shield") || bought;
+		if (NeedsPlayerBotProgressionHelmet(ch))
+			bought = BuyPlayerBotProgressionGear(ch,
+					GetPlayerBotProgressionHelmetVnum(ch), "helmet") || bought;
 		return sold || bought;
 	}
 
@@ -5790,6 +6510,26 @@ namespace
 		return false;
 	}
 
+	bool HasPlayerBotPriorityRefineOpportunity(LPCHARACTER ch)
+	{
+		if (!ch || !ch->IsItemLoaded())
+			return false;
+
+		// Cross-map blacksmith trips are reserved for currently worn essentials.
+		// A routine accessory or spare can wait until the next normal M1 visit, but
+		// a weapon/body/shield/helmet/boots upgrade should not sit unused in M2/M3.
+		const BYTE coreWearSlots[] = {
+			WEAR_WEAPON, WEAR_BODY, WEAR_SHIELD, WEAR_HEAD, WEAR_FOOTS
+		};
+		for (size_t i = 0; i < sizeof(coreWearSlots) / sizeof(coreWearSlots[0]); ++i)
+		{
+			LPITEM item = ch->GetWear(coreWearSlots[i]);
+			if (item && CanPlayerBotAttemptRefineItem(ch, item))
+				return true;
+		}
+		return false;
+	}
+
 	void CountPlayerBotPotions(LPCHARACTER ch, size_t& redCount, size_t& blueCount)
 	{
 		redCount = 0;
@@ -5825,15 +6565,29 @@ namespace
 				(!isMage && blueCount < 10 && ch->GetGold() >= 1200);
 	}
 
-	bool NeedsPlayerBotM1Services(LPCHARACTER ch)
+	bool NeedsPlayerBotEmergencyPotions(LPCHARACTER ch)
+	{
+		if (!ch)
+			return false;
+		size_t redCount = 0, blueCount = 0;
+		CountPlayerBotPotions(ch, redCount, blueCount);
+		const bool isMage = ch->GetJob() == JOB_SHAMAN || ch->GetJob() == JOB_SURA;
+		// Normal restocking happens at 50/30 (or 10) units. Cross-map travel is
+		// justified only by a genuinely short combat reserve, not by one consumed pot.
+		return redCount < 10 || (isMage ? blueCount < 8 : blueCount == 0);
+	}
+
+	bool NeedsPlayerBotCriticalTownServices(LPCHARACTER ch)
 	{
 		if (!ch || !ch->IsItemLoaded())
 			return false;
-		if (ch->GetWear(WEAR_WEAPON) == NULL || NeedsPlayerBotPotions(ch) ||
-				NeedsPlayerBotProgressionWeapon(ch) || NeedsPlayerBotProgressionArmor(ch) ||
-				NeedsPlayerBotProgressionShield(ch) ||
+		// These problems can make continued combat impossible or waste most future
+		// drops, so they justify an immediate cross-map return.
+		if (ch->GetWear(WEAR_WEAPON) == NULL || ch->GetWear(WEAR_BODY) == NULL ||
+				ch->GetWear(WEAR_SHIELD) == NULL || ch->GetWear(WEAR_HEAD) == NULL ||
+				ch->GetWear(WEAR_FOOTS) == NULL || NeedsPlayerBotEmergencyPotions(ch) ||
 				NeedsPlayerBotArrows(ch) ||
-				ch->GetEmptyInventory(3) < 0 || CountPlayerBotJunkItems(ch) >= 12)
+				ch->GetEmptyInventory(3) < 0)
 			return true;
 
 		size_t occupiedGridCells = 0;
@@ -5846,17 +6600,57 @@ namespace
 		return occupiedGridCells * 100 >= INVENTORY_MAX_NUM * 45;
 	}
 
+	bool NeedsPlayerBotM1OnlyServices(LPCHARACTER ch)
+	{
+		if (!ch)
+			return false;
+		// Bokjung has no profession trainers or Biologist. Everything else can be
+		// handled locally in M2, so only these two real activities justify M2 -> M1.
+		if (ch->GetLevel() >= 5 && ch->GetSkillGroup() == 0 &&
+				ch->GetJob() <= JOB_SHAMAN)
+			return true;
+
+		const TPlayerBotBiologistMission* mission =
+				GetActivePlayerBotBiologistMission(ch);
+		if (!mission)
+			return false;
+		const int accepted = std::max(0, ch->GetQuestFlag(
+				GetPlayerBotBiologistFlag(*mission, "collect_count")));
+		const int remaining = std::max(0, (int)mission->requiredCount - accepted);
+		return remaining > 0 && ch->CountSpecifyItem(mission->itemVnum) >= remaining;
+	}
+
 	bool IsPlayerBotM2LevelingCohort(LPCHARACTER ch)
 	{
-		// M1 remains the natural 1-23 zone; from level 20 onward most, but not all,
-		// characters gradually move to M2.  The overlap avoids a synchronized exodus.
-		return ch && ch->GetLevel() >= 20 && ch->GetLevel() <= 35 &&
-				(PlayerBotNavHash(ch->GetPlayerID() ^ 0x4d325850U) % 5U) != 0;
+		if (!ch || ch->GetLevel() < 20 || ch->GetLevel() > 35)
+			return false;
+		// Levels 20-21 still have a little useful M1 progression, so retain a small
+		// stable minority there. At level 22 every ordinary leveler graduates to M2.
+		return ch->GetLevel() >= 22 ||
+				(PlayerBotNavHash(ch->GetPlayerID() ^ 0x4d325850U) % 10U) != 0;
+	}
+
+	bool ShouldPlayerBotLeaveRemoteMapForRefining(LPCHARACTER ch,
+			TPlayerBotAIState& state, DWORD dwNow)
+	{
+		if (!HasPlayerBotPriorityRefineOpportunity(ch))
+			return false;
+		if (state.dwNextRemoteRefineReturnTime == 0)
+		{
+			const DWORD spread = PlayerBotNavHash(ch->GetPlayerID() ^
+					(dwNow / 60000U) ^ 0x52455455U) %
+					(PLAYERBOT_REMOTE_REFINE_RETURN_MAX_DELAY -
+					 PLAYERBOT_REMOTE_REFINE_RETURN_MIN_DELAY + 1);
+			state.dwNextRemoteRefineReturnTime = dwNow +
+					PLAYERBOT_REMOTE_REFINE_RETURN_MIN_DELAY + spread;
+			return false;
+		}
+		return dwNow >= state.dwNextRemoteRefineReturnTime;
 	}
 
 	bool ShouldPlayerBotVisitM3(LPCHARACTER ch)
 	{
-		if (!HasPlayerBotM3ReadyEquipment(ch) || ch->GetLevel() > 35 ||
+		if (!HasPlayerBotM3ReadyEquipment(ch) || ch->GetLevel() > 24 ||
 				HasPlayerBotSpecialLevel30Weapon(ch, true))
 			return false;
 		// A stable third of the eligible population farms infected animals for
@@ -5877,13 +6671,62 @@ namespace
 		return (PlayerBotNavHash(ch->GetPlayerID() ^ 0x42455354U) % 2U) == 0;
 	}
 
+	bool ShouldPlayerBotPursueHorseExpedition(LPCHARACTER ch, DWORD dwNow)
+	{
+		if (!CanPlayerBotAdvanceHorse(ch))
+			return false;
+
+		// A combat horse matters most to Warriors and weapon Suras, but it must be
+		// one goal among several rather than a compulsory conveyor belt through the
+		// dungeon.  The cohort rotates every 30 minutes and again after every earned
+		// horse level.  Eventually every build gets opportunities while most bots
+		// continue levelling in M2 at any given time.
+		const bool hasCombatHorse = ch->GetHorseLevel() >= 11;
+		BYTE chance = 10;
+		switch (ch->GetJob())
+		{
+			case JOB_WARRIOR:
+				chance = hasCombatHorse ? 4 : (ch->GetHorseLevel() == 0 ? 34 : 26);
+				break;
+			case JOB_SURA:
+				// Skill group 1 is Weaponry (WP); group 2 is Black Magic.
+				chance = ch->GetSkillGroup() == 1
+						? (hasCombatHorse ? 4 : (ch->GetHorseLevel() == 0 ? 32 : 25))
+						: (hasCombatHorse ? 2 : (ch->GetHorseLevel() == 0 ? 14 : 9));
+				break;
+			case JOB_ASSASSIN:
+				chance = ch->GetSkillGroup() == 2
+						? (hasCombatHorse ? 1 : (ch->GetHorseLevel() == 0 ? 6 : 4))
+						: (hasCombatHorse ? 2 : (ch->GetHorseLevel() == 0 ? 18 : 14));
+				break;
+			case JOB_SHAMAN:
+				chance = hasCombatHorse ? 2 : (ch->GetHorseLevel() == 0 ? 15 : 10);
+				break;
+		}
+		TPlayerBotAIStateMap::const_iterator stateIt =
+				s_mapPlayerBotAIStates.find(ch->GetPlayerID());
+		if (stateIt != s_mapPlayerBotAIStates.end() &&
+				stateIt->second.bAmbition == BOT_AMBITION_HORSE && !hasCombatHorse)
+			chance = std::min<BYTE>(55, chance + 15);
+
+		const DWORD window = dwNow / (30U * 60U * 1000U);
+		const DWORD seed = ch->GetPlayerID() ^ (window * 0x9e3779b9U) ^
+				((DWORD)(ch->GetHorseLevel() + 1) * 0x85ebca6bU);
+		return (PlayerBotNavHash(seed ^ 0x484f5253U) % 100U) < chance;
+	}
+
 	int GetPlayerBotDesiredHorseMedalStock(LPCHARACTER ch)
 	{
 		if (!ch)
 			return 1;
-		// Some players leave after the first medal, while others deliberately stay
-		// for two or three. The absolute dungeon timeout still bounds every trip.
-		return 1 + (PlayerBotNavHash(ch->GetPlayerID() ^ 0x4d454441U) % 3U);
+		// The high-priority builds occasionally prepare the next horse level in the
+		// same visit. Other classes leave after one medal, freeing dungeon capacity
+		// and returning to ordinary experience progression much sooner.
+		const bool highPriority = ch->GetJob() == JOB_WARRIOR ||
+				(ch->GetJob() == JOB_SURA && ch->GetSkillGroup() == 1);
+		return highPriority
+				? 1 + (PlayerBotNavHash(ch->GetPlayerID() ^ 0x4d454441U) % 2U)
+				: 1;
 	}
 
 	bool TransitionPlayerBotMap(LPCHARACTER ch, TPlayerBotAIState& state,
@@ -5900,27 +6743,42 @@ namespace
 		}
 
 		const long oldMap = ch->GetMapIndex();
+		const bool wasRiding = ch->IsRiding();
 		if (ch->GetParty())
 			ch->GetParty()->Quit(ch->GetPlayerID());
 		state.dwTargetVID = 0;
 		ch->SetVictim(NULL);
 		ch->Stop();
+		// A PC mount and the separately summoned horse are two different server
+		// entities. StopRiding() summons the latter on the old map, so explicitly
+		// remove it before Show(). Otherwise a rider can leave behind an orphaned
+		// horse at a dungeon portal (issue #4).
+		if (wasRiding)
+			ch->StopRiding();
+		ch->HorseSummon(false);
 		ClearPlayerBotRoute(state, true);
 		state.bVisitingShop = false;
 		state.bVisitingBiologist = false;
 		state.bVisitingStable = false;
 		if (!ch->Show(targetMap, targetX, targetY, 0))
 		{
+			if (wasRiding && !ch->IsRiding())
+				ch->StartRiding();
 			sys_err("PLAYERBOT_WORLD: transition failed pid=%u name=%s from=%ld to=%ld reason=%s",
 					ch->GetPlayerID(), ch->GetName(), oldMap, targetMap, reason ? reason : "?");
 			return false;
 		}
 		ch->Stop();
 		ch->SendMovePacket(FUNC_MOVE, 0, targetX, targetY, 0, dwNow);
+		if (wasRiding && ch->GetHorseHealth() > 0 && ch->GetHorseStamina() > 0)
+			ch->StartRiding();
 		ch->Save();
 		state.dwNextWanderTime = dwNow + number(1500, 4500);
+		state.dwNextHorseRideCheckTime = dwNow + 1000;
 		state.dwDungeonEnteredTime = targetMap == PLAYERBOT_MAP_MONKEY_EASY ? dwNow : 0;
 		state.dwM3EnteredTime = targetMap == PLAYERBOT_MAP_CHUNJO_M3 ? dwNow : 0;
+		if (targetMap == PLAYERBOT_MAP_CHUNJO_M3)
+			state.dwNextRemoteRefineReturnTime = 0;
 		sys_log(0, "PLAYERBOT_WORLD: transitioned pid=%u name=%s from=%ld to=%ld pos=(%ld,%ld) reason=%s",
 				ch->GetPlayerID(), ch->GetName(), oldMap, targetMap, targetX, targetY,
 				reason ? reason : "?");
@@ -5953,29 +6811,108 @@ namespace
 				state.bVisitingStable || state.bRecoveringAfterDeath || state.bTacticalRetreat)
 			return false;
 
+		const long mapIndex = ch->GetMapIndex();
+		const bool hasMedal = ch->CountSpecifyItem(PLAYERBOT_HORSE_MEDAL_VNUM) > 0;
+		const bool pursuesHorseExpedition =
+				ShouldPlayerBotPursueHorseExpedition(ch, dwNow);
+		const bool needsHorseExpedition = pursuesHorseExpedition && !hasMedal;
+		const bool needsEssentialWeaponSupply = ch->GetWear(WEAR_WEAPON) == NULL ||
+				NeedsPlayerBotArrows(ch);
+		const bool m2LevelingCohort = IsPlayerBotM2LevelingCohort(ch);
+		const bool wantsM3 = ShouldPlayerBotVisitM3(ch);
+		const bool needsCriticalTownServices = NeedsPlayerBotCriticalTownServices(ch);
+		const bool needsM1OnlyServices = NeedsPlayerBotM1OnlyServices(ch);
+		// M2 has its own blacksmith. Only the remote M3 farm needs to schedule a
+		// return to town for equipment progression.
+		const bool scheduledRemoteRefine = mapIndex == PLAYERBOT_MAP_CHUNJO_M3 &&
+				ShouldPlayerBotLeaveRemoteMapForRefining(ch, state, dwNow);
+
+		// Leaving the Monkey Dungeon is a decision, not a pathfinding exercise.
+		// Evaluate it before yielding to an existing victim: a monster near the
+		// portal must not keep a finished, timed-out or unequipped bot here forever.
+		if (mapIndex == PLAYERBOT_MAP_MONKEY_EASY)
+		{
+			if (state.dwDungeonEnteredTime == 0)
+				state.dwDungeonEnteredTime = dwNow;
+			const bool visitExpired = dwNow - state.dwDungeonEnteredTime >=
+					PLAYERBOT_MONKEY_MAX_VISIT_TIME;
+			const int medalCount = ch->CountSpecifyItem(PLAYERBOT_HORSE_MEDAL_VNUM);
+			playerbot_world_rules::TMonkeyVisitContext context;
+			context.needsEssentialSupply = needsEssentialWeaponSupply;
+			context.medalCount = medalCount;
+			context.desiredMedalCount = GetPlayerBotDesiredHorseMedalStock(ch);
+			context.visitExpired = visitExpired;
+			// Re-evaluate the rotating cohort even inside the dungeon. Bots which are
+			// no longer selected finish their current medal (if any) and leave instead
+			// of occupying the dungeon until its absolute 30-minute timeout.
+			context.canAdvanceHorse = CanPlayerBotAdvanceHorse(ch) &&
+					pursuesHorseExpedition;
+			const playerbot_world_rules::EMonkeyExitDecision exitDecision =
+					playerbot_world_rules::DecideMonkeyExit(context);
+			if (exitDecision != playerbot_world_rules::MONKEY_STAY)
+			{
+				SetPlayerBotGoal(ch, state,
+						exitDecision == playerbot_world_rules::MONKEY_EXIT_RESTOCK
+						? BOT_GOAL_RESTOCK : BOT_GOAL_HORSE, dwNow);
+				const char* reason = "monkey_horse_complete_direct";
+				if (exitDecision == playerbot_world_rules::MONKEY_EXIT_RESTOCK)
+					reason = "monkey_restock_direct";
+				else if (exitDecision == playerbot_world_rules::MONKEY_EXIT_MEDAL_READY)
+					reason = "monkey_medal_found_direct";
+				else if (exitDecision == playerbot_world_rules::MONKEY_EXIT_TIMEOUT)
+					reason = "monkey_timeout_direct";
+				const bool transitioned = TransitionPlayerBotMap(ch, state,
+						PLAYERBOT_MAP_CHUNJO_M2, PLAYERBOT_M2_MONKEY_RETURN_X,
+						PLAYERBOT_M2_MONKEY_RETURN_Y, dwNow, reason);
+				if (transitioned && medalCount == 0)
+					state.dwNextWorldTravelTime = dwNow + number(300000, 900000);
+				return transitioned;
+			}
+		}
+
+		// M3 is a focused level-30 weapon farm, not a levelling map. A bot which
+		// reaches level 25 graduates immediately, even if an old victim is still
+		// alive, and resumes normal progression in M2.
+		if (mapIndex == PLAYERBOT_MAP_CHUNJO_M3 && ch->GetLevel() > 24)
+		{
+			SetPlayerBotGoal(ch, state, BOT_GOAL_LEVEL_UP, dwNow);
+			return MovePlayerBotToWorldPortal(ch, state,
+					PLAYERBOT_M3_RETURN_PORTAL_X, PLAYERBOT_M3_RETURN_PORTAL_Y,
+					PLAYERBOT_MAP_CHUNJO_M2, PLAYERBOT_M2_FROM_M3_X,
+					PLAYERBOT_M2_FROM_M3_Y, dwNow, "m3_level_graduated");
+		}
+
 		LPCHARACTER victim = state.dwTargetVID != 0
 				? CHARACTER_MANAGER::instance().Find(state.dwTargetVID) : NULL;
 		if (victim && !victim->IsDead())
 			return false;
 
-		const long mapIndex = ch->GetMapIndex();
-		const bool hasMedal = ch->CountSpecifyItem(PLAYERBOT_HORSE_MEDAL_VNUM) > 0;
-		const bool needsHorseExpedition = CanPlayerBotAdvanceHorse(ch) && !hasMedal;
-		const bool m2LevelingCohort = IsPlayerBotM2LevelingCohort(ch);
-		const bool wantsM3 = ShouldPlayerBotVisitM3(ch);
-
 		if (mapIndex == PLAYERBOT_MAP_CHUNJO_M1)
 		{
-			if (hasMedal || NeedsPlayerBotM1Services(ch))
+			// Compact and sell an oversized potion reserve before the first trip to
+			// M2. Once the bot is already outside M1, excess potions alone must not
+			// drag it back across maps; it can keep levelling until a real restock or
+			// inventory visit is needed.
+			const bool townVisitRecentlyCompleted = state.dwNextShopCheckTime != 0 &&
+					dwNow < state.dwNextShopCheckTime;
+			const bool needsAnyRefine = HasPlayerBotRefineOpportunity(ch);
+			const bool needsTownPreparation = NeedsPlayerBotPotions(ch) ||
+					CountPlayerBotJunkItems(ch) >= 12 || needsAnyRefine;
+			if (hasMedal || needsCriticalTownServices || needsM1OnlyServices ||
+					HasPlayerBotExcessPotions(ch) ||
+					(needsTownPreparation && !townVisitRecentlyCompleted))
 				return false;
 			if (!needsHorseExpedition && !m2LevelingCohort && !wantsM3)
 				return false;
 			if (state.dwNextWorldTravelTime == 0)
 			{
+				const bool graduatedFromM1 = ch->GetLevel() >= 22 && !needsHorseExpedition;
 				const DWORD minDelay = needsHorseExpedition ? PLAYERBOT_HORSE_TRAVEL_MIN_DELAY :
-						PLAYERBOT_WORLD_TRAVEL_MIN_DELAY;
+						(graduatedFromM1 ? PLAYERBOT_LEVEL22_TRAVEL_MIN_DELAY :
+						 PLAYERBOT_WORLD_TRAVEL_MIN_DELAY);
 				const DWORD maxDelay = needsHorseExpedition ? PLAYERBOT_HORSE_TRAVEL_MAX_DELAY :
-						PLAYERBOT_WORLD_TRAVEL_MAX_DELAY;
+						(graduatedFromM1 ? PLAYERBOT_LEVEL22_TRAVEL_MAX_DELAY :
+						 PLAYERBOT_WORLD_TRAVEL_MAX_DELAY);
 				const DWORD spread = PlayerBotNavHash(ch->GetPlayerID() ^ 0x54524156U) %
 						(maxDelay - minDelay + 1);
 				state.dwNextWorldTravelTime = dwNow + minDelay + spread;
@@ -5999,8 +6936,37 @@ namespace
 			if (hasMedal)
 				return false;
 
+			// Profession trainers and the Biologist only exist in Joan. Routine gear,
+			// potion, inventory and refine needs are served by the real Bokjung NPCs.
+			if (needsM1OnlyServices)
+			{
+				SetPlayerBotGoal(ch, state, ch->GetSkillGroup() == 0
+						? BOT_GOAL_CHOOSE_PROFESSION : BOT_GOAL_BIOLOGIST, dwNow);
+				return MovePlayerBotToWorldPortal(ch, state,
+						PLAYERBOT_M2_TO_M1_PORTAL_X, PLAYERBOT_M2_TO_M1_PORTAL_Y,
+						PLAYERBOT_MAP_CHUNJO_M1, PLAYERBOT_M1_RETURN_X,
+						PLAYERBOT_M1_RETURN_Y, dwNow, "m1_only_service");
+			}
+			if (needsCriticalTownServices)
+				return false; // local M2 town visit owns this need
+
 			if (needsHorseExpedition)
 			{
+				// Honour the rest period set by a failed/timed-out expedition and
+				// stagger fresh M2 populations after a restart. Without this guard a
+				// direct exit was followed by an immediate direct re-entry.
+				if (state.dwNextWorldTravelTime == 0)
+				{
+					const DWORD spread = PlayerBotNavHash(ch->GetPlayerID() ^ 0x4d4f4e4bU) %
+							(PLAYERBOT_HORSE_TRAVEL_MAX_DELAY -
+							 PLAYERBOT_HORSE_TRAVEL_MIN_DELAY + 1);
+					state.dwNextWorldTravelTime = dwNow +
+							PLAYERBOT_HORSE_TRAVEL_MIN_DELAY + spread;
+					return false;
+				}
+				if (playerbot_world_rules::IsTravelCooldownActive(
+						dwNow, state.dwNextWorldTravelTime))
+					return false;
 				SetPlayerBotGoal(ch, state, BOT_GOAL_HORSE, dwNow);
 				return MovePlayerBotToWorldPortal(ch, state,
 						PLAYERBOT_M2_MONKEY_PORTAL_X, PLAYERBOT_M2_MONKEY_PORTAL_Y,
@@ -6008,7 +6974,7 @@ namespace
 						PLAYERBOT_MONKEY_EASY_ARRIVAL_Y, dwNow, "horse_to_monkey");
 			}
 
-			if (wantsM3 && !NeedsPlayerBotM1Services(ch))
+			if (wantsM3 && !needsCriticalTownServices)
 			{
 				SetPlayerBotGoal(ch, state, BOT_GOAL_GET_EQUIPMENT, dwNow);
 				return MovePlayerBotToWorldPortal(ch, state,
@@ -6017,13 +6983,13 @@ namespace
 						PLAYERBOT_M3_ARRIVAL_Y, dwNow, "level30_weapon_to_m3");
 			}
 
-			if (NeedsPlayerBotM1Services(ch) || !m2LevelingCohort)
+			if (!m2LevelingCohort)
 			{
-				SetPlayerBotGoal(ch, state, BOT_GOAL_RESTOCK, dwNow);
+				SetPlayerBotGoal(ch, state, BOT_GOAL_LEVEL_UP, dwNow);
 				const bool moving = MovePlayerBotToWorldPortal(ch, state,
 						PLAYERBOT_M2_TO_M1_PORTAL_X, PLAYERBOT_M2_TO_M1_PORTAL_Y,
 						PLAYERBOT_MAP_CHUNJO_M1, PLAYERBOT_M1_RETURN_X, PLAYERBOT_M1_RETURN_Y,
-						dwNow, "services_to_m1");
+						dwNow, "m2_level_range_complete");
 				if (ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M1)
 					state.dwNextWorldTravelTime = dwNow + number(300000, 900000);
 				return moving;
@@ -6037,42 +7003,29 @@ namespace
 			if (state.dwM3EnteredTime == 0)
 				state.dwM3EnteredTime = dwNow;
 			const bool visitExpired = dwNow - state.dwM3EnteredTime >= PLAYERBOT_M3_MAX_VISIT_TIME;
-			if (!visitExpired && !NeedsPlayerBotM1Services(ch) &&
+			if (!visitExpired && !needsCriticalTownServices && !needsM1OnlyServices &&
+					!scheduledRemoteRefine &&
 					!HasPlayerBotSpecialLevel30Weapon(ch, true))
 				return false;
 
 			SetPlayerBotGoal(ch, state,
-					NeedsPlayerBotM1Services(ch) ? BOT_GOAL_RESTOCK : BOT_GOAL_LEVEL_UP, dwNow);
+					(needsCriticalTownServices || needsM1OnlyServices) ? BOT_GOAL_RESTOCK :
+					(scheduledRemoteRefine ? BOT_GOAL_GET_EQUIPMENT : BOT_GOAL_LEVEL_UP), dwNow);
+			const char* reason = "m3_weapon_found";
+			if (needsCriticalTownServices || needsM1OnlyServices)
+				reason = "m3_services_to_m2";
+			else if (scheduledRemoteRefine)
+				reason = "m3_scheduled_refine_to_m2";
+			else if (visitExpired)
+				reason = "m3_visit_complete";
 			return MovePlayerBotToWorldPortal(ch, state,
 					PLAYERBOT_M3_RETURN_PORTAL_X, PLAYERBOT_M3_RETURN_PORTAL_Y,
 					PLAYERBOT_MAP_CHUNJO_M2, PLAYERBOT_M2_FROM_M3_X,
-					PLAYERBOT_M2_FROM_M3_Y, dwNow,
-					visitExpired ? "m3_visit_complete" : "m3_weapon_found");
+					PLAYERBOT_M2_FROM_M3_Y, dwNow, reason);
 		}
 
 		if (mapIndex == PLAYERBOT_MAP_MONKEY_EASY)
-		{
-			if (state.dwDungeonEnteredTime == 0)
-				state.dwDungeonEnteredTime = dwNow;
-			const bool visitExpired = dwNow - state.dwDungeonEnteredTime >=
-					PLAYERBOT_MONKEY_MAX_VISIT_TIME;
-			const int medalCount = ch->CountSpecifyItem(PLAYERBOT_HORSE_MEDAL_VNUM);
-			const int desiredMedals = GetPlayerBotDesiredHorseMedalStock(ch);
-			if (medalCount < desiredMedals && !visitExpired && CanPlayerBotAdvanceHorse(ch))
-				return false; // fight monkeys until a real medal drops
-
-			SetPlayerBotGoal(ch, state, BOT_GOAL_HORSE, dwNow);
-			// The Easy Monkey Dungeon is a maze with local, no-loading-screen
-			// teleports. Navigating every corridor only to leave is expensive and
-			// fragile, so departure is the one deliberately direct dungeon transfer.
-			const bool transitioned = TransitionPlayerBotMap(ch, state,
-					PLAYERBOT_MAP_CHUNJO_M2, PLAYERBOT_M2_MONKEY_RETURN_X,
-					PLAYERBOT_M2_MONKEY_RETURN_Y, dwNow,
-					hasMedal ? "monkey_medal_found_direct" : "monkey_timeout_direct");
-			if (transitioned && !hasMedal)
-				state.dwNextWorldTravelTime = dwNow + number(300000, 900000);
-			return transitioned;
-		}
+			return false; // stay and fight; departure was handled before victim yielding
 
 		return false;
 	}
@@ -6097,20 +7050,38 @@ namespace
 		return BOT_TOWN_PHASE_NONE;
 	}
 
+	BYTE GetPlayerBotFirstDirectTownPhase(const TPlayerBotAIState& state)
+	{
+		if (state.bTownNeedWeaponMerchant)
+			return BOT_TOWN_PHASE_WEAPON_MERCHANT;
+		if (state.bTownNeedArmorMerchant)
+			return BOT_TOWN_PHASE_ARMOR_MERCHANT;
+		if (state.bTownNeedMisc)
+			return BOT_TOWN_PHASE_MISC_MERCHANT;
+		if (state.bTownNeedBlacksmith)
+			return BOT_TOWN_PHASE_BLACKSMITH;
+		return BOT_TOWN_PHASE_NONE;
+	}
+
 	void StartPlayerBotTownVisit(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
 	{
-		if (!ch || state.bVisitingShop)
+		if (!ch || state.bVisitingShop ||
+				(ch->GetMapIndex() != PLAYERBOT_MAP_CHUNJO_M1 &&
+				 ch->GetMapIndex() != PLAYERBOT_MAP_CHUNJO_M2))
 			return;
+		const bool inM2 = ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2;
 
-		state.bTownNeedTrainer = ch->GetLevel() >= 5 && ch->GetSkillGroup() == 0 &&
+		state.bTownNeedTrainer = !inM2 && ch->GetLevel() >= 5 && ch->GetSkillGroup() == 0 &&
 				ch->GetJob() <= JOB_SHAMAN;
 		state.bTownNeedMisc = HasPlayerBotJunkForMerchant(ch, BOT_MERCHANT_MISC) ||
-				NeedsPlayerBotPotions(ch);
+				NeedsPlayerBotPotions(ch) || HasPlayerBotExcessPotions(ch) ||
+				NeedsPlayerBotProgressionBoots(ch);
 		state.bTownNeedWeaponMerchant = HasPlayerBotJunkForMerchant(
 				ch, BOT_MERCHANT_WEAPON) || ch->GetWear(WEAR_WEAPON) == NULL ||
 				NeedsPlayerBotProgressionWeapon(ch) || NeedsPlayerBotArrows(ch);
 		state.bTownNeedArmorMerchant = HasPlayerBotJunkForMerchant(ch, BOT_MERCHANT_ARMOR) ||
-				NeedsPlayerBotProgressionArmor(ch) || NeedsPlayerBotProgressionShield(ch);
+				NeedsPlayerBotProgressionArmor(ch) || NeedsPlayerBotProgressionShield(ch) ||
+				NeedsPlayerBotProgressionHelmet(ch);
 		state.bTownNeedBlacksmith = HasPlayerBotRefineOpportunity(ch);
 		if (!state.bTownNeedTrainer && !state.bTownNeedMisc && !state.bTownNeedWeaponMerchant &&
 				!state.bTownNeedArmorMerchant && !state.bTownNeedBlacksmith)
@@ -6120,19 +7091,28 @@ namespace
 		}
 
 		state.bVisitingShop = true;
-		const bool alreadyInsideTown = ch->GetX() >= 57000 && ch->GetX() <= 63000 &&
-				ch->GetY() >= 170000 && ch->GetY() <= 174000;
-		if (alreadyInsideTown)
+		if (inM2)
 		{
-			state.bTownVisitPhase = GetPlayerBotFirstInteriorTownPhase(state);
-			if (state.bTownVisitPhase == BOT_TOWN_PHASE_NONE)
-				state.bTownVisitPhase = BOT_TOWN_PHASE_GATE_OUT;
+			// Bokjung has no decorative gate split: visit only the specialists which
+			// are needed and then walk straight back to the local hunting fields.
+			state.bTownVisitPhase = GetPlayerBotFirstDirectTownPhase(state);
 		}
 		else
 		{
-			state.bTownVisitPhase = GetPlayerBotFirstExteriorTownPhase(state);
-			if (state.bTownVisitPhase == BOT_TOWN_PHASE_NONE)
-				state.bTownVisitPhase = BOT_TOWN_PHASE_GATE_IN;
+			const bool alreadyInsideTown = ch->GetX() >= 57000 && ch->GetX() <= 63000 &&
+					ch->GetY() >= 170000 && ch->GetY() <= 174000;
+			if (alreadyInsideTown)
+			{
+				state.bTownVisitPhase = GetPlayerBotFirstInteriorTownPhase(state);
+				if (state.bTownVisitPhase == BOT_TOWN_PHASE_NONE)
+					state.bTownVisitPhase = BOT_TOWN_PHASE_GATE_OUT;
+			}
+			else
+			{
+				state.bTownVisitPhase = GetPlayerBotFirstExteriorTownPhase(state);
+				if (state.bTownVisitPhase == BOT_TOWN_PHASE_NONE)
+					state.bTownVisitPhase = BOT_TOWN_PHASE_GATE_IN;
+			}
 		}
 		state.dwTownWaitUntil = 0;
 		state.dwNextShopCheckTime = dwNow + 60000;
@@ -6432,8 +7412,19 @@ namespace
 
 	bool HandlePlayerBotTownVisit(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
 	{
-		if (!ch || !state.bVisitingShop || ch->GetMapIndex() != 21)
+		if (!ch || !state.bVisitingShop ||
+				(ch->GetMapIndex() != PLAYERBOT_MAP_CHUNJO_M1 &&
+				 ch->GetMapIndex() != PLAYERBOT_MAP_CHUNJO_M2))
 			return false;
+		const bool inM2 = ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2;
+		const long weaponNpcX = inM2 ? PLAYERBOT_M2_WEAPON_MERCHANT_X : PLAYERBOT_WEAPON_MERCHANT_X;
+		const long weaponNpcY = inM2 ? PLAYERBOT_M2_WEAPON_MERCHANT_Y : PLAYERBOT_WEAPON_MERCHANT_Y;
+		const long armorNpcX = inM2 ? PLAYERBOT_M2_ARMOR_MERCHANT_X : PLAYERBOT_ARMOR_MERCHANT_X;
+		const long armorNpcY = inM2 ? PLAYERBOT_M2_ARMOR_MERCHANT_Y : PLAYERBOT_ARMOR_MERCHANT_Y;
+		const long miscNpcX = inM2 ? PLAYERBOT_M2_MISC_MERCHANT_X : PLAYERBOT_MISC_MERCHANT_X;
+		const long miscNpcY = inM2 ? PLAYERBOT_M2_MISC_MERCHANT_Y : PLAYERBOT_MISC_MERCHANT_Y;
+		const long blacksmithNpcX = inM2 ? PLAYERBOT_M2_BLACKSMITH_X : PLAYERBOT_BLACKSMITH_X;
+		const long blacksmithNpcY = inM2 ? PLAYERBOT_M2_BLACKSMITH_Y : PLAYERBOT_BLACKSMITH_Y;
 
 		if (state.bTownVisitPhase == BOT_TOWN_PHASE_TRAINER ||
 				state.bTownVisitPhase == BOT_TOWN_PHASE_TRAINER_WAIT)
@@ -6453,9 +7444,16 @@ namespace
 
 		if (state.bTownVisitPhase == BOT_TOWN_PHASE_NONE)
 		{
-			state.bTownVisitPhase = GetPlayerBotFirstExteriorTownPhase(state);
-			if (state.bTownVisitPhase == BOT_TOWN_PHASE_NONE)
+			state.bTownVisitPhase = inM2
+					? GetPlayerBotFirstDirectTownPhase(state)
+					: GetPlayerBotFirstExteriorTownPhase(state);
+			if (!inM2 && state.bTownVisitPhase == BOT_TOWN_PHASE_NONE)
 				state.bTownVisitPhase = BOT_TOWN_PHASE_GATE_IN;
+			if (inM2 && state.bTownVisitPhase == BOT_TOWN_PHASE_NONE)
+			{
+				FinishPlayerBotTownVisit(ch, state, dwNow, true);
+				return true;
+			}
 		}
 
 		// Eight profession trainers stand south of Joan.  Their npc.txt cells are
@@ -6510,8 +7508,8 @@ namespace
 		}
 
 		long weaponMerchantX = 0, weaponMerchantY = 0;
-		GetPlayerBotNpcApproach(ch->GetPlayerID(), PLAYERBOT_WEAPON_MERCHANT_X,
-				PLAYERBOT_WEAPON_MERCHANT_Y, 0x57454150U, weaponMerchantX, weaponMerchantY);
+		GetPlayerBotNpcApproach(ch->GetPlayerID(), weaponNpcX,
+				weaponNpcY, 0x57454150U, weaponMerchantX, weaponMerchantY);
 		if (state.bTownVisitPhase == BOT_TOWN_PHASE_WEAPON_MERCHANT)
 		{
 			if (MovePlayerBotTownLeg(ch, state, dwNow,
@@ -6519,6 +7517,15 @@ namespace
 			{
 				ManagePlayerBotWeaponMerchant(ch);
 				ManagePlayerBotEquipment(ch, state, dwNow);
+				if (!ch->GetWear(WEAR_WEAPON))
+				{
+					// Nothing sellable was sufficient. Leave the counter after this
+					// visit and search nearby hunting fields for ownerless Yang/gear.
+					state.dwEmergencyScavengeUntil = dwNow + 120000;
+					sys_log(0, "PLAYERBOT_GEAR: emergency scavenging armed pid=%u name=%s until=%u gold=%lld",
+							ch->GetPlayerID(), ch->GetName(), state.dwEmergencyScavengeUntil,
+							(long long)ch->GetGold());
+				}
 				state.bTownNeedBlacksmith = state.bTownNeedBlacksmith ||
 						HasPlayerBotRefineOpportunity(ch);
 				state.bTownNeedWeaponMerchant = false;
@@ -6540,8 +7547,9 @@ namespace
 			{
 				state.bTownVisitPhase = state.bTownNeedArmorMerchant
 						? BOT_TOWN_PHASE_ARMOR_MERCHANT
-						: ((state.bTownNeedMisc || state.bTownNeedBlacksmith)
-							? BOT_TOWN_PHASE_GATE_IN : BOT_TOWN_PHASE_NONE);
+						: (inM2 ? GetPlayerBotFirstDirectTownPhase(state)
+							: ((state.bTownNeedMisc || state.bTownNeedBlacksmith)
+								? BOT_TOWN_PHASE_GATE_IN : BOT_TOWN_PHASE_NONE));
 				state.dwTownWaitUntil = 0;
 				ClearPlayerBotRoute(state, true);
 				if (state.bTownVisitPhase == BOT_TOWN_PHASE_NONE)
@@ -6551,8 +7559,8 @@ namespace
 		}
 
 		long armorMerchantX = 0, armorMerchantY = 0;
-		GetPlayerBotNpcApproach(ch->GetPlayerID(), PLAYERBOT_ARMOR_MERCHANT_X,
-				PLAYERBOT_ARMOR_MERCHANT_Y, 0x41524d52U, armorMerchantX, armorMerchantY);
+		GetPlayerBotNpcApproach(ch->GetPlayerID(), armorNpcX,
+				armorNpcY, 0x41524d52U, armorMerchantX, armorMerchantY);
 		if (state.bTownVisitPhase == BOT_TOWN_PHASE_ARMOR_MERCHANT)
 		{
 			if (MovePlayerBotTownLeg(ch, state, dwNow,
@@ -6579,8 +7587,10 @@ namespace
 			ch->SetPosition(POS_STANDING);
 			if (dwNow >= state.dwTownWaitUntil)
 			{
-				state.bTownVisitPhase = (state.bTownNeedMisc || state.bTownNeedBlacksmith)
-						? BOT_TOWN_PHASE_GATE_IN : BOT_TOWN_PHASE_NONE;
+				state.bTownVisitPhase = inM2
+						? GetPlayerBotFirstDirectTownPhase(state)
+						: ((state.bTownNeedMisc || state.bTownNeedBlacksmith)
+							? BOT_TOWN_PHASE_GATE_IN : BOT_TOWN_PHASE_NONE);
 				state.dwTownWaitUntil = 0;
 				ClearPlayerBotRoute(state, true);
 				if (state.bTownVisitPhase == BOT_TOWN_PHASE_NONE)
@@ -6591,6 +7601,11 @@ namespace
 
 		if (state.bTownVisitPhase == BOT_TOWN_PHASE_GATE_IN)
 		{
+			if (inM2)
+			{
+				FinishPlayerBotTownVisit(ch, state, dwNow, false);
+				return true;
+			}
 			if (MovePlayerBotTownLeg(ch, state, dwNow,
 					PLAYERBOT_TOWN_GATE_X, PLAYERBOT_TOWN_GATE_OUTSIDE_Y, 1000))
 				state.bTownVisitPhase = BOT_TOWN_PHASE_GATE_CROSS_IN;
@@ -6610,8 +7625,8 @@ namespace
 		}
 
 		long merchantX = 0, merchantY = 0;
-		GetPlayerBotNpcApproach(ch->GetPlayerID(), PLAYERBOT_MISC_MERCHANT_X,
-				PLAYERBOT_MISC_MERCHANT_Y, 0x4d495343U, merchantX, merchantY);
+		GetPlayerBotNpcApproach(ch->GetPlayerID(), miscNpcX,
+				miscNpcY, 0x4d495343U, merchantX, merchantY);
 		if (state.bTownVisitPhase == BOT_TOWN_PHASE_MISC_MERCHANT)
 		{
 			if (MovePlayerBotTownLeg(ch, state, dwNow, merchantX, merchantY, 650))
@@ -6635,23 +7650,24 @@ namespace
 			if (dwNow >= state.dwTownWaitUntil)
 			{
 				state.bTownVisitPhase = state.bTownNeedBlacksmith
-						? BOT_TOWN_PHASE_BLACKSMITH : BOT_TOWN_PHASE_GATE_OUT;
+						? BOT_TOWN_PHASE_BLACKSMITH
+						: (inM2 ? BOT_TOWN_PHASE_NONE : BOT_TOWN_PHASE_GATE_OUT);
 				state.dwTownWaitUntil = 0;
 				ClearPlayerBotRoute(state, true);
+				if (state.bTownVisitPhase == BOT_TOWN_PHASE_NONE)
+					FinishPlayerBotTownVisit(ch, state, dwNow, true);
 			}
 			return true;
 		}
 
 		long blacksmithX = 0, blacksmithY = 0;
-		GetPlayerBotNpcApproach(ch->GetPlayerID(), PLAYERBOT_BLACKSMITH_X,
-				PLAYERBOT_BLACKSMITH_Y, 0x4b4f574cU, blacksmithX, blacksmithY);
+		GetPlayerBotNpcApproach(ch->GetPlayerID(), blacksmithNpcX,
+				blacksmithNpcY, 0x4b4f574cU, blacksmithX, blacksmithY);
 		// Keep the per-PID spread, but halve it specifically at the blacksmith.
 		// Together with the tighter arrival radius this keeps every refiner close
 		// enough to look like it is actually interacting with the NPC.
-		blacksmithX = PLAYERBOT_BLACKSMITH_X +
-				(blacksmithX - PLAYERBOT_BLACKSMITH_X) / 2;
-		blacksmithY = PLAYERBOT_BLACKSMITH_Y +
-				(blacksmithY - PLAYERBOT_BLACKSMITH_Y) / 2;
+		blacksmithX = blacksmithNpcX + (blacksmithX - blacksmithNpcX) / 2;
+		blacksmithY = blacksmithNpcY + (blacksmithY - blacksmithNpcY) / 2;
 		if (state.bTownVisitPhase == BOT_TOWN_PHASE_BLACKSMITH)
 		{
 			if (MovePlayerBotTownLeg(ch, state, dwNow, blacksmithX, blacksmithY, 500))
@@ -6685,15 +7701,23 @@ namespace
 				// Always leave the NPC wearing the best surviving/refined equipment,
 				// even if materials, Yang or a failed roll ended the session early.
 				RestorePlayerBotEquipmentAfterRefining(ch, state, dwNow);
-				state.bTownVisitPhase = BOT_TOWN_PHASE_GATE_OUT;
+				state.bTownVisitPhase = inM2
+						? BOT_TOWN_PHASE_NONE : BOT_TOWN_PHASE_GATE_OUT;
 				state.dwTownWaitUntil = 0;
 				ClearPlayerBotRoute(state, true);
+				if (state.bTownVisitPhase == BOT_TOWN_PHASE_NONE)
+					FinishPlayerBotTownVisit(ch, state, dwNow, true);
 			}
 			return true;
 		}
 
 		if (state.bTownVisitPhase == BOT_TOWN_PHASE_GATE_OUT)
 		{
+			if (inM2)
+			{
+				FinishPlayerBotTownVisit(ch, state, dwNow, false);
+				return true;
+			}
 			if (MovePlayerBotTownLeg(ch, state, dwNow,
 					PLAYERBOT_TOWN_GATE_X, PLAYERBOT_TOWN_GATE_INSIDE_Y, 1000))
 				state.bTownVisitPhase = BOT_TOWN_PHASE_GATE_CROSS_OUT;
@@ -6925,7 +7949,7 @@ namespace
 		{
 			const DWORD pid = ch->GetPlayerID();
 
-			// 1. Role: Metin Hunter (25% of bots).  These are the in-bounds
+			// 1. Role: Metin breaker (25% of bots). These are the in-bounds
 			// centres from metin2_map_b1/stone.txt, converted to world coordinates.
 			// Four legacy Gemini entries near the southern map edge were manually
 			// shifted from stone rows whose centres lie beyond this map's Y limit;
@@ -7301,6 +8325,13 @@ namespace
 		if (!ch || !ch->GetSectree() || dwNow < state.dwNextLootPickupTime)
 			return false;
 
+		// Set the throttle before scanning.  An empty floor used to leave the
+		// timestamp untouched, so the second HandleLoot call in the same update and
+		// every following update repeated a complete nine-sectree snapshot.
+		state.dwNextLootPickupTime = dwNow + number(
+				PLAYERBOT_COMBAT_LOOT_SCAN_INTERVAL_MIN,
+				PLAYERBOT_COMBAT_LOOT_SCAN_INTERVAL_MAX);
+
 		// This is the server equivalent of repeatedly pressing Z: inspect only the
 		// immediate pickup circle, never Stop(), never clear the victim and never
 		// walk toward an item while a pack is still engaged.
@@ -7354,7 +8385,7 @@ namespace
 				ch->SetQuestFlag(PLAYERBOT_HORSE_LAST_LOOT_MAP_FLAG, ch->GetMapIndex());
 				ch->SetQuestFlag(PLAYERBOT_HORSE_LAST_LOOT_TIME_FLAG, get_global_time());
 			}
-			sys_log(0, "PLAYERBOT_AI: combat-Z pickup pid=%u name=%s item_vid=%u vnum=%u visible_ms=%u",
+			sys_log(1, "PLAYERBOT_AI: combat-Z pickup pid=%u name=%s item_vid=%u vnum=%u visible_ms=%u",
 					ch->GetPlayerID(), ch->GetName(), itemVID, itemVnum,
 					(unsigned int)(dwNow - firstSeen));
 			return true;
@@ -7370,26 +8401,12 @@ namespace
 		if (!ch || !ch->GetSectree())
 			return false;
 
-		LPCHARACTER activeTarget = state.dwTargetVID != 0
-			? CHARACTER_MANAGER::instance().Find(state.dwTargetVID)
-			: NULL;
-		const bool bFightingActiveTarget = activeTarget && !activeTarget->IsDead() &&
-				(activeTarget->IsMonster() || activeTarget->IsStone());
-		CDetectPlayerBotCombatThreat threat(ch);
-		ch->GetSectree()->ForEachAround(threat);
-		const bool bRecentCombat = state.dwLastCombatActionTime != 0 &&
-				dwNow - state.dwLastCombatActionTime < 1800;
-		// A dead primary target does not mean its group is finished. While either a
-		// live target or an attacking pack exists, perform only non-blocking Z pickup.
-		if (bFightingActiveTarget || threat.Found() || bRecentCombat)
+		// Cleanup must also run for bots which spend minutes in continuous combat.
+		// Keep it periodic: walking both maps on every AI tick is unnecessary.
+		if (dwNow >= state.dwNextLootCleanupTime)
 		{
-			TryPlayerBotCombatPickup(ch, state, dwNow);
-			return false;
-		}
-
-		// Clean up expired failed loot entries
-		if (!state.mapFailedLootVIDs.empty())
-		{
+			state.dwNextLootCleanupTime = dwNow + PLAYERBOT_LOOT_CLEANUP_INTERVAL +
+					(PlayerBotNavHash(ch->GetPlayerID()) % 5001U);
 			for (std::map<DWORD, DWORD>::iterator it = state.mapFailedLootVIDs.begin();
 					it != state.mapFailedLootVIDs.end(); )
 			{
@@ -7398,9 +8415,6 @@ namespace
 				else
 					++it;
 			}
-		}
-		if (!state.mapLootSeenSince.empty())
-		{
 			for (std::map<DWORD, DWORD>::iterator it = state.mapLootSeenSince.begin();
 					it != state.mapLootSeenSince.end(); )
 			{
@@ -7411,13 +8425,51 @@ namespace
 			}
 		}
 
+		LPCHARACTER activeTarget = state.dwTargetVID != 0
+			? CHARACTER_MANAGER::instance().Find(state.dwTargetVID)
+			: NULL;
+		const bool bFightingActiveTarget = activeTarget && !activeTarget->IsDead() &&
+				(activeTarget->IsMonster() || activeTarget->IsStone());
+		const bool bRecentCombat = state.dwLastCombatActionTime != 0 &&
+				dwNow - state.dwLastCombatActionTime < 1800;
+		if (!bFightingActiveTarget && (bRecentCombat ||
+				dwNow >= state.dwNextLootThreatCheckTime))
+		{
+			CDetectPlayerBotCombatThreat threat(ch);
+			ch->GetSectree()->ForEachAround(threat);
+			state.bLootThreatNearby = threat.Found();
+			state.dwNextLootThreatCheckTime = dwNow + number(
+					PLAYERBOT_LOOT_THREAT_SCAN_INTERVAL_MIN,
+					PLAYERBOT_LOOT_THREAT_SCAN_INTERVAL_MAX);
+		}
+		// A dead primary target does not mean its group is finished. While either a
+		// live target or an attacking pack exists, perform only non-blocking Z pickup.
+		// Once the threat scan says the pack is clear, recent combat no longer hides
+		// the 25 m loot search: the bot finishes its own drop before choosing a new mob.
+		if (bFightingActiveTarget || state.bLootThreatNearby)
+		{
+			TryPlayerBotCombatPickup(ch, state, dwNow);
+			return false;
+		}
+		if (dwNow < state.dwNextLootSearchTime)
+			return false;
+
 		CCollectPlayerBotLoot collector(ch, PLAYERBOT_LOOT_SEARCH_RANGE,
 				state.mapFailedLootVIDs, dwNow);
 		ch->GetSectree()->ForEachAround(collector);
 		collector.Sort();
 		const std::vector<std::pair<int, LPITEM> >& items = collector.GetItems();
 		if (items.empty())
+		{
+			// An empty 25 m search used to run twice per second for every peaceful
+			// bot.  Delay only the next empty-floor query; as soon as an item is seen,
+			// the normal 500 ms walking/visibility cadence remains unchanged.
+			state.dwNextLootSearchTime = dwNow + number(
+					PLAYERBOT_EMPTY_LOOT_SCAN_INTERVAL_MIN,
+					PLAYERBOT_EMPTY_LOOT_SCAN_INTERVAL_MAX);
 			return false;
+		}
+		state.dwNextLootSearchTime = 0;
 		SetPlayerBotAction(state, BOT_ACTION_LOOT, dwNow);
 
 		for (size_t i = 0; i < items.size(); ++i)
@@ -7462,7 +8514,7 @@ namespace
 					sys_log(0, "PLAYERBOT_HORSE: real medal looted pid=%u name=%s map=%ld total_looted=%d",
 							ch->GetPlayerID(), ch->GetName(), ch->GetMapIndex(), looted);
 				}
-				sys_log(0, "PLAYERBOT_AI: picked up delayed loot pid=%u name=%s item_vid=%u vnum=%u visible_ms=%u",
+				sys_log(1, "PLAYERBOT_AI: picked up delayed loot pid=%u name=%s item_vid=%u vnum=%u visible_ms=%u",
 						ch->GetPlayerID(), ch->GetName(), nearestVID, itemVnum,
 						(unsigned int)(dwNow - firstSeen));
 				return true;
@@ -7470,7 +8522,7 @@ namespace
 
 			state.mapFailedLootVIDs[nearestVID] = dwNow + 5000;
 			state.mapLootSeenSince.erase(nearestVID);
-			sys_log(0, "PLAYERBOT_AI: pickup failed pid=%u name=%s item_vid=%u vnum=%u -> retrying in 5s",
+			sys_log(1, "PLAYERBOT_AI: pickup failed pid=%u name=%s item_vid=%u vnum=%u -> retrying in 5s",
 					ch->GetPlayerID(), ch->GetName(), nearestVID, itemVnum);
 			return true;
 		}
@@ -7523,13 +8575,14 @@ namespace
 			return;
 
 		state.bLastPersistedLevel = level;
-		state.dwNextPersistTime = dwNow + PLAYERBOT_PERSIST_INTERVAL;
+		state.dwNextPersistTime = dwNow + PLAYERBOT_PERSIST_INTERVAL +
+				(PlayerBotNavHash(ch->GetPlayerID()) % 5001U);
 
 		ch->SaveReal();
 		ch->FlushDelayedSaveItem();
 		const DWORD playerID = ch->GetPlayerID();
 		db_clientdesc->DBPacket(HEADER_GD_FLUSH_CACHE, 0, &playerID, sizeof(playerID));
-		sys_log(0, "PLAYERBOT_AI: persisted state pid=%u name=%s level=%u exp=%u gold=%lld",
+		sys_log(1, "PLAYERBOT_AI: persisted state pid=%u name=%s level=%u exp=%u gold=%lld",
 				playerID, ch->GetName(), level, ch->GetExp(), (long long)ch->GetGold());
 	}
 
@@ -7862,7 +8915,8 @@ namespace
 						!IsPlayerBotReachable(m_owner->GetMapIndex(),
 								m_owner->GetX(), m_owner->GetY(), candidate->GetX(), candidate->GetY()) ||
 						DISTANCE_APPROX(candidate->GetX() - m_owner->GetX(), candidate->GetY() - m_owner->GetY()) > PLAYERBOT_PARTY_COHESION_RADIUS ||
-						(candidate->IsStone() && candidate->GetLevel() > m_owner->GetLevel() + 9) ||
+						(candidate->IsStone() &&
+						 !IsPlayerBotMetinWorthFighting(m_owner, candidate)) ||
 						(candidate->IsMonster() &&
 							 candidate->GetLevel() > m_owner->GetLevel() + PLAYERBOT_MAX_TARGET_LEVEL_DELTA &&
 							 !CanPlayerBotPartyChallenge(m_owner, candidate, m_dwNow, NULL)))
@@ -7955,6 +9009,131 @@ namespace
 		return finder.GetTarget();
 	}
 
+	class CCountPlayerBotStoneAttackers
+	{
+		public:
+			CCountPlayerBotStoneAttackers(LPCHARACTER stone) :
+				m_stone(stone), m_count(0) {}
+
+			bool operator () (LPENTITY entity)
+			{
+				if (!entity || !entity->IsType(ENTITY_CHARACTER))
+					return true;
+				LPCHARACTER attacker = static_cast<LPCHARACTER>(entity);
+				if (!attacker || !attacker->IsPC() || attacker->IsDead() ||
+						attacker->GetMapIndex() != m_stone->GetMapIndex() ||
+						DISTANCE_APPROX(attacker->GetX() - m_stone->GetX(),
+								attacker->GetY() - m_stone->GetY()) > PLAYERBOT_STONE_SUPPORT_RANGE)
+					return true;
+
+				bool attacksStone = attacker->GetVictim() == m_stone;
+				TPlayerBotAIStateMap::const_iterator it =
+						s_mapPlayerBotAIStates.find(attacker->GetPlayerID());
+				if (it != s_mapPlayerBotAIStates.end() &&
+						it->second.dwTargetVID == (DWORD)m_stone->GetVID())
+					attacksStone = true;
+				if (attacksStone && m_count < 255)
+					++m_count;
+				return true;
+			}
+
+			BYTE GetCount() const { return m_count; }
+
+		private:
+			LPCHARACTER m_stone;
+			BYTE m_count;
+	};
+
+	BYTE CountPlayerBotStoneAttackers(LPCHARACTER stone)
+	{
+		if (!stone || !stone->GetSectree())
+			return 0;
+		CCountPlayerBotStoneAttackers counter(stone);
+		stone->GetSectree()->ForEachAround(counter);
+		return counter.GetCount();
+	}
+
+	void ResetPlayerBotStoneProgress(TPlayerBotAIState& state)
+	{
+		state.dwStoneFightStartTime = 0;
+		state.dwStoneProgressVID = 0;
+		state.dwStoneLastProgressTime = 0;
+		state.dwNextStoneProgressCheckTime = 0;
+		state.iLastStoneHP = 0;
+		state.bLastStoneAttackerCount = 0;
+	}
+
+	bool ShouldPlayerBotAbandonStone(LPCHARACTER ch, LPCHARACTER stone,
+			TPlayerBotAIState& state, DWORD dwNow)
+	{
+		if (!ch || !stone || !stone->IsStone() || stone->IsDead())
+		{
+			ResetPlayerBotStoneProgress(state);
+			return false;
+		}
+
+		if (state.dwStoneProgressVID != (DWORD)stone->GetVID())
+		{
+			ResetPlayerBotStoneProgress(state);
+			state.dwStoneProgressVID = stone->GetVID();
+			state.dwStoneFightStartTime = dwNow;
+			state.dwStoneLastProgressTime = dwNow;
+			state.dwNextStoneProgressCheckTime =
+					dwNow + PLAYERBOT_STONE_PROGRESS_CHECK_INTERVAL;
+			state.iLastStoneHP = stone->GetHP();
+			state.bLastStoneAttackerCount = CountPlayerBotStoneAttackers(stone);
+			return false;
+		}
+
+		if (dwNow < state.dwNextStoneProgressCheckTime)
+			return false;
+		state.dwNextStoneProgressCheckTime =
+				dwNow + PLAYERBOT_STONE_PROGRESS_CHECK_INTERVAL;
+
+		const BYTE attackerCount = CountPlayerBotStoneAttackers(stone);
+		// A new helper may turn a regenerative stalemate into real progress. Give the
+		// enlarged group a complete observation window instead of abandoning just as
+		// help arrives.
+		if (attackerCount > state.bLastStoneAttackerCount)
+			state.dwStoneLastProgressTime = dwNow;
+		state.bLastStoneAttackerCount = attackerCount;
+
+		const int meaningfulDamage = std::max(1, stone->GetMaxHP() / 200);
+		if (stone->GetHP() + meaningfulDamage <= state.iLastStoneHP)
+		{
+			state.iLastStoneHP = stone->GetHP();
+			state.dwStoneLastProgressTime = dwNow;
+		}
+
+		if (dwNow - state.dwStoneFightStartTime < PLAYERBOT_STONE_INITIAL_GRACE)
+			return false;
+		const DWORD stallTimeout = attackerCount >= 2
+				? PLAYERBOT_STONE_GROUP_STALL_TIMEOUT
+				: PLAYERBOT_STONE_SOLO_STALL_TIMEOUT;
+		if (dwNow - state.dwStoneLastProgressTime < stallTimeout)
+			return false;
+
+		const DWORD failedVID = stone->GetVID();
+		const int currentHP = stone->GetHP();
+		const int maxHP = stone->GetMaxHP();
+		state.mapFailedStones[failedVID] = dwNow + PLAYERBOT_STONE_FAILED_COOLDOWN;
+		ReleasePlayerBotMetinReservation(ch, stone);
+		state.dwTargetVID = 0;
+		ch->SetVictim(NULL);
+		ch->Stop();
+		ClearPlayerBotRoute(state, true);
+		SetPlayerBotAction(state, BOT_ACTION_IDLE, dwNow);
+		state.dwNextWanderTime = dwNow + number(1000, 2500);
+		sys_log(0, "PLAYERBOT_METIN: abandoned stalled stone pid=%u name=%s stone_vid=%u stone=%s hp=%d/%d best_hp=%d attackers=%u fight_ms=%u stalled_ms=%u cooldown_ms=%u",
+				ch->GetPlayerID(), ch->GetName(), failedVID, stone->GetName(),
+				currentHP, maxHP, state.iLastStoneHP, (unsigned int)attackerCount,
+				(unsigned int)(dwNow - state.dwStoneFightStartTime),
+				(unsigned int)(dwNow - state.dwStoneLastProgressTime),
+				(unsigned int)PLAYERBOT_STONE_FAILED_COOLDOWN);
+		ResetPlayerBotStoneProgress(state);
+		return true;
+	}
+
 	bool IsTargetClaimedByAnotherBot(LPCHARACTER owner, DWORD dwTargetVID)
 	{
 		if (!owner || dwTargetVID == 0)
@@ -7982,6 +9161,7 @@ namespace
 		int distance;
 		int level;
 		bool bIsStone;
+		bool bPriorityObjective;
 		int score;
 
 		bool operator < (const TTargetCandidate& other) const
@@ -8036,10 +9216,12 @@ namespace
 				if (failedTarget != m_failedTargets.end() && m_dwNow < failedTarget->second)
 					return false;
 
-				// Stones: max 9 levels above bot, not in failed stones
+				// Stones must remain inside the useful drop window and not be in the
+				// failed-stone cooldown. This also keeps over-levelled bots away from
+				// decorative low Metins which no longer reward their time.
 				if (candidate->IsStone())
 				{
-					if (candidate->GetLevel() > m_owner->GetLevel() + 9)
+					if (!IsPlayerBotMetinWorthFighting(m_owner, candidate))
 						return false;
 
 					std::map<DWORD, DWORD>::const_iterator stit = m_failedStones.find(candidate->GetVID());
@@ -8079,9 +9261,12 @@ namespace
 						m_huntM2Bestials &&
 						(candidate->GetRaceNum() == 533 || candidate->GetRaceNum() == 534);
 
-				// High level bots ignore weak low-level mobs below bot level unless the mob is attacking the bot
+				// Do not cross a hunting field for obsolete prey, but kill a weaker mob
+				// which is already on the route. This makes local grinding look like a
+				// player holding Space instead of visibly walking past living packs.
 				if (candidate->IsMonster() && !isQuestTarget && botLevel >= 6 &&
-						levelDelta <= -3 && candidate->GetVictim() != m_owner)
+						levelDelta <= -3 && candidate->GetVictim() != m_owner &&
+						distance > PLAYERBOT_LOCAL_CHAIN_RANGE)
 					return false;
 
 				// Component reachability lets the bot route around a wall while still
@@ -8097,6 +9282,7 @@ namespace
 				tc.distance = distance;
 				tc.level = mobLevel;
 				tc.bIsStone = candidate->IsStone();
+				tc.bPriorityObjective = isQuestTarget || isBestialWeaponTarget;
 
 				int baseScore = 0;
 				TPlayerBotAIStateMap::iterator sit = s_mapPlayerBotAIStates.find(m_owner->GetPlayerID());
@@ -8129,7 +9315,7 @@ namespace
 						baseScore += 1200000 + mobLevel * 1000;
 					}
 
-					// For dedicated Metin Hunter, normal mobs get low score unless attacking
+					// For dedicated Metin breakers, normal mobs get low score unless attacking
 					if (isMetinHunter && candidate->GetVictim() != m_owner)
 					{
 						baseScore += 5000;
@@ -8313,6 +9499,39 @@ namespace
 			}
 		}
 
+		// Chain ordinary combat into the closest unclaimed pack. A nearby quest or
+		// Bestial objective wins over generic prey, but a far-away objective no longer
+		// makes the bot walk past mobs at its feet. Metin hunters retain their global
+		// stone scoring and reservations below.
+		if (state.bBotRole != BOT_ROLE_METIN_HUNTER)
+		{
+			DWORD closestObjectiveVID = 0;
+			DWORD closestLocalVID = 0;
+			int closestObjectiveDistance = INT_MAX;
+			int closestLocalDistance = INT_MAX;
+			for (size_t i = 0; i < targets.size(); ++i)
+			{
+				if (targets[i].bIsStone || targets[i].distance > PLAYERBOT_LOCAL_CHAIN_RANGE ||
+						IsTargetClaimedByAnotherBot(ch, targets[i].dwVID))
+					continue;
+				if (targets[i].bPriorityObjective &&
+						targets[i].distance < closestObjectiveDistance)
+				{
+					closestObjectiveDistance = targets[i].distance;
+					closestObjectiveVID = targets[i].dwVID;
+				}
+				if (targets[i].distance < closestLocalDistance)
+				{
+					closestLocalDistance = targets[i].distance;
+					closestLocalVID = targets[i].dwVID;
+				}
+			}
+			const DWORD chainedVID = closestObjectiveVID != 0
+					? closestObjectiveVID : closestLocalVID;
+			if (chainedVID != 0)
+				return CHARACTER_MANAGER::instance().Find(chainedVID);
+		}
+
 		std::vector<DWORD> availableTargets;
 		for (size_t i = 0; i < targets.size(); ++i)
 		{
@@ -8389,7 +9608,9 @@ namespace
 
 		LPITEM weapon = ch->GetWear(WEAR_WEAPON);
 		const bool isBow = (weapon && weapon->GetType() == ITEM_WEAPON && weapon->GetSubType() == WEAPON_BOW);
-		LPITEM arrow = isBow ? ch->GetWear(WEAR_ARROW) : NULL;
+		LPITEM arrow = NULL;
+		if (isBow && ch->GetArrowAndBow(&weapon, &arrow, 1) != 1)
+			return 0;
 
 		int iDamage = isBow ? CalcArrowDamage(ch, primary, weapon, arrow, false) : CalcMeleeDamage(ch, primary, false, false);
 		if (iDamage < 5)
@@ -8397,6 +9618,8 @@ namespace
 
 		DWORD hitCount = 1;
 		primary->Damage(ch, iDamage, DAMAGE_TYPE_NORMAL);
+		if (isBow)
+			ch->UseArrow(arrow, 1);
 		primary->SetSyncOwner(ch);
 		if (!primary->IsDead() && primary->CanBeginFight())
 			primary->BeginFight(ch);
@@ -8448,6 +9671,13 @@ namespace
 			return false;
 
 		const bool isBow = weapon->GetSubType() == WEAPON_BOW;
+		if (isBow)
+		{
+			LPITEM bow = NULL;
+			LPITEM arrow = NULL;
+			if (ch->GetArrowAndBow(&bow, &arrow, 1) != 1)
+				return false;
+		}
 		const int combatRange = isBow ? 800 : 280;
 		if (DISTANCE_APPROX(ch->GetX() - target->GetX(), ch->GetY() - target->GetY()) > combatRange)
 			return false;
@@ -8482,6 +9712,326 @@ namespace
 			if (state.bComboMotion > MOTION_COMBO_ATTACK_4)
 				state.bComboMotion = MOTION_COMBO_ATTACK_1;
 		}
+		return true;
+	}
+
+	bool IsPlayerBotMultiPullBuild(LPCHARACTER ch, bool* naturalTank)
+	{
+		if (naturalTank)
+			*naturalTank = false;
+		if (!ch || ch->GetLevel() < 15 || ch->GetParty() ||
+				(ch->GetMapIndex() != PLAYERBOT_MAP_CHUNJO_M1 &&
+				 ch->GetMapIndex() != PLAYERBOT_MAP_CHUNJO_M2))
+			return false;
+
+		LPITEM weapon = ch->GetWear(WEAR_WEAPON);
+		LPITEM armor = ch->GetWear(WEAR_BODY);
+		LPITEM shield = ch->GetWear(WEAR_SHIELD);
+		LPITEM helmet = ch->GetWear(WEAR_HEAD);
+		if (!weapon || !armor || !shield || !helmet ||
+				(weapon->GetType() == ITEM_WEAPON &&
+				 weapon->GetSubType() == WEAPON_BOW))
+			return false;
+
+		const bool isNaturalTank =
+				(ch->GetJob() == JOB_WARRIOR && ch->GetSkillGroup() == 2) ||
+				(ch->GetJob() == JOB_SURA && ch->GetSkillGroup() == 1);
+		const bool isHeavilyArmored = armor->GetRefineLevel() >= 5 &&
+				shield->GetRefineLevel() >= 5 && helmet->GetRefineLevel() >= 4;
+		if (naturalTank)
+			*naturalTank = isNaturalTank;
+		return isNaturalTank || isHeavilyArmored;
+	}
+
+	class CCountPlayerBotPullAggressors
+	{
+		public:
+			CCountPlayerBotPullAggressors(LPCHARACTER owner) : m_owner(owner), m_count(0) {}
+
+			bool operator () (LPENTITY entity)
+			{
+				if (!entity || !entity->IsType(ENTITY_CHARACTER))
+					return false;
+				LPCHARACTER candidate = static_cast<LPCHARACTER>(entity);
+				if (candidate != m_owner && candidate->IsMonster() &&
+						!candidate->IsDead() && candidate->GetVictim() == m_owner &&
+						DISTANCE_APPROX(candidate->GetX() - m_owner->GetX(),
+								candidate->GetY() - m_owner->GetY()) <= PLAYERBOT_MULTI_PULL_SEARCH_RANGE)
+					++m_count;
+				return true;
+			}
+
+			int GetCount() const { return m_count; }
+
+		private:
+			LPCHARACTER m_owner;
+			int m_count;
+	};
+
+	int CountPlayerBotPullAggressors(LPCHARACTER ch)
+	{
+		if (!ch || !ch->GetSectree())
+			return 0;
+		CCountPlayerBotPullAggressors counter(ch);
+		ch->GetSectree()->ForEachAround(counter);
+		return counter.GetCount();
+	}
+
+	class CFindPlayerBotPullTarget
+	{
+		public:
+			CFindPlayerBotPullTarget(LPCHARACTER owner,
+					const std::vector<PIXEL_POSITION>& centers) :
+				m_owner(owner), m_centers(centers), m_bestVID(0), m_bestScore(INT_MAX)
+			{
+			}
+
+			bool operator () (LPENTITY entity)
+			{
+				if (!entity || !entity->IsType(ENTITY_CHARACTER))
+					return false;
+				LPCHARACTER candidate = static_cast<LPCHARACTER>(entity);
+				if (candidate == m_owner || !candidate->IsMonster() || candidate->IsStone() ||
+						candidate->IsDead() || candidate->GetVictim() != NULL ||
+						candidate->GetMobRank() >= MOB_RANK_BOSS ||
+						candidate->GetMapIndex() != m_owner->GetMapIndex() ||
+						IsPlayerBotSafeZone(candidate->GetMapIndex(), candidate->GetX(), candidate->GetY()))
+					return false;
+
+				const int minLevel = std::max(1, (int)m_owner->GetLevel() - 3);
+				const int maxLevel = (int)m_owner->GetLevel() + 2;
+				if (candidate->GetLevel() < minLevel || candidate->GetLevel() > maxLevel)
+					return false;
+
+				const int distance = DISTANCE_APPROX(m_owner->GetX() - candidate->GetX(),
+						m_owner->GetY() - candidate->GetY());
+				if (distance > PLAYERBOT_MULTI_PULL_SEARCH_RANGE ||
+						!IsPlayerBotReachable(m_owner->GetMapIndex(), m_owner->GetX(), m_owner->GetY(),
+								candidate->GetX(), candidate->GetY()) ||
+						IsTargetClaimedByAnotherBot(m_owner, candidate->GetVID()))
+					return false;
+
+				for (size_t i = 0; i < m_centers.size(); ++i)
+				{
+					if (DISTANCE_APPROX(candidate->GetX() - m_centers[i].x,
+							candidate->GetY() - m_centers[i].y) <
+							PLAYERBOT_MULTI_PULL_GROUP_SEPARATION)
+						return false;
+				}
+
+				// A small deterministic jitter distributes simultaneous tanks without
+				// sacrificing the preference for a nearby pack.
+				const int score = distance + (int)(PlayerBotNavHash(
+						m_owner->GetPlayerID() ^ candidate->GetVID()) % 350U);
+				if (score < m_bestScore)
+				{
+					m_bestScore = score;
+					m_bestVID = candidate->GetVID();
+				}
+				return true;
+			}
+
+			DWORD GetBestVID() const { return m_bestVID; }
+
+		private:
+			LPCHARACTER m_owner;
+			const std::vector<PIXEL_POSITION>& m_centers;
+			DWORD m_bestVID;
+			int m_bestScore;
+	};
+
+	LPCHARACTER FindPlayerBotPullTarget(LPCHARACTER ch,
+			const std::vector<PIXEL_POSITION>& centers)
+	{
+		if (!ch || !ch->GetSectree())
+			return NULL;
+		CFindPlayerBotPullTarget finder(ch, centers);
+		ch->GetSectree()->ForEachAround(finder);
+		return finder.GetBestVID() != 0
+				? CHARACTER_MANAGER::instance().Find(finder.GetBestVID()) : NULL;
+	}
+
+	void FinishPlayerBotMultiPull(LPCHARACTER ch, TPlayerBotAIState& state,
+			DWORD dwNow, const char* reason)
+	{
+		const BYTE pulledGroups = state.bMultiPullGroups;
+		const BYTE desiredGroups = state.bMultiPullDesiredGroups;
+		state.bMultiPullActive = false;
+		state.bMultiPullGroups = 0;
+		state.bMultiPullDesiredGroups = 0;
+		state.dwMultiPullStartedTime = 0;
+		state.dwNextMultiPullActionTime = 0;
+		state.dwMultiPullTargetVID = 0;
+		state.vecMultiPullCenters.clear();
+		state.dwNextMultiPullTime = dwNow + number(
+				PLAYERBOT_MULTI_PULL_MIN_COOLDOWN, PLAYERBOT_MULTI_PULL_MAX_COOLDOWN);
+
+		LPCHARACTER engaged = FindPlayerBotEngagedTarget(ch);
+		state.dwTargetVID = engaged ? engaged->GetVID() : 0;
+		if (engaged)
+			ch->SetVictim(engaged);
+		else
+			ch->SetVictim(NULL);
+		ClearPlayerBotRoute(state, true);
+		sys_log(0, "PLAYERBOT_PULL: finished pid=%u name=%s groups=%u/%u aggressors=%d hp=%d/%d reason=%s",
+				ch->GetPlayerID(), ch->GetName(), (unsigned int)pulledGroups,
+				(unsigned int)desiredGroups, CountPlayerBotPullAggressors(ch),
+				ch->GetHP(), ch->GetMaxHP(), reason ? reason : "?");
+	}
+
+	bool HandlePlayerBotMultiPull(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
+	{
+		bool naturalTank = false;
+		const bool buildEligible = IsPlayerBotMultiPullBuild(ch, &naturalTank);
+		const bool goalEligible = state.bBotRole == BOT_ROLE_MOB_GRINDER &&
+				(state.bLongTermGoal == BOT_GOAL_LEVEL_UP ||
+				 state.bLongTermGoal == BOT_GOAL_HUNTING);
+		const bool recentlyDied = state.dwLastDeathTime != 0 &&
+				dwNow - state.dwLastDeathTime < 120000;
+		size_t redPots = 0, bluePots = 0;
+		CountPlayerBotPotions(ch, redPots, bluePots);
+		const int hpPercent = ch && ch->GetMaxHP() > 0
+				? ch->GetHP() * 100 / ch->GetMaxHP() : 0;
+
+		if (!buildEligible || !goalEligible || recentlyDied || redPots < 30 ||
+				state.bVisitingShop || state.bRecoveringAfterDeath || state.bTacticalRetreat)
+		{
+			if (state.bMultiPullActive)
+				FinishPlayerBotMultiPull(ch, state, dwNow, "eligibility_lost");
+			return false;
+		}
+
+		if (!state.bMultiPullActive)
+		{
+			if (state.dwNextMultiPullTime == 0)
+			{
+				state.dwNextMultiPullTime = dwNow + 5000 +
+						PlayerBotNavHash(ch->GetPlayerID() ^ 0x50554c4cU) % 40000U;
+				return false;
+			}
+			LPCHARACTER current = state.dwTargetVID != 0
+					? CHARACTER_MANAGER::instance().Find(state.dwTargetVID) : NULL;
+			if (dwNow < state.dwNextMultiPullTime || hpPercent < PLAYERBOT_MULTI_PULL_START_HP_PERCENT ||
+					(current && !current->IsDead()) || FindPlayerBotEngagedTarget(ch))
+				return false;
+
+			LPCHARACTER first = FindPlayerBotPullTarget(ch, state.vecMultiPullCenters);
+			if (!first)
+			{
+				state.dwNextMultiPullTime = dwNow + number(10000, 20000);
+				return false;
+			}
+
+			state.bMultiPullActive = true;
+			state.bMultiPullGroups = 0;
+			state.bMultiPullDesiredGroups = naturalTank
+					? (BYTE)(2 + PlayerBotNavHash(ch->GetPlayerID() ^
+							(dwNow / 60000U)) % 3U) : 2;
+			state.dwMultiPullStartedTime = dwNow;
+			state.dwNextMultiPullActionTime = dwNow;
+			state.iMultiPullStartHPPercent = hpPercent;
+			state.dwMultiPullTargetVID = first->GetVID();
+			state.dwTargetVID = first->GetVID();
+			state.vecMultiPullCenters.clear();
+			ClearPlayerBotRoute(state, true);
+			sys_log(0, "PLAYERBOT_PULL: started pid=%u name=%s level=%u desired_groups=%u hp=%d/%d natural_tank=%d",
+					ch->GetPlayerID(), ch->GetName(), ch->GetLevel(),
+					(unsigned int)state.bMultiPullDesiredGroups, ch->GetHP(),
+					ch->GetMaxHP(), naturalTank ? 1 : 0);
+		}
+
+		const int aggressors = CountPlayerBotPullAggressors(ch);
+		if (hpPercent <= PLAYERBOT_MULTI_PULL_MIN_HP_PERCENT ||
+				state.iMultiPullStartHPPercent - hpPercent >= PLAYERBOT_MULTI_PULL_MAX_HP_LOSS_PERCENT ||
+				aggressors >= PLAYERBOT_MULTI_PULL_MAX_AGGRESSORS ||
+				dwNow - state.dwMultiPullStartedTime >= PLAYERBOT_MULTI_PULL_TIMEOUT)
+		{
+			const char* reason = hpPercent <= PLAYERBOT_MULTI_PULL_MIN_HP_PERCENT
+					? "low_hp" : (aggressors >= PLAYERBOT_MULTI_PULL_MAX_AGGRESSORS
+						? "aggressor_cap" : (dwNow - state.dwMultiPullStartedTime >=
+							PLAYERBOT_MULTI_PULL_TIMEOUT ? "timeout" : "hp_loss"));
+			FinishPlayerBotMultiPull(ch, state, dwNow, reason);
+			return false;
+		}
+
+		if (state.bMultiPullGroups >= state.bMultiPullDesiredGroups)
+		{
+			FinishPlayerBotMultiPull(ch, state, dwNow, "desired_groups_ready");
+			return false;
+		}
+
+		LPCHARACTER target = state.dwMultiPullTargetVID != 0
+				? CHARACTER_MANAGER::instance().Find(state.dwMultiPullTargetVID) : NULL;
+		if (!target || target->IsDead() || !target->IsMonster() || target->IsStone() ||
+				target->GetMapIndex() != ch->GetMapIndex() ||
+				(target->GetVictim() != NULL && target->GetVictim() != ch))
+		{
+			target = FindPlayerBotPullTarget(ch, state.vecMultiPullCenters);
+			state.dwMultiPullTargetVID = target ? target->GetVID() : 0;
+			state.dwTargetVID = state.dwMultiPullTargetVID;
+			ClearPlayerBotRoute(state, true);
+			if (!target)
+			{
+				FinishPlayerBotMultiPull(ch, state, dwNow, "no_fresh_pack");
+				return false;
+			}
+		}
+
+		SetPlayerBotAction(state, BOT_ACTION_FIGHT, dwNow);
+		state.dwTargetVID = target->GetVID();
+		ch->SetVictim(target);
+		// Aggressive packs often wake up as soon as the bot enters their radius. In
+		// that case running on is the authentic pull action; attacking would stop to
+		// clear the very first pack instead of gathering the planned spot.
+		if (target->GetVictim() == ch)
+		{
+			PIXEL_POSITION center;
+			center.x = target->GetX();
+			center.y = target->GetY();
+			center.z = 0;
+			state.vecMultiPullCenters.push_back(center);
+			++state.bMultiPullGroups;
+			state.dwMultiPullTargetVID = 0;
+			state.dwTargetVID = 0;
+			state.dwNextMultiPullActionTime = dwNow + PLAYERBOT_MULTI_PULL_ACTION_DELAY;
+			ch->SetVictim(NULL);
+			ClearPlayerBotRoute(state, true);
+			sys_log(0, "PLAYERBOT_PULL: aggroed pack pid=%u name=%s groups=%u/%u target=%s aggressors=%d hp=%d/%d",
+					ch->GetPlayerID(), ch->GetName(), (unsigned int)state.bMultiPullGroups,
+					(unsigned int)state.bMultiPullDesiredGroups, target->GetName(),
+					CountPlayerBotPullAggressors(ch), ch->GetHP(), ch->GetMaxHP());
+			return true;
+		}
+		const int distance = DISTANCE_APPROX(ch->GetX() - target->GetX(),
+				ch->GetY() - target->GetY());
+		if (distance > PLAYERBOT_MELEE_RANGE)
+		{
+			MovePlayerBot(ch, target->GetX(), target->GetY(), dwNow);
+			return true;
+		}
+
+		if (dwNow < state.dwNextMultiPullActionTime)
+			return true;
+		if (ch->IsStateMove())
+			ch->Stop();
+		if (!ExecutePlayerBotBasicAttack(ch, target, state, dwNow))
+			return true;
+
+		PIXEL_POSITION center;
+		center.x = target->GetX();
+		center.y = target->GetY();
+		center.z = 0;
+		state.vecMultiPullCenters.push_back(center);
+		++state.bMultiPullGroups;
+		state.dwMultiPullTargetVID = 0;
+		state.dwTargetVID = 0;
+		state.dwNextMultiPullActionTime = dwNow + PLAYERBOT_MULTI_PULL_ACTION_DELAY;
+		ch->SetVictim(NULL);
+		ClearPlayerBotRoute(state, true);
+		sys_log(0, "PLAYERBOT_PULL: tagged pack pid=%u name=%s groups=%u/%u target=%s aggressors=%d hp=%d/%d",
+				ch->GetPlayerID(), ch->GetName(), (unsigned int)state.bMultiPullGroups,
+				(unsigned int)state.bMultiPullDesiredGroups, target->GetName(),
+				CountPlayerBotPullAggressors(ch), ch->GetHP(), ch->GetMaxHP());
 		return true;
 	}
 
@@ -8531,6 +10081,12 @@ namespace
 			return;
 		state.dwNextGoalPlanTime = dwNow + PLAYERBOT_GOAL_PLAN_INTERVAL + number(0, 1500);
 
+		const bool canAdvanceHorse = state.bVisitingStable ||
+				ShouldPlayerBotPursueHorseExpedition(ch, dwNow);
+		const bool hasBiologistMission = GetActivePlayerBotBiologistMission(ch) != NULL;
+		const bool hasHuntingMission = GetActivePlayerBotHuntingMission(ch) != NULL;
+		const bool canRefine = HasPlayerBotRefineOpportunity(ch);
+		const bool canReadBook = HasPlayerBotUsableSkillBook(ch);
 		BYTE goal = BOT_GOAL_LEVEL_UP;
 		if (state.bRecoveringAfterDeath || state.bTacticalRetreat ||
 				(ch->GetMaxHP() > 0 && ch->GetHP() * 100 < ch->GetMaxHP() * 35))
@@ -8539,27 +10095,39 @@ namespace
 			goal = BOT_GOAL_CHOOSE_PROFESSION;
 		else if (ch->GetWear(WEAR_WEAPON) == NULL)
 			goal = BOT_GOAL_GET_EQUIPMENT;
-		else if (state.bVisitingStable || CanPlayerBotAdvanceHorse(ch))
+		else if (state.bVisitingStable)
 			goal = BOT_GOAL_HORSE;
-		else if (GetActivePlayerBotBiologistMission(ch) != NULL &&
-				ch->GetPlayerID() % 3 != 0)
-			goal = BOT_GOAL_BIOLOGIST;
-		else if (GetActivePlayerBotHuntingMission(ch) != NULL)
-			goal = BOT_GOAL_HUNTING;
-		else if (GetActivePlayerBotBiologistMission(ch) != NULL)
-			goal = BOT_GOAL_BIOLOGIST;
 		else if (state.bVisitingShop && state.bTownNeedBlacksmith)
 			goal = BOT_GOAL_REFINE;
 		else if (NeedsPlayerBotPotions(ch))
 			goal = BOT_GOAL_RESTOCK;
-		else if (HasPlayerBotRefineOpportunity(ch))
+		else if (state.bAmbition == BOT_AMBITION_EQUIPMENT && canRefine)
 			goal = BOT_GOAL_REFINE;
-		else if (HasPlayerBotUsableSkillBook(ch))
+		else if (state.bAmbition == BOT_AMBITION_SKILLS && canReadBook)
 			goal = BOT_GOAL_MASTER_SKILL;
-		else if (state.bBotRole == BOT_ROLE_METIN_HUNTER)
+		else if (state.bAmbition == BOT_AMBITION_HORSE && canAdvanceHorse)
+			goal = BOT_GOAL_HORSE;
+		else if (state.bAmbition == BOT_AMBITION_BIOLOGIST && hasBiologistMission)
+			goal = BOT_GOAL_BIOLOGIST;
+		else if (state.bAmbition == BOT_AMBITION_METINS &&
+				state.bBotRole == BOT_ROLE_METIN_HUNTER)
 			goal = BOT_GOAL_HUNT_METIN;
 		else if (state.bBotRole == BOT_ROLE_PARTY_FIGHTER && ch->GetParty())
 			goal = BOT_GOAL_PARTY_CHALLENGE;
+		else if (canAdvanceHorse)
+			goal = BOT_GOAL_HORSE;
+		else if (hasBiologistMission && ch->GetPlayerID() % 3 != 0)
+			goal = BOT_GOAL_BIOLOGIST;
+		else if (hasHuntingMission)
+			goal = BOT_GOAL_HUNTING;
+		else if (hasBiologistMission)
+			goal = BOT_GOAL_BIOLOGIST;
+		else if (canRefine)
+			goal = BOT_GOAL_REFINE;
+		else if (canReadBook)
+			goal = BOT_GOAL_MASTER_SKILL;
+		else if (state.bBotRole == BOT_ROLE_METIN_HUNTER)
+			goal = BOT_GOAL_HUNT_METIN;
 
 		SetPlayerBotGoal(ch, state, goal, dwNow);
 	}
@@ -9153,6 +10721,8 @@ namespace
 }
 
 CPlayerBotManager::CPlayerBotManager()
+	: m_bRegistryLoaded(false),
+	  m_bRegistryAvailable(false)
 {
 }
 
@@ -9164,8 +10734,18 @@ CPlayerBotManager::~CPlayerBotManager()
 
 bool CPlayerBotManager::Spawn(DWORD dwPlayerID, BYTE bEmpire)
 {
-	if (dwPlayerID == 0 || bEmpire == 0 || bEmpire >= EMPIRE_MAX_NUM)
+	if (dwPlayerID == 0 || bEmpire != 2)
 		return false;
+
+	// A bot descriptor has no authenticated account session.  Never let a raw
+	// PID turn an ordinary player into a server-controlled character: only the
+	// immutable cohort written by playerbots_seed.sql may use this load path.
+	if (!IsRegistered(dwPlayerID))
+	{
+		sys_err("PLAYERBOT_AUTH: rejected unregistered spawn pid=%u empire=%u",
+				dwPlayerID, bEmpire);
+		return false;
+	}
 
 	if (IsManaged(dwPlayerID) || CHARACTER_MANAGER::instance().FindByPID(dwPlayerID))
 		return false;
@@ -9185,6 +10765,82 @@ bool CPlayerBotManager::Spawn(DWORD dwPlayerID, BYTE bEmpire)
 	sys_log(0, "PLAYERBOT: requested player load pid=%u empire=%u handle=%u",
 			dwPlayerID, bEmpire, d->GetHandle());
 	return true;
+}
+
+bool CPlayerBotManager::LoadRegisteredBots()
+{
+	if (m_bRegistryLoaded)
+		return m_bRegistryAvailable;
+
+	// Fail closed for this process.  A missing/corrupt ledger must leave bots
+	// offline instead of falling back to the historical contiguous PID range.
+	m_bRegistryLoaded = true;
+	m_bRegistryAvailable = false;
+	m_setRegisteredBots.clear();
+
+	const char* query =
+			"SELECT l.pid "
+			"FROM common.playerbot_seed_state AS l "
+			"JOIN player.player AS p ON p.id=l.pid "
+			"JOIN account.account AS a ON a.id=p.account_id "
+			"JOIN player.player_index AS pi ON pi.id=a.id "
+			"WHERE l.seed_version=1 "
+			"AND l.state IN ('complete','adopted') "
+			"AND BINARY a.login=BINARY CONCAT('playerbot_',LPAD(l.pid-3,3,'0')) "
+			"AND BINARY a.social_id=BINARY CONCAT('9',LPAD(l.pid-3,12,'0')) "
+			"AND pi.pid1=l.pid AND pi.pid2=0 AND pi.pid3=0 AND pi.pid4=0 "
+			"AND pi.empire=2 ORDER BY l.pid";
+
+	std::unique_ptr<SQLMsg> msg(AccountDB::instance().DirectQuery(query));
+	if (!msg.get() || msg->uiSQLErrno != 0 || !msg->Get() ||
+			!msg->Get()->pSQLResult)
+	{
+		sys_err("PLAYERBOT_AUTH: registry query failed; refusing every bot spawn");
+		return false;
+	}
+
+	MYSQL_ROW row;
+	while (NULL != (row = mysql_fetch_row(msg->Get()->pSQLResult)))
+	{
+		DWORD pid = 0;
+		if (row[0])
+			str_to_number(pid, row[0]);
+		if (pid != 0)
+			m_setRegisteredBots.insert(pid);
+	}
+
+	m_bRegistryAvailable = !m_setRegisteredBots.empty();
+	if (!m_bRegistryAvailable)
+	{
+		sys_err("PLAYERBOT_AUTH: registry has no valid seeded identities; refusing every bot spawn");
+		return false;
+	}
+
+	sys_log(0, "PLAYERBOT_AUTH: loaded %u registered bot identities",
+			(unsigned int)m_setRegisteredBots.size());
+	return true;
+}
+
+bool CPlayerBotManager::IsRegistered(DWORD dwPlayerID)
+{
+	return LoadRegisteredBots() &&
+			m_setRegisteredBots.find(dwPlayerID) != m_setRegisteredBots.end();
+}
+
+size_t CPlayerBotManager::SpawnRegistered(size_t count, BYTE bEmpire)
+{
+	if (count == 0 || bEmpire != 2 || !LoadRegisteredBots())
+		return 0;
+
+	size_t selected = 0;
+	size_t spawned = 0;
+	for (TRegisteredPlayerBotSet::const_iterator it = m_setRegisteredBots.begin();
+			it != m_setRegisteredBots.end() && selected < count; ++it, ++selected)
+	{
+		if (Spawn(*it, bEmpire))
+			++spawned;
+	}
+	return spawned;
 }
 
 bool CPlayerBotManager::Despawn(DWORD dwPlayerID)
@@ -9239,6 +10895,10 @@ void CPlayerBotManager::OnPlayerLoaded(LPDESC d)
 			state.bBotRole = BOT_ROLE_METIN_HUNTER;
 		else
 			state.bBotRole = BOT_ROLE_MOB_GRINDER;
+		state.bPersonality = GetPlayerBotStablePersonality(
+				d->GetCharacter(), state.bBotRole);
+		state.bAmbition = GetPlayerBotStableAmbition(
+				d->GetCharacter(), state.bPersonality);
 
 		state.uMetinHotspotIndex = (BYTE)(dwPID % 16);
 
@@ -9248,6 +10908,9 @@ void CPlayerBotManager::OnPlayerLoaded(LPDESC d)
 		state.dwNextSkillCheckTime = now + number(1000, 5000);
 		state.dwNextSkillBookTime = now + number(3000, 12000);
 		state.dwNextSpiritStoneTime = now + number(3000, 15000);
+		state.dwNextInventoryMaintenanceTime = now + number(
+				PLAYERBOT_INVENTORY_MAINTENANCE_MIN,
+				PLAYERBOT_INVENTORY_MAINTENANCE_MAX);
 		state.dwNextPartyShareTime = now + number(10000, 30000);
 		state.dwNextGoalPlanTime = now + number(1000, 5000);
 		state.dwNextEquipmentCheckTime = now + number(1000, 5000);
@@ -9262,9 +10925,10 @@ void CPlayerBotManager::OnPlayerLoaded(LPDESC d)
 			s_pkPlayerBotUpdateEvent = event_create(playerbot_update_event, info, PASSES_PER_SEC(1));
 		}
 
-		sys_log(0, "PLAYERBOT: entered game pid=%u name=%s role=%u map=%ld",
+		sys_log(0, "PLAYERBOT: entered game pid=%u name=%s role=%u personality=%u ambition=%u map=%ld",
 				d->GetCharacter()->GetPlayerID(), d->GetCharacter()->GetName(),
-				(unsigned int)state.bBotRole, d->GetCharacter()->GetMapIndex());
+				(unsigned int)state.bBotRole, (unsigned int)state.bPersonality,
+				(unsigned int)state.bAmbition, d->GetCharacter()->GetMapIndex());
 	}
 }
 
@@ -9365,6 +11029,14 @@ void CPlayerBotManager::Update()
 		if (!d->IsPhase(PHASE_GAME))
 			continue;
 
+		if (ch->IsItemLoaded() && dwNow >= state.dwNextInventoryMaintenanceTime)
+		{
+			CompactPlayerBotPotionStacks(ch);
+			state.dwNextInventoryMaintenanceTime = dwNow + number(
+					PLAYERBOT_INVENTORY_MAINTENANCE_MIN,
+					PLAYERBOT_INVENTORY_MAINTENANCE_MAX);
+		}
+
 		// Independent safety net for stale goals/state machines. It does not move or
 		// teleport healthy bots; only 90 seconds without travel, attacks or skills
 		// clears transient state so the next tick can choose a fresh goal.
@@ -9447,12 +11119,40 @@ void CPlayerBotManager::Update()
 		// cannot press its Confirm button, so accept/claim that official mission
 		// here while leaving kill counting to the normal quest event.
 		ManagePlayerBotHuntingProgress(ch);
+		// Apprentice Chests are useful even when a weapon is already equipped. Open
+		// one eligible box between fights, then let the ordinary equipment scoring
+		// choose its best helmet, shield, boots, armour and weapon.
+		if (ManagePlayerBotProgressionChests(ch, state, dwNow))
+			continue;
 		PlanPlayerBotLongTermGoal(ch, state, dwNow);
 
 		// Trigger Town Visit (Full inventory, out of potions, or missing weapon)
 		// Only trigger when NOT in the middle of fighting an active Metin stone!
 		LPCHARACTER curTarget = state.dwTargetVID != 0 ? CHARACTER_MANAGER::instance().Find(state.dwTargetVID) : NULL;
-		const bool bFightingMetin = (curTarget && curTarget->IsStone() && !curTarget->IsDead());
+		if (curTarget && curTarget->IsStone() && !curTarget->IsDead() &&
+				!IsPlayerBotMetinWorthFighting(ch, curTarget))
+		{
+			ReleasePlayerBotMetinReservation(ch, curTarget);
+			sys_log(0, "PLAYERBOT_METIN: skipped obsolete stone pid=%u name=%s level=%u stone=%s stone_level=%u",
+					ch->GetPlayerID(), ch->GetName(), ch->GetLevel(),
+					curTarget->GetName(), curTarget->GetLevel());
+			state.dwTargetVID = 0;
+			ch->SetVictim(NULL);
+			ClearPlayerBotRoute(state, true);
+			ResetPlayerBotStoneProgress(state);
+			curTarget = NULL;
+		}
+		bool bFightingMetin = (curTarget && curTarget->IsStone() && !curTarget->IsDead());
+		if (bFightingMetin &&
+				ShouldPlayerBotAbandonStone(ch, curTarget, state, dwNow))
+		{
+			curTarget = NULL;
+			bFightingMetin = false;
+		}
+		else if (!bFightingMetin && state.dwStoneProgressVID != 0)
+		{
+			ResetPlayerBotStoneProgress(state);
+		}
 
 		const bool bNeedsProfession = ch->GetLevel() >= 5 && ch->GetSkillGroup() == 0;
 		// Losing essential gear at the real blacksmith is urgent. Do not leave the
@@ -9461,28 +11161,33 @@ void CPlayerBotManager::Update()
 		const bool bNeedsCoreGear = ch->IsItemLoaded() &&
 				(NeedsPlayerBotProgressionWeapon(ch) ||
 				 NeedsPlayerBotProgressionArmor(ch) ||
-				 NeedsPlayerBotProgressionShield(ch));
+				 NeedsPlayerBotProgressionShield(ch) ||
+				 NeedsPlayerBotProgressionHelmet(ch) ||
+				 NeedsPlayerBotProgressionBoots(ch));
 
-		// Finish the loot sweep before deciding to leave for town.  This is most
-		// important just after a Metin dies: the previous order could start a shop
-		// route in the same update and abandon a fresh, widely distributed drop.
-		if (!bFightingMetin && HandleLoot(ch, state, dwNow))
+		// Exactly one loot decision per full AI pass. HandleLoot performs a
+		// non-blocking, throttled Z-style pickup in combat and returns false, while
+		// peaceful loot may take ownership of this tick and walk to the drop.
+		if (HandleLoot(ch, state, dwNow))
 			continue;
 
 		// Horse medals are equally real resources: a bot leaves combat, walks to
-		if (!bFightingMetin && ManagePlayerBotHorse(ch, state, dwNow))
+		if (!state.bMultiPullActive && !bFightingMetin &&
+				ManagePlayerBotHorse(ch, state, dwNow))
 			continue;
 
 		// Move between the real Chunjo portals in controlled, staggered waves.
 		// M2, M3 and the empire-specific easy Monkey Dungeon share this core, so
 		// map changes remain visible to native desktop clients.
-		if (!bFightingMetin && ManagePlayerBotWorldTravel(ch, state, dwNow))
+		if (!state.bMultiPullActive && !bFightingMetin &&
+				ManagePlayerBotWorldTravel(ch, state, dwNow))
 			continue;
 
 		// Research is a first-class activity, not an instant reward. A bot that
 		// has collected the outstanding specimens walks to Chaegirab and submits
 		// them one by one before it resumes hunting.
-		if (!bFightingMetin && ManagePlayerBotBiologist(ch, state, dwNow))
+		if (!state.bMultiPullActive && !bFightingMetin &&
+				ManagePlayerBotBiologist(ch, state, dwNow))
 			continue;
 
 		// Missing/progression gear starts the first visit immediately because the
@@ -9490,7 +11195,10 @@ void CPlayerBotManager::Update()
 		// its 5-10 minute retry cooldown.  Otherwise a bot that cannot yet afford
 		// the next tier loops forever between the weapon and armour merchants and
 		// never returns to combat (or to its local party).
-		if (ch->GetMapIndex() == 21 && !state.bVisitingShop && !bFightingMetin &&
+		const bool bOnTownMap = ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M1 ||
+				ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2;
+		if (bOnTownMap && !state.bVisitingShop && !state.bMultiPullActive &&
+				!bFightingMetin &&
 				(bNeedsProfession || dwNow > state.dwNextShopCheckTime))
 		{
 			size_t occupiedItems = 0;
@@ -9520,9 +11228,11 @@ void CPlayerBotManager::Update()
 			const bool bNeedsRefine = HasPlayerBotRefineOpportunity(ch);
 			const bool bNeedsGearUpgrade = bNeedsCoreGear || NeedsPlayerBotArrows(ch);
 			const bool bNeedsSellRun = CountPlayerBotJunkItems(ch) >= 12;
+			const bool bNeedsPotionCleanup = HasPlayerBotExcessPotions(ch);
 
 			if (bNeedsProfession || bInventoryFull || bOutPotions || bWeaponMissing ||
-					bNeedsRefine || bNeedsGearUpgrade || bNeedsSellRun)
+					bNeedsRefine || bNeedsGearUpgrade || bNeedsSellRun ||
+					bNeedsPotionCleanup)
 				StartPlayerBotTownVisit(ch, state, dwNow);
 		}
 
@@ -9543,14 +11253,22 @@ void CPlayerBotManager::Update()
 		{
 			state.dwTargetVID = 0;
 			ch->SetVictim(NULL);
-			// An unarmed bot must still be able to collect an owned weapon drop.
-			if (HandleLoot(ch, state, dwNow))
-				continue;
-
-			// If neither inventory nor ground contains a weapon, begin a real town
-			// visit instead of buying one remotely and remaining permanently idle.
-			StartPlayerBotTownVisit(ch, state, dwNow);
-			ch->Stop();
+			if (state.dwEmergencyScavengeUntil != 0 &&
+					dwNow < state.dwEmergencyScavengeUntil &&
+					ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M1)
+			{
+				// HandleLoot above collects any ownerless nearby drop. Wander between
+				// hunting hubs so the next scans cover new ground instead of idling at
+				// the Weapon Merchant forever.
+				SetPlayerBotGoal(ch, state, BOT_GOAL_GET_EQUIPMENT, dwNow);
+				ManagePlayerBotWandering(ch, state, dwNow);
+			}
+			else
+			{
+				state.dwEmergencyScavengeUntil = 0;
+				StartPlayerBotTownVisit(ch, state, dwNow);
+				ch->Stop();
+			}
 			continue;
 		}
 
@@ -9587,14 +11305,27 @@ void CPlayerBotManager::Update()
 		if (HandlePlayerBotTacticalRetreat(ch, state, dwNow))
 			continue;
 
-		ManagePlayerBotEquipment(ch, state, dwNow);
-
-		if (HandleLoot(ch, state, dwNow))
+		const bool bMissingCoreWearSlot = ch->GetWear(WEAR_WEAPON) == NULL ||
+				ch->GetWear(WEAR_BODY) == NULL || ch->GetWear(WEAR_SHIELD) == NULL ||
+				ch->GetWear(WEAR_HEAD) == NULL || ch->GetWear(WEAR_FOOTS) == NULL;
+		if (ManagePlayerBotEquipment(ch, state, dwNow))
 			continue;
+		if (bMissingCoreWearSlot && state.bEquipPending)
+		{
+			// A continuous attack cadence never left the 1.7 s native equipment
+			// window open. Pause only when a usable item for a missing core slot is
+			// already waiting in the inventory, then equip it on the next update.
+			state.dwTargetVID = 0;
+			ch->SetVictim(NULL);
+			ch->Stop();
+			continue;
+		}
 
 		// A buff is a complete action for this AI update.  Continuing into the
 		// attack code used to emit a second skill packet in the very same tick.
 		if (ManagePlayerBotCombatBuffs(ch, state, dwNow))
+			continue;
+		if (HandlePlayerBotMultiPull(ch, state, dwNow))
 			continue;
 
 		LPCHARACTER target = state.dwTargetVID != 0
@@ -9625,6 +11356,7 @@ void CPlayerBotManager::Update()
 				CanPlayerBotPartyChallenge(ch, target, dwNow, NULL);
 
 		if (!target || target->IsDead() || (!bTargetIsMonster && !bTargetIsStone) ||
+			(bTargetIsStone && !IsPlayerBotMetinWorthFighting(ch, target)) ||
 			!bPartyCanContinue ||
 			IsPlayerBotSafeZone(ch->GetMapIndex(), target ? target->GetX() : ch->GetX(),
 					target ? target->GetY() : ch->GetY()) ||
@@ -9643,7 +11375,7 @@ void CPlayerBotManager::Update()
 			{
 				if (target->IsStone())
 					ReservePlayerBotMetin(ch, target, dwNow);
-				sys_log(0, "PLAYERBOT_AI: target acquired pid=%u name=%s level=%u target_vid=%u target=%s target_level=%u is_stone=%d recent_death=%d",
+				sys_log(1, "PLAYERBOT_AI: target acquired pid=%u name=%s level=%u target_vid=%u target=%s target_level=%u is_stone=%d recent_death=%d",
 						ch->GetPlayerID(), ch->GetName(), ch->GetLevel(), state.dwTargetVID,
 						target->GetName(), target->GetLevel(), target->IsStone() ? 1 : 0, bRecentDeath ? 1 : 0);
 				if (target->IsMonster() && target->GetLevel() > ch->GetLevel() + PLAYERBOT_MAX_TARGET_LEVEL_DELTA)
@@ -9661,6 +11393,10 @@ void CPlayerBotManager::Update()
 		if (!target)
 		{
 			ch->SetVictim(NULL);
+			// A wander timer chosen before the last fight must not create an idle gap
+			// after this pack dies. Existing routes are still advanced first inside
+			// ManagePlayerBotWandering; only an idle bot plans a fresh scouting leg.
+			state.dwNextWanderTime = dwNow;
 			ManagePlayerBotWandering(ch, state, dwNow);
 			continue;
 		}
@@ -9733,6 +11469,59 @@ void CPlayerBotManager::Update()
 
 		ExecutePlayerBotBasicAttack(ch, target, state, dwNow);
 
+	}
+
+	// Publish one compact, atomic snapshot per game core. The web panel reads
+	// these files from the shared read-only game-var volume, so it sees the real
+	// AI decision instead of inferring an activity from party membership or PID.
+	static DWORD s_dwNextStatusSnapshotTime = 0;
+	if (dwNow >= s_dwNextStatusSnapshotTime)
+	{
+		s_dwNextStatusSnapshotTime = dwNow + PLAYERBOT_STATUS_SNAPSHOT_INTERVAL;
+		const char* tempPath = "playerbot_status.tsv.tmp";
+		const char* finalPath = "playerbot_status.tsv";
+		FILE* snapshot = fopen(tempPath, "wb");
+		if (snapshot)
+		{
+			fprintf(snapshot, "pid\tpersonality\tambition\trole\tin_party\tgoal\taction\tupdated_ms\tmap\tx\ty\thp\tmax_hp\tstatus\n");
+			for (TPlayerBotMap::const_iterator statusIt = m_mapBots.begin();
+					statusIt != m_mapBots.end(); ++statusIt)
+			{
+				LPDESC statusDesc = statusIt->second;
+				LPCHARACTER statusCh = statusDesc ? statusDesc->GetCharacter() : NULL;
+				TPlayerBotAIStateMap::const_iterator aiIt =
+						s_mapPlayerBotAIStates.find(statusIt->first);
+				if (!statusCh || !statusDesc->IsPhase(PHASE_GAME) ||
+						aiIt == s_mapPlayerBotAIStates.end())
+					continue;
+
+				const TPlayerBotAIState& statusState = aiIt->second;
+				char statusText[192];
+				if (statusCh->IsDead())
+					snprintf(statusText, sizeof(statusText), "Nieprzytomny - czekam na wstanie");
+				else
+					BuildPlayerBotStatusText(statusCh, statusState,
+							statusText, sizeof(statusText));
+				for (char* p = statusText; *p; ++p)
+				{
+					if (*p == '\t' || *p == '\r' || *p == '\n')
+						*p = ' ';
+				}
+
+				fprintf(snapshot, "%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%ld\t%ld\t%ld\t%d\t%d\t%s\n",
+						statusCh->GetPlayerID(), (unsigned int)statusState.bPersonality,
+						(unsigned int)statusState.bAmbition, (unsigned int)statusState.bBotRole,
+						statusCh->GetParty() ? 1U : 0U,
+						(unsigned int)statusState.bLongTermGoal,
+						(unsigned int)statusState.bCurrentAction, (unsigned int)dwNow,
+						statusCh->GetMapIndex(), statusCh->GetX(), statusCh->GetY(),
+						statusCh->GetHP(), statusCh->GetMaxHP(), statusText);
+			}
+			fflush(snapshot);
+			fclose(snapshot);
+			if (rename(tempPath, finalPath) != 0)
+				remove(tempPath);
+		}
 	}
 }
 

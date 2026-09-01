@@ -24,7 +24,7 @@
 #  for no isolation benefit -- they already trust each other completely.
 # =============================================================================
 
-name: metin2
+name: "${M2_COMPOSE_PROJECT_NAME:-metin2}"
 
 services:
 
@@ -34,7 +34,7 @@ services:
   # ---------------------------------------------------------------------------
   mariadb:
     image: mariadb:10.11
-    container_name: metin2-db
+    container_name: "${M2_CONTAINER_PREFIX:-metin2}-db"
     restart: unless-stopped
     stop_grace_period: 60s
 
@@ -88,7 +88,7 @@ services:
   # ---------------------------------------------------------------------------
   playerbot-migrate:
     image: mariadb:10.11
-    container_name: metin2-playerbot-migrate
+    container_name: "${M2_CONTAINER_PREFIX:-metin2}-playerbot-migrate"
     restart: "no"
 
     depends_on:
@@ -103,6 +103,9 @@ services:
       # 0 preserves an older/non-canonical cohort without changing it. CI and
       # deliberate migrations can choose 1 to fail the stack on any collision.
       PLAYERBOT_SEED_STRICT: "${PLAYERBOT_SEED_STRICT:-0}"
+      # Optional persistent-world guard. A non-zero value refuses to seed/start
+      # when the selected Docker daemon or volume contains fewer bots.
+      PLAYERBOT_EXPECT_MIN_EXISTING_BOTS: "${PLAYERBOT_EXPECT_MIN_EXISTING_BOTS:-0}"
 
     entrypoint: ["/bin/sh", "/opt/playerbot/apply.sh"]
 
@@ -133,7 +136,7 @@ services:
         MAKE_JOBS: "${M2_MAKE_JOBS:-}"
         STRIP_BINARIES: "${M2_STRIP_BINARIES:-1}"
     image: metin2/game:40250
-    container_name: metin2-game
+    container_name: "${M2_CONTAINER_PREFIX:-metin2}-game"
     restart: unless-stopped
 
     # The cores flush players to the db core on shutdown, and the db core then
@@ -174,6 +177,10 @@ services:
       # Single authoritative startup switch (implemented by the bot manager).
       # Keep the existing 350-bot world by default; lower this in .env for tests.
       PLAYERBOT_AUTOSPAWN_COUNT: "${PLAYERBOT_AUTOSPAWN_COUNT:-350}"
+
+      # Used only when the persistent language choice does not exist yet.
+      # The panel can change it later and m2-lang preserves that choice.
+      M2_DEFAULT_GAME_LANGUAGE: "${M2_DEFAULT_GAME_LANGUAGE:-en}"
 
       TZ: "${M2_TZ:-UTC}"
 
@@ -225,7 +232,7 @@ services:
       context: ./panel
       dockerfile: Dockerfile
     image: metin2/panel:latest
-    container_name: metin2-panel
+    container_name: "${M2_CONTAINER_PREFIX:-metin2}-panel"
     restart: unless-stopped
 
     depends_on:
@@ -583,7 +590,7 @@ services:
       context: ./wsbridge
       dockerfile: Dockerfile
     image: metin2/wsbridge:latest
-    container_name: metin2-wsbridge
+    container_name: "${M2_CONTAINER_PREFIX:-metin2}-wsbridge"
     profiles: ["browser"]
     restart: unless-stopped
     init: true
@@ -656,7 +663,7 @@ services:
       context: ./updater
       dockerfile: Dockerfile
     image: metin2/updater:latest
-    container_name: metin2-updater
+    container_name: "${M2_CONTAINER_PREFIX:-metin2}-updater"
     profiles: ["update"]
     restart: unless-stopped
     init: true

@@ -4,6 +4,13 @@
 
 A local Metin2 singleplayer world populated by genuine, autonomous player characters (Playerbots): leveling up, grinding solo and in squads, looting items, refining gear at the Blacksmith, hunting Metin stones, and persisting their full progression in the standard database.
 
+## 💬 Community & Project Support
+
+- **[Join our Discord server](https://discord.gg/6v4WkDY6a)** — discuss the project, share playtests and ideas, and follow playerbot development updates.
+- **[Support development on Zrzutka.pl](https://zrzutka.pl/rw4g7p)** — voluntary donations help cover the tools and AI models used to develop the project.
+
+Every contribution — testing, bug reports, ideas, code, or financial support — helps us build a more autonomous and lively Metin2 world.
+
 > [!IMPORTANT]
 > This project supports the **native Windows client only**. It neither contains nor automatically downloads Metin2 files, the r40250 package, or the withdrawn upstream WebClient. Installation requires your own compatible files. See [project provenance and attribution](docs/ATTRIBUTION.md).
 
@@ -43,7 +50,7 @@ The project is under active research and development.
 
 ### 1. Prepare the files
 
-Have a compatible local r40250 server archive ready. A native Windows client archive is optional if you already have a configured client. Neither file belongs in this repository.
+Have a compatible local r40250 server archive ready. A native Windows client archive, preferably from the exact same release, is optional if you already have a configured client. The “r40250” label alone does not guarantee matching packets and proto files. Neither file belongs in this repository.
 
 ### 2. Clone and Install (Windows)
 ```powershell
@@ -64,7 +71,7 @@ docker compose up -d
 ```
 
 ### 4. Join the Game
-Point any standard r40250-compatible game client to `127.0.0.1` (Auth port `11000`, Game ports `13000–13002`) and jump into the living world in Joan (Chunjo)!
+Point the client from the same compatible r40250 set to `127.0.0.1` (Auth port `11000`, Game ports `13000–13002`) and jump into the living world in Joan (Chunjo)!
 
 👉 **Detailed installation, `.env` options, and client setup instructions: [docs/INSTALL_EN.md](docs/INSTALL_EN.md)**
 
@@ -103,6 +110,7 @@ Detailed guides separated into dedicated documentation modules:
 
 - 📖 **[Installation & Setup Guide (docs/INSTALL_EN.md)](docs/INSTALL_EN.md)** – Docker, WSL2, Linux, `.env`, client connection.
 - 💻 **[Developer Guide & Diagnostics (docs/DEVELOPMENT_EN.md)](docs/DEVELOPMENT_EN.md)** – 8-second fast C++ builds (`fast-game-build`), debugging, and telemetry logs.
+- 🧩 **[Architecture and refactoring path (docs/ARCHITECTURE.md)](docs/ARCHITECTURE.md)** – module boundaries and the incremental path toward testable AI components.
 - 🧾 **[Provenance & Attribution (docs/ATTRIBUTION.md)](docs/ATTRIBUTION.md)** – fork history, licensing boundary, and WebClient status.
 
 ---

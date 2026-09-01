@@ -937,6 +937,31 @@ function ConvertTo-MountPath {
     return ((Resolve-Path -LiteralPath $Path).ProviderPath.TrimEnd('\'))
 }
 
+# A failed source dry run happens inside a Docker volume. Copy its deliberately
+# source-free compatibility report onto Windows before the helper exits so an
+# operator can attach one small text file to an issue instead of transcribing
+# a scrolling terminal or exposing their server archive.
+function Export-SourceCompatibilityReport {
+    $diagnostics = Join-Path $script:InstallDir 'diagnostics'
+    $destination = Join-Path $diagnostics 'compatibility-report.txt'
+    $created = Invoke-Native 'docker' @('create', '-v', "$($script:SrcVolume):/work",
+                                        $script:FetcherImage, 'true')
+    if ($created.Code -ne 0 -or -not $created.Output) { return '' }
+    $cid = ($created.Output -split "`n" | Where-Object { $_.Trim() } |
+            Select-Object -Last 1).Trim()
+    try {
+        New-Item -ItemType Directory -Force -Path $diagnostics | Out-Null
+        $copied = Invoke-Native 'docker' @('cp',
+                    "$($cid):/work/cache/compatibility-report.txt", $destination)
+        if ($copied.Code -eq 0 -and (Test-Path -LiteralPath $destination -PathType Leaf)) {
+            return $destination
+        }
+    } finally {
+        Invoke-Native 'docker' @('rm', '-f', $cid) | Out-Null
+    }
+    return ''
+}
+
 # Put the project inside the volume, so that everything after this happens on
 # the container's own filesystem: no Windows path lengths, no bind-mount
 # overhead on half a gigabyte of small files, and the user's own checkout is
@@ -955,7 +980,9 @@ function Copy-ProjectIntoVolume {
         # developer's PC that one directory is 300 MB of files we would copy in
         # only to delete.
         $sh = 'set -e; rm -rf /work/repo; mkdir -p /work/repo; ' +
-              'tar cf - -C /src --exclude=./.git --exclude=./linux-port/docker/game/src . ' +
+              'tar cf - -C /src --exclude=./.git --exclude=./linux-port/docker/game/src ' +
+              '--exclude=./linux-port/docker/artifacts.json ' +
+              '--exclude=./linux-port/docker/fetch-web-client.sh . ' +
               '| tar xf - -C /work/repo; ' +
               'test -f /work/repo/linux-port/fetch-sources.sh'
         $code = Invoke-DockerLoud @(
@@ -1144,6 +1171,14 @@ function Invoke-SourceFetch {
         return
     }
 
+    $compatibilityReport = ''
+    if ($code -eq 6) {
+        $compatibilityReport = Export-SourceCompatibilityReport
+        if ($compatibilityReport) {
+            Write-Info "source compatibility report: $compatibilityReport"
+        }
+    }
+
     # fetch-sources.sh gives every kind of failure its own exit code precisely
     # so that this can say something useful rather than "it did not work".
     switch ($code) {
@@ -1176,7 +1211,13 @@ the "[40250] Reference Serverfile" package: the one with Server\ and Client\
 inside it. If it was downloaded, it may have been cut short -- run the
 installer again and it will notice.
 "@ }
-        6 { Stop-Friendly @"
+        6 {
+            $reportAdvice = if ($compatibilityReport) {
+                "A diagnostic report was saved at:`n`n    $compatibilityReport`n`nAttach that text file to the relevant GitHub issue."
+            } else {
+                'The first 80 lines of the patch dry run are printed above.'
+            }
+            Stop-Friendly @"
 The Linux port does not apply to this source.
 
 That is a precise answer rather than a vague failure: the server-file package
@@ -1184,7 +1225,9 @@ on this PC is not the r40250 one the port was made against. It is not a fault
 in the port, and it must not be forced -- a half-applied port compiles happily
 and then produces a server that does not work.
 
-What to do: use the r40250 package. Nothing was installed.
+What to do: use the supported baseline r40250 package. Nothing was installed.
+
+$reportAdvice
 "@ }
         7 { Stop-Friendly @"
 Docker ran out of disk space while assembling the server.
@@ -1252,7 +1295,26 @@ somewhere shorter -- C:\Metin2Server, say:
         # started with a directory where its script should have been. Copied in
         # so every path in docker-compose.yml stays inside this one folder.
         foreach ($extra in @('linux-port/fetch-web-client.sh', 'artifacts.json')) {
-            $rc = Invoke-DockerLoud @('cp', "$($cid):/work/repo/$extra", $script:InstallDir)
+            $leaf = Split-Path -Leaf $extra
+            $target = Join-Path $script:InstallDir $leaf
+
+            # Docker creates a DIRECTORY at a missing bind-mount source. A
+            # checkout that was used to start Compose can therefore contain an
+            # untracked docker\artifacts.json directory. Older installers
+            # copied that directory into the build context and then asked
+            # `docker cp' to overwrite it with the real file. Docker correctly
+            # refused with "cannot overwrite non-directory ... with directory".
+            # Keep any such unexpected directory for inspection instead of
+            # deleting it, then copy to an explicit file path so Docker never
+            # has to guess whether the destination means a file or a folder.
+            if (Test-Path -LiteralPath $target -PathType Container) {
+                $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+                $quarantine = "$target.invalid-directory-$stamp"
+                Move-Item -LiteralPath $target -Destination $quarantine
+                Write-Warn "Moved invalid $leaf directory aside: $quarantine"
+            }
+
+            $rc = Invoke-DockerLoud @('cp', "$($cid):/work/repo/$extra", $target)
             if ($rc -ne 0) {
                 Write-Warn "Could not copy $extra -- the browser client cannot be fetched."
             }
