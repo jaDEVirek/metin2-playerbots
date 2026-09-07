@@ -25,6 +25,11 @@ $cases = @(
         Expected = 'VIRTUALIZATION_DISABLED'
     },
     [pscustomobject]@{
+        Name = 'Docker WSL disk read-only'
+        Text = 'failed to solve: write /var/lib/desktop-containerd/daemon/io.containerd.metadata.v1.bolt/meta.db: read-only file system'
+        Expected = 'DOCKER_DISK_BROKEN'
+    },
+    [pscustomobject]@{
         Name = 'Broken WSL'
         Text = 'There was a problem with WSL. wsl.exe exit status 1'
         Expected = 'WSL_BROKEN'

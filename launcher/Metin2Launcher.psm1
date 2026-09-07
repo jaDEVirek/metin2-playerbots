@@ -1,6 +1,9 @@
 ﻿Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+# Fallback used when the manifest carries no support block (offline, or an old manifest).
+$script:M2_DEFAULT_SUPPORT_CONTACT = 'https://discord.gg/pt5tvnrN6'
+
 function Get-M2DefaultLauncherConfig {
     param([Parameter(Mandatory = $true)][string]$ServerRoot)
 
@@ -45,7 +48,10 @@ function Save-M2LauncherConfig {
 }
 
 function Get-M2UpdateManifest {
-    param([Parameter(Mandatory = $true)][string]$Source)
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [int]$TimeoutSec = 30
+    )
 
     if (Test-Path -LiteralPath $Source -PathType Leaf) {
         return Get-Content -LiteralPath $Source -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -56,7 +62,7 @@ function Get-M2UpdateManifest {
         throw 'Manifest musi być lokalnym plikiem albo adresem HTTPS.'
     }
     try {
-        return Invoke-RestMethod -Uri $uri -Method Get -UseBasicParsing -TimeoutSec 30
+        return Invoke-RestMethod -Uri $uri -Method Get -UseBasicParsing -TimeoutSec $TimeoutSec
     }
     catch {
         $statusCode = 0
@@ -66,6 +72,14 @@ function Get-M2UpdateManifest {
             }
         }
         catch { $statusCode = 0 }
+
+        # GitHub serves raw manifests from an anonymous, per-IP budget. A player
+        # who clicks the button a few times in a row spends it, and the bare
+        # transport error that came back ("Operacja nie powiodla sie") told them
+        # nothing about waiting an hour - or that their install was fine.
+        if ($statusCode -eq 403 -or $statusCode -eq 429) {
+            throw 'GitHub chwilowo ogranicza liczbe zapytan z Twojego adresu IP (limit anonimowy). Nie jest to blad Twojej instalacji - serwer dziala dalej. Sprobuj ponownie za kilkanascie minut.'
+        }
 
         # The stable channel may intentionally be empty between releases. A
         # missing manifest must never make the launcher reinstall the server,
@@ -271,6 +285,254 @@ function Invoke-M2PackageUpdate {
     }
 }
 
+function Invoke-M2EnginePatches {
+    <#
+        The engine patches are shipped and then never applied. prepare-context.sh
+        applies them, but it needs the pristine tree at /opt/m2port and never runs
+        on a player's machine, and nothing in the rebuild path did it instead - so
+        0004-private-shop-guard.patch sat in every installation while every server
+        still ran the unpatched guard. That guard is `GetPart(PART_MAIN) > 2`, and
+        PART_MAIN holds the vnum of the worn body armour, so OpenMyShop refused a
+        stall to anyone wearing armour: every bot, and every player who tried it.
+
+        patch(1) is not something a Windows machine has, but Docker is - a build
+        cannot happen without it - so the patch runs in the same base image the
+        server is compiled with. The directory is read whole rather than by name:
+        adding a patch must not mean editing this function.
+    #>
+    param([Parameter(Mandatory = $true)][string]$ServerRoot)
+
+    $patchDir = Join-Path $ServerRoot 'linux-port\overlays\playerbot\patches'
+    $target = Join-Path $ServerRoot 'linux-port\docker\game\src\server'
+    if (-not (Test-Path -LiteralPath $patchDir -PathType Container)) { return 0 }
+    if (-not (Test-Path -LiteralPath $target -PathType Container)) { return 0 }
+    $patches = @(Get-ChildItem -LiteralPath $patchDir -File -Filter '*.patch' | Sort-Object Name)
+    if ($patches.Count -eq 0) { return 0 }
+
+    # busybox, not the build image: ubuntu:24.04 has no patch(1) at all, and the
+    # first version of this silently reported "nothing to apply" because a failed
+    # dry run and a missing binary look identical. busybox is four megabytes and
+    # its patch understands -N and --dry-run, which is all this needs.
+    $image = 'busybox:latest'
+
+    # Whether a patch is already in is decided by reading the target files, not
+    # by asking patch(1). busybox's -N cannot tell an applied patch from a fresh
+    # one: it re-applied the 18 KB core-integration patch onto a tree that
+    # already had it and duplicated every declaration in it. So the tool is only
+    # ever handed a patch this function has first established is absent, and
+    # after that it cannot double-apply whatever the tool reports.
+    # Whether a patch is already in is decided by reading the target files, not
+    # by asking patch(1). busybox's -N cannot tell an applied patch from a fresh
+    # one: it re-applied the 18 KB core-integration patch onto a tree that
+    # already had it and duplicated every declaration in it. So the tool is only
+    # ever handed a patch this function has first established is absent.
+    #
+    # The test is per hunk and uses the whole block the hunk produces - its
+    # context lines together with its added lines. A single added line is not
+    # enough to go on: 0004 adds "if (IsPolymorphed())", which char.cpp already
+    # contains in three other functions.
+    $pending = @()
+    foreach ($p in $patches) {
+        $blocks = @()
+        $file = $null
+        $current = $null
+        foreach ($line in [IO.File]::ReadAllLines($p.FullName)) {
+            if ($line.StartsWith('+++ b/')) { $file = $line.Substring(6).Trim(); continue }
+            if ($line.StartsWith('@@')) {
+                if ($null -ne $current -and $current.Lines.Count -gt 0) { $blocks += $current }
+                $current = [pscustomobject]@{ File = $file; Lines = (New-Object Collections.Generic.List[string]) }
+                continue
+            }
+            if ($null -eq $current) { continue }
+            if ($line.StartsWith('-')) { continue }
+            if ($line.StartsWith('+')) { $current.Lines.Add($line.Substring(1)); continue }
+            if ($line.StartsWith(' ')) { $current.Lines.Add($line.Substring(1)); continue }
+            if ($line.StartsWith('\')) { continue }
+            # Anything else ends the hunk (a new "diff --git", for instance).
+            if ($current.Lines.Count -gt 0) { $blocks += $current }
+            $current = $null
+        }
+        if ($null -ne $current -and $current.Lines.Count -gt 0) { $blocks += $current }
+        if ($blocks.Count -eq 0) { continue }
+
+        $cache = @{}
+        $found = 0
+        $checked = 0
+        foreach ($b in $blocks) {
+            $path = Join-Path $target $b.File
+            if (-not $cache.ContainsKey($path)) {
+                $cache[$path] = if (Test-Path -LiteralPath $path -PathType Leaf) {
+                    ([IO.File]::ReadAllText($path)) -replace "`r`n", "`n"
+                } else { $null }
+            }
+            if ($null -eq $cache[$path]) { continue }
+            $checked++
+            $needle = ($b.Lines -join "`n")
+            if ($needle.Trim().Length -eq 0) { $checked--; continue }
+            if ($cache[$path].Contains($needle)) { $found++ }
+        }
+        if ($checked -eq 0) { continue }
+        if ($found -eq $checked) { continue }          # every hunk already in
+        if ($found -gt 0) {
+            Write-Host "Latka $($p.Name) jest nalozona tylko czesciowo - pomijam ja, zeby nie pogorszyc." -ForegroundColor Yellow
+            continue
+        }
+        $pending += $p
+    }
+
+    if ($pending.Count -eq 0) { return 0 }
+
+    $lines = @(
+        'command -v patch >/dev/null 2>&1 || { echo NOPATCH; exit 3; }',
+        'cd /src || exit 4'
+    )
+    foreach ($p in $pending) {
+        $lines += ('patch -N -p1 -i "/patches/' + $p.Name + '" >/dev/null 2>&1 || { echo "FAILED ' + $p.Name + '"; exit 5; }')
+        $lines += ('echo "APPLIED ' + $p.Name + '"')
+    }
+    $scriptFile = Join-Path ([IO.Path]::GetTempPath()) ("m2patch-" + [Guid]::NewGuid().ToString('N') + ".sh")
+    [IO.File]::WriteAllText($scriptFile, ($lines -join "`n") + "`n", (New-Object Text.UTF8Encoding($false)))
+
+    $previous = $ErrorActionPreference
+    $count = 0
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & docker run --rm `
+            -v "${target}:/src" -v "${patchDir}:/patches:ro" -v "${scriptFile}:/apply.sh:ro" `
+            --entrypoint sh $image /apply.sh 2>&1
+        $exit = $LASTEXITCODE
+        $text = ($output | Out-String)
+        if ($exit -eq 0) {
+            foreach ($line in @($output)) {
+                if ("$line" -match '^APPLIED (.+)$') {
+                    Write-Host "Nalozono latke silnika: $($Matches[1])" -ForegroundColor DarkGray
+                    $count++
+                }
+            }
+        }
+        else {
+            # Never fail quietly here: the stalls were broken for weeks because a
+            # patch that never arrived looked exactly like one already applied.
+            if ($text -match 'NOPATCH') {
+                Write-Host "Obraz $image nie zawiera narzedzia patch - latki silnika NIE zostaly nalozone." -ForegroundColor Yellow
+            }
+            else {
+                Write-Host 'Nie udalo sie nalozyc latek silnika - serwer zbuduje sie bez nich.' -ForegroundColor Yellow
+            }
+            Write-Host 'Prywatne stragany botow i graczy moga przez to nie dzialac.' -ForegroundColor Yellow
+            Write-Host $text -ForegroundColor DarkGray
+        }
+    }
+    finally {
+        $ErrorActionPreference = $previous
+        Remove-Item -LiteralPath $scriptFile -Force -ErrorAction SilentlyContinue
+    }
+    return $count
+}
+
+function Sync-M2PlayerbotOverlay {
+    <#
+        The compiler never sees linux-port/overlays -- it builds from the staged
+        copy under linux-port/docker/game/src/server/game/src. On a development
+        machine prepare-context.sh keeps the two in step, but it needs the
+        pristine engine tree at /opt/m2port, which the distribution deliberately
+        does not contain, so on a player's machine nothing did.
+
+        That is how 1.23.2 shipped a manager that included a header no player
+        had: every build stopped at "playerbot_types.h: No such file or
+        directory", and 1.22.4 had already broken the same way on a stale
+        playerbot_manager.h. Copying the whole overlay directory - rather than a
+        hand-maintained list of filenames - is what keeps the next new source
+        file from repeating it.
+    #>
+    param([Parameter(Mandatory = $true)][string]$ServerRoot)
+
+    $source = Join-Path $ServerRoot 'linux-port\overlays\playerbot\src\game\src'
+    $staged = Join-Path $ServerRoot 'linux-port\docker\game\src\server\game\src'
+    if (-not (Test-Path -LiteralPath $source -PathType Container)) { return 0 }
+    if (-not (Test-Path -LiteralPath $staged -PathType Container)) { return 0 }
+
+    $copied = 0
+    foreach ($file in Get-ChildItem -LiteralPath $source -File) {
+        $destination = Join-Path $staged $file.Name
+        $current = $null
+        if (Test-Path -LiteralPath $destination -PathType Leaf) {
+            $current = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+        }
+        $incoming = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        if ($current -ne $incoming) {
+            Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
+            $copied++
+        }
+    }
+
+    # The engine Makefile in the build context is patched by prepare-context.sh,
+    # which never runs on a player's machine - so the wildcard that makes a new
+    # .cpp compile itself would never reach them. Repair that one line here
+    # instead of shipping the whole Makefile over theirs.
+    $makefile = Join-Path $ServerRoot 'linux-port\docker\game\src\server\game\src\Makefile'
+    if (Test-Path -LiteralPath $makefile -PathType Leaf) {
+        $text = Get-Content -LiteralPath $makefile -Raw
+        if ($text -match '(?m)^CPPFILE \+= playerbot_manager\.cpp\s*$') {
+            $text = $text -replace '(?m)^CPPFILE \+= playerbot_manager\.cpp\s*$',
+                'CPPFILE += $(wildcard playerbot_*.cpp)'
+            [IO.File]::WriteAllText($makefile, $text)
+            $copied++
+        }
+    }
+
+    # The two data files the Dockerfile COPYs from the build context. The
+    # update builds the image straight after the files land - before
+    # start-server.ps1 runs and stages them - and a COPY of a file that is not
+    # there fails the whole build: "special_item_group.moonlight.txt: not
+    # found", five players in the first ten minutes of 1.29.1.
+    foreach ($pair in @(
+            @{ From = 'linux-port\overlays\playerbot\serverfiles\special_item_group.moonlight.txt';
+               To   = 'linux-port\docker\game\special_item_group.moonlight.txt' },
+            @{ From = 'linux-port\overlays\playerbot\serverfiles\mob_drop_item.m3.append.txt';
+               To   = 'linux-port\docker\game\mob_drop_item.m3.append.txt' })) {
+        $dataSource = Join-Path $ServerRoot $pair.From
+        $dataStaged = Join-Path $ServerRoot $pair.To
+        if (-not (Test-Path -LiteralPath $dataSource -PathType Leaf)) { continue }
+        $dataStagedHash = $null
+        if (Test-Path -LiteralPath $dataStaged -PathType Leaf) {
+            $dataStagedHash = (Get-FileHash -LiteralPath $dataStaged -Algorithm SHA256).Hash
+        }
+        if ($dataStagedHash -ne (Get-FileHash -LiteralPath $dataSource -Algorithm SHA256).Hash) {
+            Copy-Item -LiteralPath $dataSource -Destination $dataStaged -Force
+            $copied++
+        }
+    }
+
+    # The migrate container mounts linux-port/docker/mariadb/playerbot, so the
+    # seed it actually applies is a copy of the overlay's - staged there by
+    # prepare-context.sh, which never runs on a player's machine. That copy was
+    # from August: the 1000-character registry and the additive seeding were in
+    # every update package and reached nobody, because nothing replaced the file
+    # the container reads.
+    $seedSource = Join-Path $ServerRoot 'linux-port\overlays\playerbot\sql\playerbots_seed.sql'
+    $seedStaged = Join-Path $ServerRoot 'linux-port\docker\mariadb\playerbot\playerbots_seed.sql'
+    if ((Test-Path -LiteralPath $seedSource -PathType Leaf) -and
+        (Test-Path -LiteralPath (Split-Path -Parent $seedStaged) -PathType Container)) {
+        $seedStagedHash = $null
+        if (Test-Path -LiteralPath $seedStaged -PathType Leaf) {
+            $seedStagedHash = (Get-FileHash -LiteralPath $seedStaged -Algorithm SHA256).Hash
+        }
+        if ($seedStagedHash -ne (Get-FileHash -LiteralPath $seedSource -Algorithm SHA256).Hash) {
+            Copy-Item -LiteralPath $seedSource -Destination $seedStaged -Force
+            $copied++
+        }
+    }
+    elseif (-not (Test-Path -LiteralPath $seedSource -PathType Leaf)) {
+        # Silent before: a missing source left the staged copy as it was, and if
+        # that was missing too the start failed a second after the database came
+        # up, with "exit 1" and nothing else. Say which file, and where.
+        Write-Warning "Brak $seedSource - playerbots_seed.sql nie zostal odswiezony."
+    }
+
+    return $copied
+}
+
 function Get-M2SanitizedEnv {
     param([Parameter(Mandatory = $true)][string]$EnvPath)
 
@@ -344,13 +606,30 @@ function New-M2SupportBundle {
     New-Item -ItemType Directory -Path $work -Force | Out-Null
 
     try {
+        # A bundle collected after Docker Desktop has been shut down contains
+        # nothing but connection errors where the container logs should be, and
+        # used to be reported as a success. Say so at the top of the file instead,
+        # so nobody spends an evening reading an empty report.
+        $dockerUp = Test-M2DockerRunning
         $summary = @(
             'Metin2 Playerbots - pakiet diagnostyczny',
             "Utworzono: $([DateTime]::Now.ToString('s'))",
             "PowerShell: $($PSVersionTable.PSVersion)",
             "Windows: $([Environment]::OSVersion.VersionString)",
-            "Folder serwera: $([IO.Path]::GetFileName($root))"
-        ) -join [Environment]::NewLine
+            "Folder serwera: $([IO.Path]::GetFileName($root))",
+            "Silnik Dockera: $(if ($dockerUp) { 'dziala' } else { 'ZATRZYMANY' })"
+        )
+        if (-not $dockerUp) {
+            $summary += @(
+                '',
+                'PACZKA NIEPELNA. Docker byl wylaczony, wiec nie ma w niej logow',
+                'kontenerow ani stanu uslug - a to zwykle jedyne miejsce, gdzie',
+                'widac przyczyne problemu.',
+                'Uruchom Docker (przycisk URUCHOM DOCKER), odtworz problem',
+                'i zbierz paczke ponownie.'
+            )
+        }
+        $summary = $summary -join [Environment]::NewLine
         [IO.File]::WriteAllText((Join-Path $work 'summary.txt'), $summary, [Text.UTF8Encoding]::new($false))
 
         $versionFile = Join-Path $root 'VERSION'
@@ -359,7 +638,11 @@ function New-M2SupportBundle {
         }
 
         $envPath = Join-Path $root 'linux-port\docker\.env'
-        $safeEnv = Get-M2SanitizedEnv -EnvPath $envPath
+        # An empty array returned from a function arrives here as $null, and
+        # WriteAllLines refuses it: a player with no .env could not even send
+        # the logs that would have shown it.
+        [string[]]$safeEnv = @(Get-M2SanitizedEnv -EnvPath $envPath)
+        if ($safeEnv.Count -eq 0) { $safeEnv = @('(brak pliku .env)') }
         [IO.File]::WriteAllLines((Join-Path $work 'environment-redacted.txt'), $safeEnv, [Text.UTF8Encoding]::new($false))
 
         $composeDir = Join-Path $root 'linux-port\docker'
@@ -399,6 +682,74 @@ function New-M2SupportBundle {
     }
 }
 
+function Test-M2SupportUploadUrl {
+    param([Parameter(Mandatory = $true)][string]$Url)
+
+    $uri = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri)) { return $false }
+    if ($uri.Scheme -ne 'https') { return $false }
+    # discord.gg links are invitations, not webhooks - posting to one always fails.
+    if ($uri.Host -ieq 'discord.gg') { return $false }
+    if ($uri.Host -ieq 'discord.com' -or $uri.Host -ieq 'discordapp.com') {
+        return $uri.AbsolutePath.StartsWith('/api/webhooks/', [StringComparison]::OrdinalIgnoreCase)
+    }
+    return $true
+}
+
+function Get-M2SupportSettings {
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [switch]$NoRemote
+    )
+
+    $result = [pscustomobject]@{
+        UploadUrl  = ''
+        ContactUrl = $script:M2_DEFAULT_SUPPORT_CONTACT
+        Source     = 'none'
+    }
+
+    # A local setting always wins, so a tester can redirect the button without
+    # touching the manifest everybody else reads.
+    $local = ''
+    if ($null -ne $Config.PSObject.Properties['supportUploadUrl']) { $local = [string]$Config.supportUploadUrl }
+    if ($local -and (Test-M2SupportUploadUrl -Url $local)) {
+        $result.UploadUrl = $local
+        $result.Source = 'config'
+        return $result
+    }
+
+    if ($NoRemote) { return $result }
+
+    # Otherwise read it from the update manifest. Keeping the address there means
+    # it can be rotated by editing one file on GitHub - no new release, no
+    # reinstall, and a leaked webhook can be revoked the same way.
+    $manifest = $null
+    try {
+        $source = ''
+        if ($null -ne $Config.PSObject.Properties['manifestUrl']) { $source = [string]$Config.manifestUrl }
+        if (-not $source) { return $result }
+        $manifest = Get-M2UpdateManifest -Source $source -TimeoutSec 10
+    }
+    catch { return $result }
+
+    if ($null -eq $manifest -or $null -eq $manifest.PSObject.Properties['support']) { return $result }
+    $support = $manifest.support
+    if ($null -eq $support) { return $result }
+
+    if ($null -ne $support.PSObject.Properties['contactUrl']) {
+        $contact = [string]$support.contactUrl
+        if ($contact) { $result.ContactUrl = $contact }
+    }
+    if ($null -ne $support.PSObject.Properties['uploadUrl']) {
+        $upload = [string]$support.uploadUrl
+        if ($upload -and (Test-M2SupportUploadUrl -Url $upload)) {
+            $result.UploadUrl = $upload
+            $result.Source = 'manifest'
+        }
+    }
+    return $result
+}
+
 function Send-M2SupportBundle {
     param(
         [Parameter(Mandatory = $true)][string]$BundlePath,
@@ -409,8 +760,24 @@ function Send-M2SupportBundle {
     if (-not [Uri]::TryCreate($UploadUrl, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne 'https') {
         throw 'Adres wysyłki logów musi używać HTTPS.'
     }
+    if ($uri.Host -ieq 'discord.gg') {
+        throw 'To jest zaproszenie na serwer Discord, a nie webhook. Adres webhooka wygląda tak: https://discord.com/api/webhooks/...'
+    }
     if (-not (Test-Path -LiteralPath $BundlePath -PathType Leaf)) {
         throw "Nie znaleziono paczki: $BundlePath"
+    }
+
+    $isDiscordWebhook =
+        ($uri.Host -ieq 'discord.com' -or $uri.Host -ieq 'discordapp.com') -and
+        $uri.AbsolutePath.StartsWith('/api/webhooks/', [StringComparison]::OrdinalIgnoreCase)
+
+    if ($isDiscordWebhook) {
+        # Discord rejects attachments over 10 MB on servers without boosts, and it
+        # does so after the whole upload, so check before wasting the transfer.
+        $size = (Get-Item -LiteralPath $BundlePath).Length
+        if ($size -gt 10MB) {
+            throw ('Paczka ma {0:N1} MB, a Discord przyjmuje do 10 MB. Wyślij ZIP ręcznie albo usuń starsze logi z folderu i zbierz paczkę ponownie.' -f ($size / 1MB))
+        }
     }
 
     Add-Type -AssemblyName System.Net.Http
@@ -420,9 +787,6 @@ function Send-M2SupportBundle {
     try {
         $content = [Net.Http.StreamContent]::new($stream)
         $content.Headers.ContentType = [Net.Http.Headers.MediaTypeHeaderValue]::Parse('application/zip')
-        $isDiscordWebhook =
-            ($uri.Host -ieq 'discord.com' -or $uri.Host -ieq 'discordapp.com') -and
-            $uri.AbsolutePath.StartsWith('/api/webhooks/', [StringComparison]::OrdinalIgnoreCase)
         if ($isDiscordWebhook) {
             $payload = [Net.Http.StringContent]::new(
                 '{"content":"Paczka diagnostyczna Metin2 Playerbots (hasła automatycznie usunięte).","allowed_mentions":{"parse":[]}}',
@@ -461,6 +825,18 @@ function Send-M2SupportBundle {
 $script:M2_DB_IMAGE = 'mariadb:10.11'
 $script:M2_DB_LIST = @('account', 'common', 'player', 'log', 'hotbackup')
 
+function Test-M2DockerRunning {
+    # docker volume ls and friends fail with an unhelpful pipe/socket error when
+    # the engine is down, so callers ask this first and say something useful.
+    $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        & docker info --format '{{.ServerVersion}}' 1>$null 2>$null
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch { return $false }
+    finally { $ErrorActionPreference = $previous }
+}
+
 function Get-M2DbDataVolumes {
     $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     try {
@@ -473,12 +849,51 @@ function Get-M2DbDataVolumes {
         if ($LASTEXITCODE -eq 0 -and $all) {
             foreach ($n in @($all -split '\r?\n' | Where-Object { $_ -match '_db-data$' })) { if (-not $names.Contains($n)) { $names.Add($n) } }
         }
+        # Creation dates in one call - the list is short, but one docker
+        # invocation per volume is still a visible stall on a cold engine.
+        $created = @{}
+        if ($names.Count -gt 0) {
+            $inspected = & docker volume inspect --format '{{.Name}}|{{.CreatedAt}}' @($names) 2>$null
+            if ($LASTEXITCODE -eq 0 -and $inspected) {
+                foreach ($line in @($inspected -split '\r?\n' | Where-Object { $_ })) {
+                    $parts = $line -split '\|', 2
+                    if ($parts.Count -eq 2) {
+                        # Docker prints an RFC 3339 stamp with an offset.
+                        try {
+                            $stamp = [DateTimeOffset]::Parse($parts[1], [Globalization.CultureInfo]::InvariantCulture)
+                            $created[$parts[0]] = $stamp.LocalDateTime
+                        }
+                        catch { }
+                    }
+                }
+            }
+        }
+
         $result = New-Object System.Collections.Generic.List[object]
         foreach ($name in $names) {
             $project = if ($name -match '^(.*)_db-data$') { $Matches[1] } else { $name }
-            $result.Add([pscustomobject]@{ Name = $name; Project = $project })
+            $stamp = $null
+            if ($created.ContainsKey($name)) { $stamp = $created[$name] }
+            $result.Add([pscustomobject]@{ Name = $name; Project = $project; CreatedAt = $stamp })
         }
         return $result.ToArray()
+    }
+    finally { $ErrorActionPreference = $previous }
+}
+
+function Test-M2VolumeInitialized {
+    # True only when the volume already exists AND holds an initialized MariaDB
+    # data directory. Never creates anything: `docker volume inspect' does not
+    # create, and the content probe mounts read-only.
+    param([Parameter(Mandatory = $true)][string]$Volume)
+    $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        & docker volume inspect $Volume 1>$null 2>$null
+        if ($LASTEXITCODE -ne 0) { return $false }
+        # --entrypoint sh is required: the mariadb image's own entrypoint would
+        # otherwise swallow the probe command.
+        & docker run --rm --entrypoint sh -v "${Volume}:/v:ro" $script:M2_DB_IMAGE -c 'test -d /v/mysql' 1>$null 2>$null
+        return ($LASTEXITCODE -eq 0)
     }
     finally { $ErrorActionPreference = $previous }
 }
@@ -487,8 +902,21 @@ function Start-M2ThrowawayDb {
     param([Parameter(Mandatory = $true)][string]$Volume)
     $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     try {
+        # Refuse to touch a volume that is missing or not an initialized
+        # database. Docker silently CREATES a named volume that does not exist,
+        # and MariaDB would then initialize it as an empty, password-less server
+        # with no game schema. Because the volume is no longer empty afterwards,
+        # the compose entrypoint never runs initdb.d again and the install is
+        # permanently broken. Fail loudly instead.
+        if (-not (Test-M2VolumeInitialized -Volume $Volume)) {
+            throw "Baza '$Volume' nie istnieje albo nie jest jeszcze zainicjalizowana. Uruchom najpierw serwer (GRAJ) choć raz, aby baza powstała poprawnie, i dopiero potem użyj tej funkcji."
+        }
         $container = 'm2dbimp-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
-        $null = & docker run -d --name $container -e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=1 -v "${Volume}:/var/lib/mysql" $script:M2_DB_IMAGE --skip-grant-tables 2>$null
+        # No MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: on an initialized volume the
+        # entrypoint skips setup entirely, and without it a surprise empty volume
+        # makes the container refuse to start rather than silently create a
+        # password-less database.
+        $null = & docker run -d --name $container -v "${Volume}:/var/lib/mysql" $script:M2_DB_IMAGE --skip-grant-tables 2>$null
         if ($LASTEXITCODE -ne 0) { throw "Nie udało się uruchomić kontenera bazy dla wolumenu '$Volume' (czy jest zajęty przez działający serwer?)." }
         $deadline = (Get-Date).AddSeconds(120)
         do {
@@ -506,7 +934,17 @@ function Stop-M2ThrowawayDb {
     param([string]$Container)
     if ($Container) {
         $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        try { & docker rm -f $Container 1>$null 2>$null } finally { $ErrorActionPreference = $previous }
+        try {
+            # Graceful stop so mysqld flushes and shuts down cleanly. A hard
+            # `docker rm -f' (SIGKILL) leaves the volume needing InnoDB crash
+            # recovery on the next start, which could bring the post-import
+            # MariaDB up in a state where the game DB user failed to authenticate
+            # ("unauthenticated"), stalling playerbot-migrate and blocking the
+            # game and panel.
+            & docker stop -t 40 $Container 1>$null 2>$null
+            & docker rm -f $Container 1>$null 2>$null
+        }
+        finally { $ErrorActionPreference = $previous }
     }
 }
 
@@ -514,16 +952,28 @@ function Get-M2VolumeWorldStats {
     param([Parameter(Mandatory = $true)][string]$Volume)
     $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     $container = $null
+    $created = ''
     try {
+        # The volume's own creation time answers "when was this world made?"
+        # without touching the data or starting a container.
+        $created = [string](& docker volume inspect $Volume --format '{{.CreatedAt}}' 2>$null | Select-Object -First 1)
         $container = Start-M2ThrowawayDb -Volume $Volume
-        $out = & docker exec $container sh -c "mariadb -uroot -N -e 'SELECT COUNT(*), IFNULL(MAX(level),0) FROM player.player'" 2>$null
+        # -B keeps the columns tab-separated so a last_play datetime (which has a
+        # space) is not split apart.
+        $out = & docker exec $container sh -c "mariadb -uroot -N -B -e 'SELECT COUNT(*), IFNULL(MAX(level),0), IFNULL(MAX(last_play),0) FROM player.player'" 2>$null
         if ($LASTEXITCODE -eq 0 -and $out) {
-            $parts = ($out.ToString().Trim() -split '\s+')
-            return [pscustomobject]@{ Players = [int]$parts[0]; MaxLevel = [int]$parts[1]; Ok = $true }
+            $parts = ($out.ToString().Trim() -split "`t")
+            return [pscustomobject]@{
+                Players  = [int]$parts[0]
+                MaxLevel = [int]$parts[1]
+                LastPlay = [string]$parts[2]
+                Created  = $created
+                Ok       = $true
+            }
         }
-        return [pscustomobject]@{ Players = 0; MaxLevel = 0; Ok = $false }
+        return [pscustomobject]@{ Players = 0; MaxLevel = 0; LastPlay = ''; Created = $created; Ok = $false }
     }
-    catch { return [pscustomobject]@{ Players = 0; MaxLevel = 0; Ok = $false } }
+    catch { return [pscustomobject]@{ Players = 0; MaxLevel = 0; LastPlay = ''; Created = $created; Ok = $false } }
     finally { Stop-M2ThrowawayDb -Container $container; $ErrorActionPreference = $previous }
 }
 
@@ -550,11 +1000,52 @@ function Invoke-M2SqlFile {
     finally { $ErrorActionPreference = $previous }
 }
 
+function Repair-M2GameDbUser {
+    # Recreate the game DB user and its grants on an existing db-data volume.
+    # For installs that swapped the world (import) before the graceful-shutdown
+    # fix and were left with a MariaDB the migrator could not authenticate to.
+    # Only mysql.* (the technical DB account) is touched; player data is not.
+    param(
+        [Parameter(Mandatory = $true)][string]$Volume,
+        [Parameter(Mandatory = $true)][string]$DbUser,
+        [Parameter(Mandatory = $true)][string]$DbPassword
+    )
+    $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $work = Join-Path ([IO.Path]::GetTempPath()) ('m2repair-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    $container = $null
+    try {
+        $container = Start-M2ThrowawayDb -Volume $Volume
+        $safeUser = ($DbUser -replace '[^A-Za-z0-9_]', '')
+        if (-not $safeUser) { $safeUser = 'metin2' }
+        $pwEsc = $DbPassword.Replace('\', '\\').Replace("'", "''")
+        $gb = New-Object System.Text.StringBuilder
+        [void]$gb.AppendLine('FLUSH PRIVILEGES;')
+        [void]$gb.AppendLine("CREATE USER IF NOT EXISTS '$safeUser'@'%' IDENTIFIED BY '$pwEsc';")
+        [void]$gb.AppendLine("ALTER USER '$safeUser'@'%' IDENTIFIED BY '$pwEsc';")
+        foreach ($db in $script:M2_DB_LIST) {
+            [void]$gb.AppendLine("GRANT ALL PRIVILEGES ON $db.* TO '$safeUser'@'%';")
+        }
+        [void]$gb.AppendLine('FLUSH PRIVILEGES;')
+        $repairFile = Join-Path $work 'repair.sql'
+        [IO.File]::WriteAllText($repairFile, $gb.ToString(), [Text.UTF8Encoding]::new($false))
+        Invoke-M2SqlFile -Container $container -Database '' -InFile $repairFile
+        return $true
+    }
+    finally {
+        if ($container) { Stop-M2ThrowawayDb -Container $container }
+        if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+        $ErrorActionPreference = $previous
+    }
+}
+
 function Invoke-M2DatabaseImport {
     param(
         [Parameter(Mandatory = $true)][string]$SourceVolume,
         [Parameter(Mandatory = $true)][string]$TargetVolume,
-        [Parameter(Mandatory = $true)][string]$BackupRoot
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [string]$DbUser = 'metin2',
+        [string]$DbPassword = ''
     )
     if ($SourceVolume -eq $TargetVolume) { throw 'Źródło i cel to ten sam wolumen.' }
     $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
@@ -595,7 +1086,34 @@ function Invoke-M2DatabaseImport {
         foreach ($db in $script:M2_DB_LIST) {
             Invoke-M2SqlFile -Container $tgtC -Database $db -InFile (Join-Path $work "source\$db.sql")
         }
+
         $stats = & docker exec $tgtC sh -c "mariadb -uroot -N -B -e 'SELECT COUNT(*), IFNULL(MAX(level),0) FROM player.player'" 2>$null
+
+        # Re-establish the game DB user and its grants so the game core and the
+        # playerbot migrator can always authenticate after an import, regardless
+        # of what the imported schema left behind. Done LAST, because FLUSH
+        # PRIVILEGES turns the privilege system back on inside the
+        # --skip-grant-tables container -- the -uroot socket queries above rely on
+        # privileges being off. The standard initdb grants are (re)applied;
+        # mysql.* is otherwise untouched, so player logins, characters, items and
+        # bots are not altered.
+        if ($DbPassword) {
+            $safeUser = ($DbUser -replace '[^A-Za-z0-9_]', '')
+            if (-not $safeUser) { $safeUser = 'metin2' }
+            $pwEsc = $DbPassword.Replace('\', '\\').Replace("'", "''")
+            $gb = New-Object System.Text.StringBuilder
+            [void]$gb.AppendLine('FLUSH PRIVILEGES;')
+            [void]$gb.AppendLine("CREATE USER IF NOT EXISTS '$safeUser'@'%' IDENTIFIED BY '$pwEsc';")
+            [void]$gb.AppendLine("ALTER USER '$safeUser'@'%' IDENTIFIED BY '$pwEsc';")
+            foreach ($db in $script:M2_DB_LIST) {
+                [void]$gb.AppendLine("GRANT ALL PRIVILEGES ON $db.* TO '$safeUser'@'%';")
+            }
+            [void]$gb.AppendLine('FLUSH PRIVILEGES;')
+            $grantFile = Join-Path $work 'grant.sql'
+            [IO.File]::WriteAllText($grantFile, $gb.ToString(), [Text.UTF8Encoding]::new($false))
+            Invoke-M2SqlFile -Container $tgtC -Database '' -InFile $grantFile
+        }
+
         Stop-M2ThrowawayDb -Container $tgtC; $tgtC = $null
 
         $players = 0; $maxLevel = 0
@@ -618,7 +1136,14 @@ Export-ModuleMember -Function @(
     'Invoke-M2PackageUpdate',
     'New-M2SupportBundle',
     'Send-M2SupportBundle',
+    'Get-M2SupportSettings',
+    'Test-M2SupportUploadUrl',
     'Get-M2DbDataVolumes',
     'Get-M2VolumeWorldStats',
-    'Invoke-M2DatabaseImport'
+    'Invoke-M2DatabaseImport',
+    'Repair-M2GameDbUser',
+    'Test-M2VolumeInitialized',
+    'Test-M2DockerRunning',
+    'Sync-M2PlayerbotOverlay',
+    'Invoke-M2EnginePatches'
 )

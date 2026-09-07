@@ -155,6 +155,28 @@ fi
 # -----------------------------------------------------------------------------
 if [ -f "$CONF_PATH" ]; then
   log "using existing config at $CONF_PATH (not regenerated)"
+  # The database credentials are the stack's, not the panel's: they come from
+  # .env and the game core reads them fresh on every start. The panel reads
+  # them from this file, written once - so a panel-conf volume from an older
+  # install kept an old password and the dashboard answered "Access denied"
+  # while the game ran. Only these three keys follow the environment; the
+  # hash, salt and session secret stay as they are.
+  CONF_PATH="$CONF_PATH" M2_DB_HOST="$M2_DB_HOST" M2_DB_USER="$M2_DB_USER" M2_DB_PASSWORD="$M2_DB_PASSWORD" \
+  python3 - <<'PY' || log "WARNING: could not refresh the database credentials in the config"
+import json, os
+path = os.environ["CONF_PATH"]
+with open(path) as f:
+    conf = json.load(f)
+wanted = {"db_host": os.environ["M2_DB_HOST"], "db_user": os.environ["M2_DB_USER"], "db_pass": os.environ["M2_DB_PASSWORD"]}
+changed = [k for k, v in wanted.items() if v and conf.get(k) != v]
+if changed:
+    conf.update({k: wanted[k] for k in changed})
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(conf, f, indent=2)
+    os.replace(tmp, path)
+    print("[panel] database credentials refreshed from the environment: " + ", ".join(changed))
+PY
   if [ -n "$M2_PANEL_PASSWORD" ]; then
     log "note: M2_PANEL_PASSWORD is set but the config already exists, so it is"
     log "      ignored. To change the passphrase: delete the file and restart --"

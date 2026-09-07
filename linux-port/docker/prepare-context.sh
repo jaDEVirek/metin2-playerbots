@@ -59,13 +59,18 @@ PANEL_SRC="${PANEL_SRC:-$HERE/../../files}"
 REPO_ROOT="${REPO_ROOT:-$(cd "$HERE/../.." && pwd)}"
 PLAYERBOT_OVERLAY="$REPO_ROOT/linux-port/overlays/playerbot"
 PLAYERBOT_SRC="$PLAYERBOT_OVERLAY/src/game/src"
-PLAYERBOT_CORE_PATCH="$PLAYERBOT_OVERLAY/patches/0001-core-integration.patch"
-PLAYERBOT_ECONOMY_PATCH="$PLAYERBOT_OVERLAY/patches/0002-economy-yang-x5.patch"
-PLAYERBOT_LOG_PATCH="$PLAYERBOT_OVERLAY/patches/0003-suppress-refine-find-log.patch"
+PLAYERBOT_PATCH_DIR="$PLAYERBOT_OVERLAY/patches"
+# The core patch is named because the validation below greps for what it adds;
+# every other patch in the directory is found rather than listed. Naming them
+# used to cost four edits apiece, and one of those edits had already been
+# forgotten: 0004 was applied but never hashed into the build digest, so a
+# change to it would not have invalidated a cached image.
+PLAYERBOT_CORE_PATCH="$PLAYERBOT_PATCH_DIR/0001-core-integration.patch"
 PLAYERBOT_SEED_GENERATOR="$PLAYERBOT_OVERLAY/tools/generate_seed.py"
 PLAYERBOT_SEED="$PLAYERBOT_OVERLAY/sql/playerbots_seed.sql"
 PLAYERBOT_MIGRATOR="$HERE/mariadb/playerbot/apply.sh"
 PLAYERBOT_M3_DROPS="$PLAYERBOT_OVERLAY/serverfiles/mob_drop_item.m3.append.txt"
+PLAYERBOT_MOONLIGHT_CHEST="$PLAYERBOT_OVERLAY/serverfiles/special_item_group.moonlight.txt"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -92,17 +97,38 @@ done
 command -v patch >/dev/null 2>&1 || die "GNU patch is needed to apply the Playerbot source overlay"
 command -v git >/dev/null 2>&1 || die "git is needed to fingerprint the Playerbot source overlay"
 command -v python3 >/dev/null 2>&1 || die "python3 is needed to verify the deterministic Playerbot seed"
+# The overlay sources are discovered, never listed. Naming each file here (and
+# in the copy, the chmod, the verification and the fingerprint below) meant that
+# adding one source file cost five edits in this script alone - which is exactly
+# why the manager grew to twelve thousand lines instead of being split up.
+PLAYERBOT_SOURCES=""
+for f in "$PLAYERBOT_SRC"/playerbot_*.h "$PLAYERBOT_SRC"/playerbot_*.cpp; do
+  [ -e "$f" ] || continue
+  PLAYERBOT_SOURCES="$PLAYERBOT_SOURCES $f"
+done
+
+# Applied in file-name order, which is what the numbering is for: 0001 lays down
+# the integration every later patch is written against.
+PLAYERBOT_PATCHES=""
+for f in "$PLAYERBOT_PATCH_DIR"/[0-9][0-9][0-9][0-9]-*.patch; do
+  [ -e "$f" ] || continue
+  PLAYERBOT_PATCHES="$PLAYERBOT_PATCHES $f"
+done
+[ -n "$PLAYERBOT_PATCHES" ] || die "no engine patches found in $PLAYERBOT_PATCH_DIR"
+[ -s "$PLAYERBOT_CORE_PATCH" ] || die "the Playerbot core integration patch is missing: $PLAYERBOT_CORE_PATCH"
+[ -n "$PLAYERBOT_SOURCES" ] || die "no Playerbot overlay sources found in $PLAYERBOT_SRC"
+# playerbot_manager.cpp is the one file the integration patch cannot work
+# without, so its absence is a different failure from "the directory is empty".
+[ -s "$PLAYERBOT_SRC/playerbot_manager.cpp" ] || die "Playerbot overlay input is missing or empty: $PLAYERBOT_SRC/playerbot_manager.cpp"
+
 for p in \
-  "$PLAYERBOT_SRC/playerbot_manager.cpp" \
-  "$PLAYERBOT_SRC/playerbot_manager.h" \
-  "$PLAYERBOT_SRC/playerbot_world_rules.h" \
-  "$PLAYERBOT_CORE_PATCH" \
-  "$PLAYERBOT_ECONOMY_PATCH" \
-  "$PLAYERBOT_LOG_PATCH" \
+  $PLAYERBOT_SOURCES \
+  $PLAYERBOT_PATCHES \
   "$PLAYERBOT_SEED_GENERATOR" \
   "$PLAYERBOT_SEED" \
   "$PLAYERBOT_MIGRATOR" \
-  "$PLAYERBOT_M3_DROPS"
+  "$PLAYERBOT_M3_DROPS" \
+  "$PLAYERBOT_MOONLIGHT_CHEST"
 do
   [ -s "$p" ] || die "Playerbot overlay input is missing or empty: $p"
 done
@@ -155,53 +181,62 @@ info "$(du -sh "$GAME_CTX/server" | cut -f1)"
 # patch uses zero-context hunks so it never rewrites the legacy CP949 comments;
 # the dry-run and post-apply checks make application errors fatal.
 say "Playerbot server overlay"
-if ! (cd "$GAME_CTX/server" && \
-      patch --batch --forward --fuzz=0 -p1 --dry-run < "$PLAYERBOT_CORE_PATCH"); then
-  die "the Playerbot core integration patch does not apply cleanly to the staged port source"
-fi
-if ! (cd "$GAME_CTX/server" && \
-      patch --batch --forward --fuzz=0 -p1 --dry-run < "$PLAYERBOT_ECONOMY_PATCH"); then
-  die "the Playerbot economy patch does not apply cleanly to the staged port source"
-fi
-if ! (cd "$GAME_CTX/server" && \
-      patch --batch --forward --fuzz=0 -p1 --dry-run < "$PLAYERBOT_LOG_PATCH"); then
-  die "the Playerbot log-noise patch does not apply cleanly to the staged port source"
-fi
-(cd "$GAME_CTX/server" && \
-  patch --batch --forward --fuzz=0 -p1 < "$PLAYERBOT_CORE_PATCH" && \
-  patch --batch --forward --fuzz=0 -p1 < "$PLAYERBOT_ECONOMY_PATCH" && \
-  patch --batch --forward --fuzz=0 -p1 < "$PLAYERBOT_LOG_PATCH") \
-  || die "the Playerbot source overlay could not be applied"
+# Every patch is dry-run first, all of them, before any of them is applied for
+# real. A half-patched context is worse than an unpatched one: it compiles.
+for p in $PLAYERBOT_PATCHES; do
+  if ! (cd "$GAME_CTX/server" && \
+        patch --batch --forward --fuzz=0 -p1 --dry-run < "$p"); then
+    die "engine patch does not apply cleanly to the staged port source: $(basename "$p")"
+  fi
+done
+for p in $PLAYERBOT_PATCHES; do
+  (cd "$GAME_CTX/server" && patch --batch --forward --fuzz=0 -p1 < "$p") \
+    || die "engine patch could not be applied: $(basename "$p")"
+  info "patch $(basename "$p")"
+done
 
-cp -a "$PLAYERBOT_SRC/playerbot_manager.cpp" "$GAME_CTX/server/game/src/playerbot_manager.cpp"
-cp -a "$PLAYERBOT_SRC/playerbot_manager.h" "$GAME_CTX/server/game/src/playerbot_manager.h"
-cp -a "$PLAYERBOT_SRC/playerbot_world_rules.h" "$GAME_CTX/server/game/src/playerbot_world_rules.h"
-chmod 0644 "$GAME_CTX/server/game/src/playerbot_manager.cpp" \
-           "$GAME_CTX/server/game/src/playerbot_manager.h" \
-           "$GAME_CTX/server/game/src/playerbot_world_rules.h"
+for f in $PLAYERBOT_SOURCES; do
+  cp -a "$f" "$GAME_CTX/server/game/src/$(basename "$f")"
+  chmod 0644 "$GAME_CTX/server/game/src/$(basename "$f")"
+done
 
-grep -q 'CPPFILE += playerbot_manager.cpp' "$GAME_CTX/server/game/src/Makefile" \
-  || die "Playerbot overlay validation failed: game Makefile has no manager source"
+# A source removed from the overlay has to disappear from the build context too.
+# The Makefile now compiles every playerbot_*.cpp it finds there, so a file left
+# behind by a previous run would still be built - against headers that no longer
+# describe it.
+for f in "$GAME_CTX/server/game/src"/playerbot_*.h "$GAME_CTX/server/game/src"/playerbot_*.cpp; do
+  [ -e "$f" ] || continue
+  [ -e "$PLAYERBOT_SRC/$(basename "$f")" ] || {
+    info "removing stale overlay source $(basename "$f")"
+    rm -f "$f"
+  }
+done
+
+grep -q 'CPPFILE += $(wildcard playerbot_\*.cpp)' "$GAME_CTX/server/game/src/Makefile" \
+  || die "Playerbot overlay validation failed: game Makefile does not pick up the overlay sources"
 grep -q 'HEADER_GD_BOT_PLAYER_LOAD' "$GAME_CTX/server/common/tables.h" \
   || die "Playerbot overlay validation failed: DB protocol header is missing"
 grep -q 'CPlayerBotManager::instance().OnPlayerLoaded' "$GAME_CTX/server/game/src/input_db.cpp" \
   || die "Playerbot overlay validation failed: player-load hook is missing"
 grep -q 'iGold \*= 5;' "$GAME_CTX/server/game/src/char_battle.cpp" \
   || die "Playerbot overlay validation failed: economy adjustment is missing"
-cmp -s "$PLAYERBOT_SRC/playerbot_manager.cpp" "$GAME_CTX/server/game/src/playerbot_manager.cpp" \
-  || die "Playerbot overlay validation failed: manager source copy differs"
-cmp -s "$PLAYERBOT_SRC/playerbot_manager.h" "$GAME_CTX/server/game/src/playerbot_manager.h" \
-  || die "Playerbot overlay validation failed: manager header copy differs"
-cmp -s "$PLAYERBOT_SRC/playerbot_world_rules.h" "$GAME_CTX/server/game/src/playerbot_world_rules.h" \
-  || die "Playerbot overlay validation failed: world-rules header copy differs"
+for f in $PLAYERBOT_SOURCES; do
+  cmp -s "$f" "$GAME_CTX/server/game/src/$(basename "$f")" \
+    || die "Playerbot overlay validation failed: $(basename "$f") copy differs"
+done
 
 {
-  printf 'core_patch=%s\n' "$(git hash-object "$PLAYERBOT_CORE_PATCH")"
-  printf 'economy_patch=%s\n' "$(git hash-object "$PLAYERBOT_ECONOMY_PATCH")"
-  printf 'log_patch=%s\n' "$(git hash-object "$PLAYERBOT_LOG_PATCH")"
-  printf 'manager_cpp=%s\n' "$(git hash-object "$PLAYERBOT_SRC/playerbot_manager.cpp")"
-  printf 'manager_h=%s\n' "$(git hash-object "$PLAYERBOT_SRC/playerbot_manager.h")"
-  printf 'world_rules_h=%s\n' "$(git hash-object "$PLAYERBOT_SRC/playerbot_world_rules.h")"
+  # Every patch, by name, so that adding one or editing any of them changes the
+  # digest. This is where 0004 was missing.
+  for p in $PLAYERBOT_PATCHES; do
+    printf 'patch_%s=%s\n' "$(basename "$p")" "$(git hash-object "$p")"
+  done
+  # Every overlay source, sorted, so a changed or added file always invalidates
+  # a stale build. Missing one here is the failure that does not announce
+  # itself: the context looks fine and the image is simply not rebuilt.
+  for f in $PLAYERBOT_SOURCES; do
+    printf 'src_%s=%s\n' "$(basename "$f")" "$(git hash-object "$f")"
+  done
   printf 'seed_generator=%s\n' "$(git hash-object "$PLAYERBOT_SEED_GENERATOR")"
   printf 'seed_sql=%s\n' "$(git hash-object "$PLAYERBOT_SEED")"
 } > "$GAME_CTX/.playerbot-overlay"
@@ -223,6 +258,7 @@ for d in conf data locale package; do
 done
 
 cp -a "$PLAYERBOT_M3_DROPS" "$HERE/game/mob_drop_item.m3.append.txt"
+cp -a "$PLAYERBOT_MOONLIGHT_CHEST" "$HERE/game/special_item_group.moonlight.txt"
 info "M3/Waryong level-30 weapon and level-21 shield drop overlay staged"
 
 # share/bin is deliberately NOT copied. The binaries in the image come from the
@@ -278,6 +314,15 @@ cp -a "$PANEL_SRC/admin_panel.py" "$HERE/panel/app/"
 for f in items.json favicon.png; do
   [ -f "$PANEL_SRC/$f" ] && cp -a "$PANEL_SRC/$f" "$HERE/panel/app/" && info "$f"
 done
+# Whatever the panel serves from /static. Copied as a directory rather than by
+# name so that adding an icon set is only ever a matter of putting it there --
+# the same rule the playerbot sources follow. Note the rm -rf above: anything
+# under panel/app that is not reproduced from PANEL_SRC does not survive a run
+# of this script, so /static content has to live in the source tree to be safe.
+if [ -d "$PANEL_SRC/static" ]; then
+  cp -a "$PANEL_SRC/static" "$HERE/panel/app/"
+  info "static/ ($(find "$PANEL_SRC/static" -type f | wc -l | tr -d ' ') files)"
+fi
 # The live map's Polish mode uses the complete server locale rather than a
 # partial hand-maintained dictionary.  Keep this optional for custom source
 # trees that genuinely do not ship Polish, in which case the panel falls back
@@ -293,6 +338,7 @@ fi
 # its patch log says the file is not in this build -- it never invents either.
 if [ -f "$REPO_ROOT/VERSION" ]; then
   cp -a "$REPO_ROOT/VERSION" "$HERE/panel/app/VERSION"
+  cp -a "$REPO_ROOT/VERSION" "$HERE/seban-panel/VERSION"
   info "VERSION  $(tr -d ' \r\n' < "$REPO_ROOT/VERSION")"
 else
   info "WARNING: $REPO_ROOT/VERSION not found -- the panel will report its"

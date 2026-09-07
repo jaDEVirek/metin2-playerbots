@@ -52,12 +52,55 @@ if ($SelfTest) {
 
 [Windows.Forms.Application]::EnableVisualStyles()
 
+# The session log is opened in Notepad and pasted into chat, and Polish letters
+# do not survive either. Everything written to the file is transliterated; the
+# on-screen box is left alone, because it renders them correctly and there is no
+# reason to make the window worse to fix the file. A character that is neither
+# ASCII nor in the table - including the replacement character left behind by an
+# older, mis-encoded log - becomes a question mark rather than disappearing.
+$script:M2_ASCII_MAP = @{
+    [char]0x0105 = 'a'; [char]0x0107 = 'c'; [char]0x0119 = 'e'; [char]0x0142 = 'l'
+    [char]0x0144 = 'n'; [char]0x00F3 = 'o'; [char]0x015B = 's'; [char]0x017A = 'z'
+    [char]0x017C = 'z'
+    [char]0x0104 = 'A'; [char]0x0106 = 'C'; [char]0x0118 = 'E'; [char]0x0141 = 'L'
+    [char]0x0143 = 'N'; [char]0x00D3 = 'O'; [char]0x015A = 'S'; [char]0x0179 = 'Z'
+    [char]0x017B = 'Z'
+    [char]0x2013 = '-'; [char]0x2014 = '-'; [char]0x2026 = '...'
+    [char]0x2018 = "'"; [char]0x2019 = "'"; [char]0x201C = '"'; [char]0x201D = '"'
+    [char]0x00A0 = ' '
+}
+
+function ConvertTo-M2AsciiLine {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $builder = New-Object Text.StringBuilder
+    foreach ($ch in $Text.ToCharArray()) {
+        if ($script:M2_ASCII_MAP.ContainsKey($ch)) {
+            [void]$builder.Append($script:M2_ASCII_MAP[$ch])
+        }
+        elseif ([int]$ch -lt 128) { [void]$builder.Append($ch) }
+        else { [void]$builder.Append('?') }
+    }
+    return $builder.ToString()
+}
+
 function Write-LocalLog {
-    param([Parameter(Mandatory = $true)][string]$Message)
+    # -FileOnly keeps very chatty build output (apt, unpacking) in the session
+    # log without flooding the small on-screen box.
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [switch]$FileOnly
+    )
     $line = '{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
-    [IO.File]::AppendAllText($sessionLog, $line + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-    if ($script:logBox -and -not $script:logBox.IsDisposed) {
+    [IO.File]::AppendAllText($sessionLog,
+        (ConvertTo-M2AsciiLine $line) + [Environment]::NewLine,
+        [Text.UTF8Encoding]::new($false))
+    if (-not $FileOnly -and $script:logBox -and -not $script:logBox.IsDisposed) {
         $script:logBox.AppendText($line + [Environment]::NewLine)
+        # Keep the box bounded so a long build cannot grow it without limit.
+        if ($script:logBox.Lines.Count -gt 600) {
+            $script:logBox.Lines = $script:logBox.Lines[-400..-1]
+        }
         $script:logBox.SelectionStart = $script:logBox.TextLength
         $script:logBox.ScrollToCaret()
     }
@@ -198,6 +241,107 @@ function Refresh-Status {
     }
     $script:serverStatus.Text = if ($serverRunning) { 'Serwer: DZIAŁA' } else { 'Serwer: ZATRZYMANY' }
     $script:serverStatus.ForeColor = if ($serverRunning) { [Drawing.Color]::LightGreen } else { [Drawing.Color]::Silver }
+
+    if ($script:versionLabel) { Update-VersionFooter }
+}
+
+# apt/dpkg chatter from a first image build, plus Docker's note about the data
+# volume it did not create itself. Both are harmless, but players read the
+# word "warning" next to their database and reach for `down -v`, which is the
+# one command that would actually destroy the world. Kept in the session log,
+# kept out of the on-screen box so the interesting lines stay readable.
+$script:M2_NOISY_BUILD = 'already exists but was not created by Docker Compose|Get:\d|Unpacking |Selecting previously|Preparing to unpack|Reading database|Setting up |Suggested packages:|Recommended packages:|The following NEW packages|The following packages will be|debconf:'
+
+# Discord invite the ZIP button falls back to, and the once-per-session cache of
+# the support address read from the update manifest.
+$script:openContactAfterAction = ''
+$script:supportSettingsCache = $null
+
+function Read-SharedText {
+    # The child process still holds these files open for writing.
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8)
+            try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+        }
+        finally { $stream.Dispose() }
+    }
+    catch { return $null }
+}
+
+function Update-ActionPhase {
+    # Turn BuildKit / Compose chatter into a phase name and a step count, so the
+    # progress bar and the status line can show real movement during the long
+    # first build instead of an endless marquee.
+    param([Parameter(Mandatory = $true)][string]$Line)
+    $step = [Regex]::Match($Line, '^\s*#\d+\s+\[([^\]]+?)\s+(\d+)/(\d+)\]')
+    if ($step.Success) {
+        $script:activePhase = $step.Groups[1].Value
+        $script:activePhaseStep = [int]$step.Groups[2].Value
+        $script:activePhaseTotal = [int]$step.Groups[3].Value
+        if (-not $script:activeBuildNoticed) {
+            $script:activeBuildNoticed = $true
+            Write-LocalLog 'Trwa budowanie obrazów serwera. Przy pierwszym uruchomieniu to normalnie kilkanaście–kilkadziesiąt minut — nie przerywaj.'
+        }
+        return
+    }
+    if ($Line -match 'transferring context:\s*([\d.]+\s*[kKMG]?B)') {
+        $script:activePhase = "przesyłanie plików do budowy ($($Matches[1]))"
+        $script:activePhaseStep = 0; $script:activePhaseTotal = 0
+        return
+    }
+    $container = [Regex]::Match($Line, 'Container\s+(\S+)\s+(Creating|Created|Starting|Started|Waiting|Healthy|Recreate|Stopping|Stopped)')
+    if ($container.Success) {
+        $script:activePhase = "$($container.Groups[1].Value): $($container.Groups[2].Value)"
+        $script:activePhaseStep = 0; $script:activePhaseTotal = 0
+    }
+}
+
+function Update-ActionStatusText {
+    if (-not $script:activeProcess -or -not $script:actionStatus) { return }
+    $elapsed = (Get-Date) - $script:activeStarted
+    $text = 'Trwa: {0}...  {1:mm\:ss}' -f $script:activeAction, $elapsed
+    if ($script:activePhaseTotal -gt 0) {
+        $pct = [int](100 * $script:activePhaseStep / $script:activePhaseTotal)
+        $pct = [Math]::Max(0, [Math]::Min(100, $pct))
+        $text += '   —   {0} {1}/{2} ({3}%)' -f $script:activePhase, $script:activePhaseStep, $script:activePhaseTotal, $pct
+        if ($script:progress.Style -ne 'Blocks') { $script:progress.Style = 'Blocks' }
+        $script:progress.Value = $pct
+    }
+    elseif ($script:activePhase) {
+        $text += '   —   {0}' -f $script:activePhase
+    }
+    $script:actionStatus.Text = $text
+}
+
+function Update-ActionStream {
+    # Tail the running action's output into the log while it runs, so a long
+    # start does not look like a frozen window.
+    if (-not $script:activeProcess) { return }
+    foreach ($key in @('out', 'err')) {
+        $path = if ($key -eq 'out') { $script:activeOut } else { $script:activeErr }
+        if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $content = Read-SharedText -Path $path
+        if ($null -eq $content) { continue }
+        $offset = if ($key -eq 'out') { $script:activeOutOffset } else { $script:activeErrOffset }
+        if ($content.Length -le $offset) { continue }
+        $fresh = $content.Substring($offset)
+        $lastBreak = $fresh.LastIndexOf("`n")
+        if ($lastBreak -lt 0) { continue }
+        $complete = $fresh.Substring(0, $lastBreak + 1)
+        if ($key -eq 'out') { $script:activeOutOffset = $offset + $complete.Length }
+        else { $script:activeErrOffset = $offset + $complete.Length }
+        $script:activeOutputAll += $complete
+        foreach ($line in ($complete -split '\r?\n')) {
+            if (-not $line.Trim()) { continue }
+            Update-ActionPhase -Line $line
+            if ($line -match $script:M2_NOISY_BUILD) { Write-LocalLog $line -FileOnly }
+            else { Write-LocalLog $line }
+        }
+    }
+    Update-ActionStatusText
 }
 
 function Complete-LauncherAction {
@@ -206,25 +350,34 @@ function Complete-LauncherAction {
     if (-not $script:activeProcess.HasExited) { return }
 
     $exitCode = $script:activeProcess.ExitCode
-    $output = ''
-    foreach ($path in @($script:activeOut, $script:activeErr)) {
-        if (Test-Path -LiteralPath $path -PathType Leaf) {
-            $output += Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
+    # Flush whatever the action wrote between the last tick and its exit.
+    Update-ActionStream
+    foreach ($key in @('out', 'err')) {
+        $path = if ($key -eq 'out') { $script:activeOut } else { $script:activeErr }
+        if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $content = Read-SharedText -Path $path
+        if ($null -eq $content) { continue }
+        $offset = if ($key -eq 'out') { $script:activeOutOffset } else { $script:activeErrOffset }
+        if ($content.Length -le $offset) { continue }
+        $tail = $content.Substring($offset)
+        if ($key -eq 'out') { $script:activeOutOffset = $content.Length } else { $script:activeErrOffset = $content.Length }
+        $script:activeOutputAll += $tail
+        foreach ($line in ($tail -split '\r?\n')) {
+            if (-not $line.Trim()) { continue }
+            if ($line -match $script:M2_NOISY_BUILD) { Write-LocalLog $line -FileOnly } else { Write-LocalLog $line }
         }
     }
-    if ($output) {
-        foreach ($line in ($output -split '\r?\n')) {
-            if ($line) { Write-LocalLog $line }
-        }
-    }
+    $output = $script:activeOutputAll
 
     $action = $script:activeAction
     $launchClient = $script:launchClientAfterAction
     $openSupport = $script:openSupportAfterAction
+    $contactUrl = $script:openContactAfterAction
     $script:activeProcess.Dispose()
     $script:activeProcess = $null
     $script:launchClientAfterAction = $false
     $script:openSupportAfterAction = $false
+    $script:openContactAfterAction = ''
     $script:progress.Style = 'Blocks'
     $script:progress.Value = 0
     $script:actionStatus.Text = if ($exitCode -eq 0) { "Gotowe: $action" } else { "Błąd: $action (kod $exitCode)" }
@@ -241,10 +394,42 @@ function Complete-LauncherAction {
             'OK',
             'Warning') | Out-Null
     }
+    if ($exitCode -eq 0 -and $action -like 'Update*' -and (Get-LauncherFingerprint) -ne $script:launcherFingerprint) {
+        $answer = [Windows.Forms.MessageBox]::Show(
+            "Launcher zostal zaktualizowany.`r`n`r`nTo okno dziala jeszcze na starej wersji - nowe przyciski i poprawki pojawia sie dopiero po ponownym uruchomieniu.`r`n`r`nUruchomic launcher ponownie teraz?",
+            'Aktualizacja zainstalowana', 'YesNo', 'Information')
+        if ($answer -eq [Windows.Forms.DialogResult]::Yes) {
+            Restart-Launcher
+            return
+        }
+        $script:launcherFingerprint = Get-LauncherFingerprint
+    }
     if ($exitCode -eq 0 -and $launchClient) { Start-ConfiguredClient }
     if ($exitCode -eq 0 -and $openSupport -and (Test-Path $supportDirectory)) {
         Start-Process explorer.exe -ArgumentList ('"{0}"' -f $supportDirectory)
+        if ($contactUrl) { Start-Process $contactUrl }
     }
+}
+
+function Confirm-DockerReady {
+    # Without this the docker CLI just returns nothing and the caller reports
+    # "no databases found", which reads as data loss rather than a stopped engine.
+    if (Test-M2DockerRunning) { return $true }
+    [Windows.Forms.MessageBox]::Show(
+        "Silnik Dockera jest zatrzymany, wiec nie widac zadnych baz.`r`n`r`nKliknij przycisk URUCHOM DOCKER, poczekaj az status u gory zmieni sie na - Docker: GOTOWY - i sprobuj ponownie.`r`n`r`nZadne dane nie zginely: bazy sa na dysku, tylko Docker ich teraz nie pokazuje.",
+        'Docker jest zatrzymany', 'OK', 'Warning') | Out-Null
+    return $false
+}
+
+function Get-SupportSettings {
+    if ($null -eq $script:supportSettingsCache) {
+        try { $script:supportSettingsCache = Get-M2SupportSettings -Config (Get-LauncherConfig) }
+        catch {
+            Write-LocalLog "Nie udalo sie odczytac adresu zgloszen: $($_.Exception.Message)" -FileOnly
+            $script:supportSettingsCache = [pscustomobject]@{ UploadUrl = ''; ContactUrl = 'https://discord.gg/pt5tvnrN6'; Source = 'none' }
+        }
+    }
+    return $script:supportSettingsCache
 }
 
 function Get-BotCountFromEnv {
@@ -254,6 +439,132 @@ function Get-BotCountFromEnv {
         if ($match.Success) { return [int]$match.Groups[1].Value }
     }
     return 350
+}
+
+function Get-LauncherFingerprint {
+    # An update replaces the launcher's own files, but this process already read
+    # them - the new buttons cannot appear until it restarts.
+    $stamps = New-Object System.Collections.Generic.List[string]
+    foreach ($file in @($PSCommandPath, $cliLauncher, $modulePath, $diagnosticsModulePath)) {
+        if (Test-Path -LiteralPath $file -PathType Leaf) {
+            $stamps.Add(((Get-Item -LiteralPath $file).LastWriteTimeUtc.Ticks).ToString())
+        }
+    }
+    return ($stamps -join '|')
+}
+
+function Restart-Launcher {
+    $batch = Join-Path $root 'Metin2-Launcher-GUI.bat'
+    try {
+        if (Test-Path -LiteralPath $batch -PathType Leaf) {
+            Start-Process -FilePath $batch -WorkingDirectory $root
+        }
+        else {
+            # -STA matters: WinForms will not start without it.
+            Start-Process -FilePath 'powershell.exe' -WorkingDirectory $root -ArgumentList @(
+                '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+        }
+        Write-LocalLog 'Uruchamiam launcher ponownie po aktualizacji.'
+        $script:form.Close()
+    }
+    catch {
+        [Windows.Forms.MessageBox]::Show(
+            ("Nie udalo sie uruchomic launchera ponownie: {0}`r`n`r`nZamknij to okno i uruchom launcher recznie." -f $_.Exception.Message),
+            'Restart launchera', 'OK', 'Warning') | Out-Null
+    }
+}
+
+function Get-InstalledServerVersion {
+    # Same reasoning as Read-State in the text launcher: while a rebuild is
+    # outstanding the files on disk are ahead of the containers, so the version
+    # they claim must not be used to decide that nothing needs doing.
+    if (Test-Path -LiteralPath (Join-Path $root '.m2launcher-rebuild-pending') -PathType Leaf) {
+        return 'unknown'
+    }
+    $statePath = Join-Path $root '.m2launcher-state.json'
+    if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+        try {
+            $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ([string]$state.server) { return ([string]$state.server).Trim() }
+        }
+        catch { }
+    }
+    $versionFile = Join-Path $root 'VERSION'
+    if (Test-Path -LiteralPath $versionFile -PathType Leaf) {
+        return (Get-Content -LiteralPath $versionFile -Raw).Trim()
+    }
+    return 'unknown'
+}
+
+function Show-BotCountDialog {
+    # Slider instead of a typed number: the range is a property of the world, and
+    # dragging is far friendlier than guessing a value. The maximum matches the
+    # canonical cohort the seed creates (PID 4..1503); how many of those a world
+    # can actually spawn depends on its registry, which is often smaller.
+    param([int]$Current = 350)
+    $dialog = [Windows.Forms.Form]::new()
+    $dialog.Text = 'Liczba grających botów'
+    $dialog.Size = [Drawing.Size]::new(480, 260)
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+
+    $info = [Windows.Forms.Label]::new()
+    $info.Text = "Ilu botów ma grać jednocześnie?`r`nEfektywny limit to liczba botów w Twoim świecie (kanoniczna paczka ma 350).`r`nZmiana wymaga restartu serwera."
+    $info.Location = [Drawing.Point]::new(14, 12)
+    $info.Size = [Drawing.Size]::new(440, 54)
+    $dialog.Controls.Add($info)
+
+    $valueLabel = [Windows.Forms.Label]::new()
+    $valueLabel.Name = 'valueLabel'
+    $valueLabel.Font = [Drawing.Font]::new('Segoe UI Semibold', 15)
+    $valueLabel.Location = [Drawing.Point]::new(14, 70)
+    $valueLabel.Size = [Drawing.Size]::new(440, 32)
+    $dialog.Controls.Add($valueLabel)
+
+    $bar = [Windows.Forms.TrackBar]::new()
+    $bar.Name = 'botBar'
+    $bar.Minimum = 0
+    $bar.Maximum = 1500
+    $bar.TickFrequency = 50
+    $bar.SmallChange = 1
+    $bar.LargeChange = 25
+    $bar.Location = [Drawing.Point]::new(12, 104)
+    $bar.Size = [Drawing.Size]::new(442, 45)
+    $bar.Value = [Math]::Max(0, [Math]::Min(1500, $Current))
+    $dialog.Controls.Add($bar)
+    $valueLabel.Text = "Boty: $($bar.Value)"
+    # $this/FindForm keeps the handler independent of captured locals.
+    $bar.Add_ValueChanged({
+            $form = $this.FindForm()
+            if ($form) {
+                $label = $form.Controls['valueLabel']
+                if ($label) { $label.Text = "Boty: $($this.Value)" }
+            }
+        })
+
+    $okButton = [Windows.Forms.Button]::new()
+    $okButton.Text = 'Zastosuj'
+    $okButton.Location = [Drawing.Point]::new(252, 168)
+    $okButton.Size = [Drawing.Size]::new(100, 32)
+    $okButton.DialogResult = [Windows.Forms.DialogResult]::OK
+    $dialog.Controls.Add($okButton)
+
+    $cancelButton = [Windows.Forms.Button]::new()
+    $cancelButton.Text = 'Anuluj'
+    $cancelButton.Location = [Drawing.Point]::new(358, 168)
+    $cancelButton.Size = [Drawing.Size]::new(96, 32)
+    $cancelButton.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $dialog.Controls.Add($cancelButton)
+    $dialog.AcceptButton = $okButton
+    $dialog.CancelButton = $cancelButton
+
+    $result = $dialog.ShowDialog()
+    $chosen = $bar.Value
+    $dialog.Dispose()
+    if ($result -ne [Windows.Forms.DialogResult]::OK) { return $null }
+    return [int]$chosen
 }
 
 function Get-GuiTargetVolume {
@@ -298,6 +609,15 @@ function Start-LauncherAction {
     $script:activeAction = $Action
     $script:launchClientAfterAction = [bool]$LaunchClient
     $script:openSupportAfterAction = [bool]$OpenSupport
+    # Live-progress state for this run.
+    $script:activeOutOffset = 0
+    $script:activeErrOffset = 0
+    $script:activeOutputAll = ''
+    $script:activeStarted = Get-Date
+    $script:activePhase = ''
+    $script:activePhaseStep = 0
+    $script:activePhaseTotal = 0
+    $script:activeBuildNoticed = $false
     $script:actionStatus.Text = "Trwa: $Action..."
     $script:actionStatus.ForeColor = [Drawing.Color]::Gold
     $script:progress.Style = 'Marquee'
@@ -358,10 +678,12 @@ function Install-Or-Prepare {
         'Gotowe', 'OK', 'Information') | Out-Null
 }
 
+$script:launcherFingerprint = Get-LauncherFingerprint
+
 $script:form = [Windows.Forms.Form]::new()
 $script:form.Text = 'Metin2 Singleplayer Playerbots — All in One'
-$script:form.Size = [Drawing.Size]::new(780, 732)
-$script:form.MinimumSize = [Drawing.Size]::new(780, 732)
+$script:form.Size = [Drawing.Size]::new(780, 764)
+$script:form.MinimumSize = [Drawing.Size]::new(780, 764)
 $script:form.StartPosition = 'CenterScreen'
 $script:form.BackColor = [Drawing.Color]::FromArgb(24, 25, 29)
 $script:form.ForeColor = [Drawing.Color]::White
@@ -401,15 +723,15 @@ $stopButton = New-Button 'ZATRZYMAJ I ZAPISZ' 268 202 218 50 ([Drawing.Color]::F
 $panelButton = New-Button 'OTWÓRZ PANEL WWW' 508 202 218 50 ([Drawing.Color]::FromArgb(180, 125, 35))
 $clientButton = New-Button 'WYBIERZ KLIENTA' 28 266 218 48 ([Drawing.Color]::FromArgb(75, 90, 120))
 $updateButton = New-Button 'SPRAWDŹ AKTUALIZACJE' 268 266 218 48 ([Drawing.Color]::FromArgb(75, 90, 120))
-$bundleButton = New-Button 'ZBIERZ LOGI (ZIP)' 508 266 218 48 ([Drawing.Color]::FromArgb(75, 90, 120))
-$installUpdateButton = New-Button 'ZAINSTALUJ AKTUALIZACJE' 28 328 158 45 ([Drawing.Color]::FromArgb(88, 82, 160))
-$diagnosticsButton = New-Button 'DIAGNOSTYKA' 204 328 158 45 ([Drawing.Color]::FromArgb(45, 110, 190))
-$openLogButton = New-Button 'OTWÓRZ LOG' 380 328 158 45 ([Drawing.Color]::FromArgb(58, 62, 72))
-$folderButton = New-Button 'FOLDER LOGÓW' 556 328 170 45 ([Drawing.Color]::FromArgb(58, 62, 72))
-$botCountButton = New-Button 'USTAW LICZBĘ BOTÓW (0–350)' 28 380 338 32 ([Drawing.Color]::FromArgb(120, 95, 40))
-$importDbButton = New-Button 'IMPORTUJ BAZĘ (WYŻSZE POSTACIE)' 388 380 338 32 ([Drawing.Color]::FromArgb(70, 120, 90))
+$bundleButton = New-Button 'ZBIERZ / WYŚLIJ LOGI' 508 266 218 48 ([Drawing.Color]::FromArgb(75, 90, 120))
+$diagnosticsButton = New-Button 'DIAGNOSTYKA' 28 328 218 45 ([Drawing.Color]::FromArgb(45, 110, 190))
+$openLogButton = New-Button 'OTWÓRZ LOG' 262 328 218 45 ([Drawing.Color]::FromArgb(58, 62, 72))
+$folderButton = New-Button 'FOLDER LOGÓW' 496 328 230 45 ([Drawing.Color]::FromArgb(58, 62, 72))
+$botCountButton = New-Button 'LICZBA BOTÓW (0–1500)' 28 380 218 32 ([Drawing.Color]::FromArgb(120, 95, 40))
+$importDbButton = New-Button 'IMPORTUJ BAZĘ' 262 380 218 32 ([Drawing.Color]::FromArgb(70, 120, 90))
+$repairDbButton = New-Button 'NAPRAW DOSTĘP DO BAZY' 496 380 230 32 ([Drawing.Color]::FromArgb(150, 90, 55))
 
-foreach ($button in @($installButton, $playButton, $dockerButton, $stopButton, $panelButton, $clientButton, $updateButton, $bundleButton, $installUpdateButton, $diagnosticsButton, $openLogButton, $folderButton, $botCountButton, $importDbButton)) {
+foreach ($button in @($installButton, $playButton, $dockerButton, $stopButton, $panelButton, $clientButton, $updateButton, $bundleButton, $diagnosticsButton, $openLogButton, $folderButton, $botCountButton, $importDbButton, $repairDbButton)) {
     $script:form.Controls.Add($button)
 }
 
@@ -443,6 +765,50 @@ $footer.Size = [Drawing.Size]::new(700, 25)
 $footer.ForeColor = [Drawing.Color]::DarkGray
 $script:form.Controls.Add($footer)
 
+
+$script:versionLabel = [Windows.Forms.Label]::new()
+$script:versionLabel.Location = [Drawing.Point]::new(28, 674)
+$script:versionLabel.Size = [Drawing.Size]::new(700, 22)
+$script:versionLabel.ForeColor = [Drawing.Color]::Silver
+$script:versionLabel.Font = [Drawing.Font]::new('Segoe UI Semibold', 9)
+$script:form.Controls.Add($script:versionLabel)
+
+$script:latestServerVersion = $null
+$script:latestVersionChecked = $false
+
+function Update-VersionFooter {
+    # The manifest lives behind GitHub's anonymous per-IP budget, so it is read
+    # once per session and whenever the player asks for a check - never on the
+    # 8-second status timer, which would spend that budget for nothing.
+    $installed = Get-InstalledServerVersion
+    $installedText = if ($installed -and $installed -ne 'unknown') { $installed } else { 'nieznana (przebudowa w toku)' }
+    $latestText = if ($script:latestServerVersion) { $script:latestServerVersion }
+        elseif ($script:latestVersionChecked) { 'nie udalo sie sprawdzic' }
+        else { 'sprawdzanie...' }
+    $script:versionLabel.Text = "Aktualna wersja: $installedText     |     Najnowsza wersja: $latestText"
+    $upToDate = $script:latestServerVersion -and $installed -and $installed -ne 'unknown' -and
+        $installed.Equals($script:latestServerVersion, [StringComparison]::OrdinalIgnoreCase)
+    $script:versionLabel.ForeColor = if ($upToDate) { [Drawing.Color]::LightGreen }
+        elseif ($script:latestServerVersion) { [Drawing.Color]::Gold }
+        else { [Drawing.Color]::Silver }
+}
+
+function Read-LatestServerVersion {
+    param([switch]$Force)
+    if ($script:latestVersionChecked -and -not $Force) { return }
+    $script:latestVersionChecked = $true
+    try {
+        $config = Get-M2LauncherConfig -ServerRoot $root -ConfigPath $configPath
+        $manifest = Get-M2UpdateManifest -Source ([string]$config.manifestUrl) -TimeoutSec 8
+        $serverProperty = $manifest.PSObject.Properties['server']
+        if ($serverProperty -and $serverProperty.Value -and [string]$serverProperty.Value.version) {
+            $script:latestServerVersion = ([string]$serverProperty.Value.version).Trim()
+        }
+    }
+    catch { }
+    Update-VersionFooter
+}
+
 $installButton.Add_Click({ Install-Or-Prepare })
 $playButton.Add_Click({
     if (-not (Find-ClientExecutable)) {
@@ -459,15 +825,75 @@ $stopButton.Add_Click({
 })
 $panelButton.Add_Click({ Start-Process 'http://127.0.0.1:7788/map' })
 $clientButton.Add_Click({ [void](Select-ClientExecutable) })
-$updateButton.Add_Click({ Start-LauncherAction -Action 'Check' })
-$installUpdateButton.Add_Click({
+$updateButton.Add_Click({
+    # One button for the whole flow: check in-process, and only offer to install
+    # when there really is something newer.
+    $installed = Get-InstalledServerVersion
+    Write-LocalLog "Sprawdzam aktualizacje (zainstalowana wersja: $installed)..."
+    $manifest = $null
+    try {
+        $config = Get-M2LauncherConfig -ServerRoot $root -ConfigPath $configPath
+        $manifest = Get-M2UpdateManifest -Source ([string]$config.manifestUrl)
+    }
+    catch {
+        Write-LocalLog "Nie udało się sprawdzić aktualizacji: $($_.Exception.Message)"
+        [Windows.Forms.MessageBox]::Show(
+            "Nie udało się sprawdzić aktualizacji.`r`n`r`n$($_.Exception.Message)",
+            'Sprawdzanie aktualizacji', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $server = $null
+    $serverProperty = $manifest.PSObject.Properties['server']
+    if ($serverProperty -and $serverProperty.Value) { $server = $serverProperty.Value }
+    if (-not $server -or -not [string]$server.version) {
+        $message = 'Kanał aktualizacji nie ma obecnie nowej wersji serwera. Twoja instalacja pozostaje bez zmian.'
+        $statusProperty = $manifest.PSObject.Properties['statusMessage']
+        if ($statusProperty -and [string]$statusProperty.Value) { $message = [string]$statusProperty.Value }
+        Write-LocalLog $message
+        [Windows.Forms.MessageBox]::Show($message, 'Brak aktualizacji', 'OK', 'Information') | Out-Null
+        return
+    }
+    $available = ([string]$server.version).Trim()
+    $script:latestServerVersion = $available
+    $script:latestVersionChecked = $true
+    Update-VersionFooter
+    Write-LocalLog "Dostępna wersja serwera: $available"
+    if ($installed -and $installed -ne 'unknown' -and $installed.Equals($available, [StringComparison]::OrdinalIgnoreCase)) {
+        [Windows.Forms.MessageBox]::Show("Masz już najnowszą wersję ($available).", 'Aktualizacje', 'OK', 'Information') | Out-Null
+        return
+    }
     $answer = [Windows.Forms.MessageBox]::Show(
-        'Pobrać i zainstalować dostępne aktualizacje serwera oraz klienta? Zmieniane pliki otrzymają kopię zapasową, a baza postaci pozostanie bez zmian.',
-        'Instalacja aktualizacji', 'YesNo', 'Question')
-    if ($answer -eq [Windows.Forms.DialogResult]::Yes) { Start-LauncherAction -Action 'UpdateAll' -Yes }
+        "Znaleziono nową wersję serwera: $available`r`n(zainstalowana: $installed)`r`n`r`nZainstalować teraz?`r`n`r`nTwoje postacie, przedmioty i boty pozostaną bez zmian. Aktualizacja przebudowuje serwer lokalnie — przy pierwszym razie może to potrwać kilkanaście–kilkadziesiąt minut. Postęp zobaczysz w logu poniżej.",
+        'Dostępna aktualizacja', 'YesNo', 'Question')
+    if ($answer -ne [Windows.Forms.DialogResult]::Yes) {
+        Write-LocalLog 'Aktualizacja odłożona na później.'
+        return
+    }
+    Start-LauncherAction -Action 'UpdateAll' -Yes
 })
 $diagnosticsButton.Add_Click({ Start-LauncherAction -Action 'Diagnose' })
-$bundleButton.Add_Click({ Start-LauncherAction -Action 'Logs' -OpenSupport })
+$bundleButton.Add_Click({
+    # The support address comes from the update manifest, so it is looked up
+    # once per session - a slow or missing network just falls back to the ZIP.
+    $support = Get-SupportSettings
+    if ($support.UploadUrl) {
+        $answer = [Windows.Forms.MessageBox]::Show(
+            "Spakowac logi i wyslac je od razu do autora projektu?`r`n`r`nPaczka zawiera logi Dockera i konfiguracje z usunietymi haslami.`r`n`r`nNIE = tylko zapisz ZIP na dysku.",
+            'Wyslij logi', 'YesNoCancel', 'Question')
+        if ($answer -eq [Windows.Forms.DialogResult]::Cancel) { return }
+        if ($answer -eq [Windows.Forms.DialogResult]::Yes) {
+            Start-LauncherAction -Action 'SendLogs' -Yes
+            return
+        }
+    }
+    else {
+        [Windows.Forms.MessageBox]::Show(
+            "Zapisze paczke ZIP z logami i otworze jej folder - dolacz ja na Discordzie.`r`n`r`nOtworze tez zaproszenie na serwer.",
+            'Logi', 'OK', 'Information') | Out-Null
+        $script:openContactAfterAction = $support.ContactUrl
+    }
+    Start-LauncherAction -Action 'Logs' -OpenSupport
+})
 $openLogButton.Add_Click({
     if (-not (Test-Path -LiteralPath $sessionLog -PathType Leaf)) { Write-LocalLog 'Utworzono dziennik launchera.' }
     Start-Process notepad.exe -ArgumentList ('"{0}"' -f $sessionLog)
@@ -478,18 +904,8 @@ $folderButton.Add_Click({
 })
 $botCountButton.Add_Click({
     $current = Get-BotCountFromEnv
-    $entered = [Microsoft.VisualBasic.Interaction]::InputBox(
-        "Ilu botów ma grać? (0-350; limit = liczba zaseedowanych botów)`r`nZmiana wymaga restartu serwera, aby zadziałała.",
-        'Liczba grających botów', "$current")
-    if ([string]::IsNullOrWhiteSpace($entered)) { return }
-    if ($entered -notmatch '^\d+$') {
-        [Windows.Forms.MessageBox]::Show('Podaj liczbę całkowitą (np. 150).', 'Nieprawidłowa wartość', 'OK', 'Warning') | Out-Null
-        return
-    }
-    $count = [int]$entered
-    if ($count -gt 350) {
-        [Windows.Forms.MessageBox]::Show("Kanoniczna paczka ma 350 zaseedowanych botów, więc grać będzie najwyżej 350. Ustawię $count, ale efektywnie pojawi się maksymalnie tyle, ile jest zaseedowanych.", 'Uwaga', 'OK', 'Information') | Out-Null
-    }
+    $count = Show-BotCountDialog -Current $current
+    if ($null -eq $count) { return }
     $answer = [Windows.Forms.MessageBox]::Show(
         "Ustawić $count grających botów i zrestartować serwer teraz, aby zastosować? Baza i postęp botów pozostaną bez zmian.",
         'Liczba botów', 'YesNoCancel', 'Question')
@@ -502,6 +918,7 @@ $botCountButton.Add_Click({
     }
 })
 $importDbButton.Add_Click({
+    if (-not (Confirm-DockerReady)) { return }
     $target = Get-GuiTargetVolume
     $sources = @()
     try { $sources = @(Get-M2DbDataVolumes | Where-Object { $_.Name -ne $target }) } catch { $sources = @() }
@@ -524,7 +941,13 @@ $importDbButton.Add_Click({
     $list = [Windows.Forms.ListBox]::new()
     $list.Location = [Drawing.Point]::new(12, 58)
     $list.Size = [Drawing.Size]::new(430, 170)
-    foreach ($item in $sources) { [void]$list.Items.Add($item.Project) }
+    # The project names are opaque hashes, so the creation date is the only thing
+    # that tells one install from another.
+    foreach ($item in $sources) {
+        $label = $item.Project
+        if ($item.CreatedAt) { $label = '{0}   (utworzona {1:yyyy-MM-dd HH:mm})' -f $item.Project, $item.CreatedAt }
+        [void]$list.Items.Add($label)
+    }
     $list.SelectedIndex = 0
     $dlg.Controls.Add($list)
     $okButton = [Windows.Forms.Button]::new()
@@ -542,7 +965,8 @@ $importDbButton.Add_Click({
     $dlg.AcceptButton = $okButton
     $dlg.CancelButton = $cancelButton
     $result = $dlg.ShowDialog()
-    $picked = [string]$list.SelectedItem
+    $picked = ''
+    if ($list.SelectedIndex -ge 0) { $picked = [string]$sources[$list.SelectedIndex].Project }
     $dlg.Dispose()
     if ($result -ne [Windows.Forms.DialogResult]::OK -or -not $picked) { return }
     $confirm = [Windows.Forms.MessageBox]::Show(
@@ -551,15 +975,29 @@ $importDbButton.Add_Click({
     if ($confirm -ne [Windows.Forms.DialogResult]::Yes) { return }
     Start-LauncherAction -Action 'ImportDb' -Yes -ExtraArgs @('-ImportSource', "$picked")
 })
+$repairDbButton.Add_Click({
+    if (-not (Confirm-DockerReady)) { return }
+    $answer = [Windows.Forms.MessageBox]::Show(
+        "Naprawić dostęp do bazy?`r`n`r`nUżyj tego, gdy po imporcie serwer nie startuje (playerbot-migrate kończy się błędem). Odtwarza tylko techniczne konto bazy — postacie, przedmioty i boty pozostają BEZ ZMIAN. Serwer zostanie zatrzymany na czas naprawy.",
+        'Napraw dostęp do bazy', 'YesNo', 'Question')
+    if ($answer -ne [Windows.Forms.DialogResult]::Yes) { return }
+    Start-LauncherAction -Action 'RepairDb'
+})
 
 $timer = [Windows.Forms.Timer]::new()
 $timer.Interval = 1200
-$timer.Add_Tick({ Complete-LauncherAction })
+$timer.Add_Tick({ Update-ActionStream; Complete-LauncherAction })
 $timer.Start()
 
 $statusTimer = [Windows.Forms.Timer]::new()
 $statusTimer.Interval = 8000
-$statusTimer.Add_Tick({ if (-not $script:activeProcess) { Refresh-Status } })
+$statusTimer.Add_Tick({
+    if ($script:activeProcess) { return }
+    Refresh-Status
+    # One manifest read per session: on the first quiet tick rather than during
+    # form startup, so the window is already usable while it happens.
+    Read-LatestServerVersion
+})
 $statusTimer.Start()
 
 $script:form.Add_FormClosing({
@@ -577,5 +1015,6 @@ if (Test-Path -LiteralPath $sessionLog -PathType Leaf) {
     if ($tail) { $script:logBox.Text = ($tail -join [Environment]::NewLine) + [Environment]::NewLine }
 }
 Write-LocalLog 'Uruchomiono GUI launchera.'
+Update-VersionFooter
 Refresh-Status
 [void]$script:form.ShowDialog()

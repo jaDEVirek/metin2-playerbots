@@ -60,6 +60,20 @@ function Get-M2LauncherErrorGuidance {
         $port = $Matches.port
     }
 
+    # Not a busy port: Windows itself refused the bind. Hyper-V and WSL reserve
+    # random port ranges after a restart ("excluded port ranges"), and when
+    # 11000 or 13000 falls inside one, compose fails one second after the
+    # images are built with a message about access permissions. Five updates
+    # in a row went that way for one player before this branch existed.
+    if ($value -match '(?i)ports are not available|forbidden by its access permissions|zabroniony przez uprawnienia|WSAEACCES|\b10013\b') {
+        return [pscustomobject]@{
+            Code = 'PORT_EXCLUDED'
+            Title = "Windows zarezerwował port $port"
+            Message = "Port $port nie jest zajęty przez program - jest w zakresie, który Windows (Hyper-V/WSL) zarezerwował dla siebie po ostatnim restarcie. Docker nie może na nim nasłuchiwać, więc serwer nie wstaje. Pliki serwera i baza są w porządku."
+            Remedy = 'Uruchom PowerShell jako administrator i wykonaj: net stop winnat, potem kliknij GRAJ w launcherze, a gdy serwer wstanie, wykonaj: net start winnat. Zwykle pomaga też zwykły restart Windows. Sprawdzenie zakresów: netsh interface ipv4 show excludedportrange protocol=tcp'
+        }
+    }
+
     if ($value -match '(?i)port is already allocated|address already in use|failed programming external connectivity|bind for .+ failed|port \d{2,5} (?:jest zajęty|zajmuje)') {
         return [pscustomobject]@{
             Code = 'PORT_IN_USE'
@@ -102,6 +116,27 @@ function Get-M2LauncherErrorGuidance {
             Title = 'Wybrany folder zawiera inną instalację'
             Message = 'Stary install.ps1 próbuje skopiować paczkę na istniejący plik lub do niezgodnego układu katalogów.'
             Remedy = 'Nie uruchamiaj starego install.ps1 na folderze obecnej paczki All-in-One. Rozpakuj pełną paczkę do pustego folderu i uruchom Metin2-Launcher-GUI.bat. Istniejącej bazy Dockera nie usuwaj.'
+        }
+    }
+
+    # Docker Desktop's own Linux disk went read-only or ran out of room, so the
+    # image could not be written. Nothing of the server is touched; the fix is
+    # a clean restart of the WSL machine and free space - never Docker's
+    # "Clean / Purge data", which takes the database with it.
+    if ($value -match '(?i)read-only file system|no space left on device|desktop-containerd.+(?:input/output error|meta\.db)') {
+        return [pscustomobject]@{
+            Code = 'DOCKER_DISK_BROKEN'
+            Title = 'Dysk maszyny Dockera jest tylko do odczytu albo pełny'
+            Message = 'Docker nie mógł zapisać obrazu na swoim dysku WSL (komunikat „read-only file system” albo „no space left on device”). Pliki serwera i baza są w porządku; to stan maszyny wirtualnej Docker Desktop po nieczystym zamknięciu lub braku miejsca.'
+            Remedy = 'Zamknij Docker Desktop (ikona w zasobniku → Quit), w PowerShell wykonaj: wsl --shutdown, sprawdź wolne miejsce na dysku z folderem %LOCALAPPDATA%\Docker\wsl (potrzeba kilku GB), uruchom Docker Desktop ponownie i kliknij GRAJ. Nie używaj w Docker Desktop opcji „Clean / Purge data” ani „Reset to factory defaults” - usuwają bazę z postaciami.'
+        }
+    }
+    if ($value -match "(?i)playerbot-migrate.+didn.t complete successfully|database import was not ready after|user: 'unauthenticated'") {
+        return [pscustomobject]@{
+            Code = 'DB_USER_BROKEN'
+            Title = 'Serwer nie może zalogować się do własnej bazy'
+            Message = 'Baza działa, ale techniczne konto, którym łączy się serwer, nie jest rozpoznawane. Dlatego krok „playerbot-migrate” nie kończy się poprawnie, a gra i panel nie wstają. Twoje postacie, przedmioty i boty są bezpieczne.'
+            Remedy = 'W launcherze kliknij „NAPRAW DOSTĘP DO BAZY”, poczekaj na komunikat „Gotowe”, a potem kliknij „GRAJ”. Nie usuwaj wolumenów i nie używaj docker compose down -v.'
         }
     }
 
@@ -205,6 +240,65 @@ function Get-M2DockerPortOwner {
     return $null
 }
 
+# The TCP ranges Windows has reserved for itself (Hyper-V, WSL, NAT). A port
+# inside one cannot be bound by anything, Docker included, and the failure
+# only shows up a second after the images are built. Empty when netsh is
+# missing or says nothing - never a reason to refuse a start on its own.
+function Get-M2ExcludedPortRanges {
+    $ranges = @()
+    try {
+        $lines = & netsh interface ipv4 show excludedportrange protocol=tcp 2>$null
+        foreach ($line in @($lines)) {
+            if ("$line" -match '^\s*(\d+)\s+(\d+)\s*\*?\s*$') {
+                $ranges += [pscustomobject]@{ Start = [int]$Matches[1]; End = [int]$Matches[2] }
+            }
+        }
+    }
+    catch { }
+    return $ranges
+}
+
+function Get-M2ExcludedPortHit {
+    param([Parameter(Mandatory = $true)][int]$Port, [object[]]$Ranges)
+    foreach ($r in @($Ranges)) {
+        if ($Port -ge $r.Start -and $Port -le $r.End) { return $r }
+    }
+    return $null
+}
+
+function Get-DockerDesktopCandidates {
+    # The three stock folders, then wherever the CLI on PATH lives (Docker
+    # Desktop keeps docker.exe under <install>\resources\bin), then the
+    # uninstall entry's InstallLocation. Two players had Docker on another
+    # drive: the launcher stopped Docker Desktop for them and then could not
+    # start it again, and the update that happened to come between the two
+    # got the blame.
+    $paths = New-Object System.Collections.Generic.List[string]
+    foreach ($p in @(
+            (Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Docker\Docker\Docker Desktop.exe'),
+            (Join-Path $env:LOCALAPPDATA 'Docker\Docker Desktop.exe'))) {
+        if ($p) { $paths.Add($p) }
+    }
+    try {
+        $cli = (Get-Command docker -ErrorAction Stop).Source
+        if ($cli) {
+            $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $cli))
+            if ($root) { $paths.Add((Join-Path $root 'Docker Desktop.exe')) }
+        }
+    }
+    catch { }
+    foreach ($key in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop',
+                       'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop')) {
+        try {
+            $loc = (Get-ItemProperty -LiteralPath $key -ErrorAction Stop).InstallLocation
+            if ($loc) { $paths.Add((Join-Path $loc 'Docker Desktop.exe')) }
+        }
+        catch { }
+    }
+    return @($paths | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -Unique)
+}
+
 function Get-M2DockerPreflight {
     param(
         [Parameter(Mandatory = $true)][string]$ServerRoot,
@@ -240,13 +334,7 @@ function Get-M2DockerPreflight {
         [void]$blocking.Add('Zainstaluj Docker Desktop z oficjalnej strony i uruchom ponownie launcher.')
     }
 
-    $desktopCandidates = @(
-        @(
-            (Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'),
-            (Join-Path ${env:ProgramFiles(x86)} 'Docker\Docker\Docker Desktop.exe'),
-            (Join-Path $env:LOCALAPPDATA 'Docker\Docker Desktop.exe')
-        ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) }
-    )
+    $desktopCandidates = @(Get-DockerDesktopCandidates)
     if (-not $dockerEngineReady -and $desktopCandidates.Count -eq 0) {
         [void]$blocking.Add('Nie znaleziono programu Docker Desktop. Zainstaluj go przed uruchomieniem serwera.')
     }
@@ -319,6 +407,43 @@ function Get-M2DockerPreflight {
         }
         else {
             [void]$checks.Add("OK: port panelu $panelPort jest wolny.")
+        }
+    }
+
+    # Ports the stack binds on the host, against the ranges Windows reserved.
+    # The game ports are the ones that fail in practice: a range that starts
+    # at 11000 or 13000 blocks the login server or the channel, and nothing
+    # in the launcher used to say so.
+    $excludedRanges = Get-M2ExcludedPortRanges
+    if ($excludedRanges.Count -gt 0) {
+        $envPath = Join-Path $root 'linux-port\docker\.env'
+        $authPort = 11000
+        $dbPort = 3306
+        if (Test-Path -LiteralPath $envPath -PathType Leaf) {
+            $m = Select-String -LiteralPath $envPath -Pattern '^M2_AUTH_PORT=(\d+)$' | Select-Object -First 1
+            if ($m) { $authPort = [int]$m.Matches[0].Groups[1].Value }
+            $m = Select-String -LiteralPath $envPath -Pattern '^M2_DB_PUBLISH_PORT=(\d+)$' | Select-Object -First 1
+            if ($m) { $dbPort = [int]$m.Matches[0].Groups[1].Value }
+        }
+        $stackPorts = @(
+            @{ Port = $authPort; Name = 'serwer logowania' },
+            @{ Port = 13000; Name = 'kanal gry' },
+            @{ Port = 13001; Name = 'kanal gry' },
+            @{ Port = 13002; Name = 'kanal gry' },
+            @{ Port = $dbPort; Name = 'baza danych' },
+            @{ Port = [int]$panelPort; Name = 'panel' }
+        )
+        $hits = @()
+        foreach ($p in $stackPorts) {
+            $hit = Get-M2ExcludedPortHit -Port $p.Port -Ranges $excludedRanges
+            if ($hit) { $hits += "$($p.Port) ($($p.Name), zakres $($hit.Start)-$($hit.End))" }
+        }
+        if ($hits.Count -gt 0) {
+            [void]$checks.Add("BŁĄD: Windows zarezerwował porty serwera: $($hits -join ', ').")
+            [void]$blocking.Add('Port serwera leży w zakresie zarezerwowanym przez Windows (Hyper-V/WSL), więc Docker nie może na nim nasłuchiwać. Uruchom PowerShell jako administrator: net stop winnat, kliknij GRAJ, a po starcie serwera: net start winnat. Zwykle pomaga też restart Windows.')
+        }
+        else {
+            [void]$checks.Add('OK: żaden port serwera nie leży w zakresie zarezerwowanym przez Windows.')
         }
     }
 

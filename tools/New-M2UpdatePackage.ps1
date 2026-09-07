@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][ValidateSet('server', 'client')][string]$Type,
     [Parameter(Mandatory = $true)][string]$Version,
@@ -23,6 +23,112 @@ try {
         Where-Object { $_ -and -not $_.StartsWith('#') })
     if ($entries.Count -eq 0) { throw 'The file list is empty.' }
 
+    # A line may name a directory with a wildcard - "…/src/playerbot_*" - and it
+    # expands to whatever is there. Splitting a source file used to mean editing
+    # this list too, and forgetting to is what shipped a manager without its own
+    # headers twice. A pattern that matches nothing is still an error: it means
+    # the tree moved and the package would be silently short.
+    $expanded = @()
+    foreach ($entry in $entries) {
+        if ($entry -notmatch '[\*\?]') { $expanded += $entry; continue }
+        $relativePattern = $entry.Replace('/', '\').TrimStart('\')
+        if ([IO.Path]::IsPathRooted($relativePattern) -or
+            $relativePattern.Split('\') -contains '..') {
+            throw "Unsafe pattern: $entry"
+        }
+        $directory = Split-Path -Parent $relativePattern
+        $leaf = Split-Path -Leaf $relativePattern
+        $searchRoot = Join-Path $source $directory
+        if (-not (Test-Path -LiteralPath $searchRoot -PathType Container)) {
+            throw "Pattern directory does not exist: $directory"
+        }
+        # A bare "*" is taken to mean the whole tree under that directory, so a
+        # line can name a folder of assets without naming the shape of it.
+        # files/static holds only subdirectories, and listing
+        # static/skill_icons/*.png instead would have worked exactly until the
+        # second icon set - which is the trap the playerbot sources were pulled
+        # out of.
+        if ($leaf -eq '*') {
+            $matched = @(Get-ChildItem -LiteralPath $searchRoot -File -Recurse |
+                Sort-Object FullName | ForEach-Object {
+                    Join-Path $directory $_.FullName.Substring($searchRoot.Length).TrimStart('\\')
+                })
+        } else {
+            $matched = @(Get-ChildItem -LiteralPath $searchRoot -File -Filter $leaf |
+                Sort-Object Name | ForEach-Object { (Join-Path $directory $_.Name) })
+        }
+        if ($matched.Count -eq 0) { throw "Pattern matched no files: $entry" }
+        $expanded += $matched
+    }
+    $entries = @($expanded | Select-Object -Unique)
+
+
+    # The overlay sources and the staged build context are two copies of the
+    # same files, and a package that carries one without the other is what took
+    # every player's server down in 1.22.4 and again in 1.23.2: the compiler saw
+    # a manager whose header was still the previous release's, or missing
+    # outright. Refuse to build such a package at all.
+    $overlayPrefix = 'linux-port\overlays\playerbot\src\game\src\'
+    $stagedPrefix = 'linux-port\docker\game\src\server\game\src\'
+    $overlayNames = @()
+    $stagedNames = @()
+    foreach ($relativeInput in $entries) {
+        $relative = $relativeInput.Replace('/', '\').TrimStart('\')
+        if ($relative.StartsWith($overlayPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $overlayNames += $relative.Substring($overlayPrefix.Length)
+        }
+        elseif ($relative.StartsWith($stagedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $stagedNames += $relative.Substring($stagedPrefix.Length)
+        }
+    }
+
+    # The seed has the same two-copy shape as the sources: the overlay's is the
+    # source of truth and the migrate container mounts the other one.
+    # Listed with forward slashes, the way the file list writes them, and only
+    # turned into a path when one is needed.
+    $seedOverlay = 'linux-port/overlays/playerbot/sql/playerbots_seed.sql'
+    $seedMounted = 'linux-port/docker/mariadb/playerbot/playerbots_seed.sql'
+    $shipsOverlaySeed = $entries -contains $seedOverlay
+    $shipsMountedSeed = $entries -contains $seedMounted
+    if ($shipsOverlaySeed -or $shipsMountedSeed) {
+        if (-not ($shipsOverlaySeed -and $shipsMountedSeed)) {
+            throw "The seed ships in only one of its two locations. Add both $seedOverlay and $seedMounted to $listPath."
+        }
+        $seedOverlayPath = Join-Path $source ($seedOverlay -replace '/', [IO.Path]::DirectorySeparatorChar)
+        $seedMountedPath = Join-Path $source ($seedMounted -replace '/', [IO.Path]::DirectorySeparatorChar)
+        if ((Get-FileHash -LiteralPath $seedOverlayPath -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $seedMountedPath -Algorithm SHA256).Hash) {
+            throw "The overlay seed and the seed the migrate container mounts differ. Copy it across before packaging."
+        }
+    }
+
+    foreach ($name in $stagedNames) {
+        # An engine file shipped as its patched copy - item_manager.cpp,
+        # config.cpp - has no overlay source and the launcher's sync never
+        # touches it: Sync-M2PlayerbotOverlay copies what sits in the overlay
+        # directory, which is only ever playerbot_*. The pairing rule below is
+        # for the overlay sources alone.
+        if ($name -notlike 'playerbot_*') { continue }
+        if ($overlayNames -notcontains $name) {
+            # The launcher syncs overlay -> build context before every build, so
+            # an overlay copy left behind by an older release would overwrite the
+            # good staged one on the player's machine. Both halves ship together
+            # or neither does.
+            throw "Build-context copy shipped without its Playerbot source: $name. Add $overlayPrefix$name to $listPath."
+        }
+    }
+    foreach ($name in $overlayNames) {
+        if ($stagedNames -notcontains $name) {
+            throw "Playerbot source shipped without its build-context copy: $name. Add $stagedPrefix$name to $listPath."
+        }
+        $a = Join-Path $source ($overlayPrefix + $name)
+        $b = Join-Path $source ($stagedPrefix + $name)
+        if ((Get-FileHash -LiteralPath $a -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $b -Algorithm SHA256).Hash) {
+            throw "Playerbot source and its build-context copy differ: $name. Run prepare-context.sh or copy it across before packaging."
+        }
+    }
+
     foreach ($relativeInput in $entries) {
         $relative = $relativeInput.Replace('/', '\').TrimStart('\')
         if ([IO.Path]::IsPathRooted($relative) -or $relative.Split('\') -contains '..') {
@@ -31,16 +137,19 @@ try {
         if ($relative -ieq 'linux-port\docker\.env' -or $relative.StartsWith('.git\')) {
             throw "Protected file cannot be published in an update: $relative"
         }
-        $input = [IO.Path]::GetFullPath((Join-Path $source $relative))
-        if (-not $input.StartsWith($source + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        # PowerShell's automatic pipeline-enumerator variable used to be
+        # reused here as an ordinary name. Handing it to a cmdlet made
+        # packaging hang at random, with the process sitting fully idle.
+        $sourceFile = [IO.Path]::GetFullPath((Join-Path $source $relative))
+        if (-not $sourceFile.StartsWith($source + '\', [StringComparison]::OrdinalIgnoreCase)) {
             throw "Path leaves source root: $relative"
         }
-        if (-not (Test-Path -LiteralPath $input -PathType Leaf)) {
+        if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
             throw "Listed file does not exist: $relative"
         }
         $destination = Join-Path $temp $relative
         New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
-        Copy-Item -LiteralPath $input -Destination $destination -Force
+        Copy-Item -LiteralPath $sourceFile -Destination $destination -Force
     }
 
     $safeVersion = $Version -replace '[^A-Za-z0-9._-]', '-'

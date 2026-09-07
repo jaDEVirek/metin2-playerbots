@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet('Menu', 'Start', 'Stop', 'StartDocker', 'StopAll', 'Check', 'UpdateServer', 'UpdateClient', 'UpdateAll', 'Diagnose', 'Logs', 'SendLogs', 'Configure', 'SetBots', 'ImportDb')]
+    [ValidateSet('Menu', 'Start', 'Stop', 'StartDocker', 'StopAll', 'Check', 'UpdateServer', 'UpdateClient', 'UpdateAll', 'Diagnose', 'Logs', 'SendLogs', 'Configure', 'SetBots', 'ImportDb', 'RepairDb')]
     [string]$Action = 'Menu',
     [string]$Manifest = '',
     [int]$BotCount = -1,
@@ -9,11 +9,27 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# The GUI runs this script hidden with its stdout redirected into a file and
+# reads that file back as UTF-8. Without this the redirect gets the console's
+# OEM code page instead, and every Polish letter this script prints reaches the
+# log broken - "Serwer dzia?a w wersji", while the GUI's own lines beside them
+# are fine. Both ends speak UTF-8 now.
+try {
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    $OutputEncoding = [Text.UTF8Encoding]::new($false)
+}
+catch { }
+
 $serverRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 $modulePath = Join-Path $serverRoot 'launcher\Metin2Launcher.psm1'
 $diagnosticsModulePath = Join-Path $serverRoot 'launcher\Metin2Launcher.Diagnostics.psm1'
 $configPath = Join-Path $serverRoot '.m2launcher.json'
 $statePath = Join-Path $serverRoot '.m2launcher-state.json'
+# Written when new files are already on disk but Docker did not finish building
+# them. Until it is gone the installation is not really on the version its
+# VERSION file claims, and starting it would run the previous images.
+$rebuildMarkerPath = Join-Path $serverRoot '.m2launcher-rebuild-pending'
 
 foreach ($requiredModule in @($modulePath, $diagnosticsModulePath)) {
     if (-not (Test-Path -LiteralPath $requiredModule -PathType Leaf)) {
@@ -41,7 +57,18 @@ function Get-ManifestSource {
     return [string]$Config.manifestUrl
 }
 
+function Test-RebuildPending {
+    return (Test-Path -LiteralPath $rebuildMarkerPath -PathType Leaf)
+}
+
 function Read-State {
+    # An interrupted update leaves the new VERSION file on disk while the running
+    # containers are still the old ones. Reporting that version would make the
+    # update check answer "already up to date" and never rebuild, which is the
+    # state a player cannot get out of on their own.
+    if (Test-RebuildPending) {
+        return [pscustomobject]@{ schema = 1; server = 'unknown'; client = 'unknown' }
+    }
     if (Test-Path -LiteralPath $statePath -PathType Leaf) {
         return Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
     }
@@ -111,6 +138,15 @@ function Assert-DockerPrerequisites {
 
 function Start-Server {
     Assert-DockerPrerequisites -CheckPanelPort
+    # start-server.ps1 brings the stack up from the images that already exist.
+    # After an interrupted update those are the old ones, so finish the build
+    # first - otherwise the player keeps running the previous server and the
+    # website keeps showing the previous panel.
+    if (Test-RebuildPending) {
+        Write-Host 'Poprzednia aktualizacja nie dokonczyla budowania. Dokancczam je teraz...' -ForegroundColor Yellow
+        Rebuild-Server
+        Write-Host 'Budowanie zakonczone.' -ForegroundColor Green
+    }
     $script = Join-Path $serverRoot 'start-server.ps1'
     if (-not (Test-Path -LiteralPath $script -PathType Leaf)) { throw 'Brakuje start-server.ps1.' }
     & $script
@@ -173,18 +209,60 @@ function Stop-DockerAndServer {
 function Rebuild-Server {
     $composeDir = Join-Path $serverRoot 'linux-port\docker'
     $composeFile = Join-Path $composeDir 'docker-compose.yml'
+    # Stopping the server also stops Docker Desktop (see Stop-DockerAndServer),
+    # so the sensible order - stop the server, then update it - always arrived
+    # here with a dead engine and failed on a raw npipe error, after the files
+    # had already been swapped. Start-Server has the same hole: it finishes a
+    # pending build before start-server.ps1 gets a chance to bring the engine
+    # up, so "click GRAJ" only ever worked when Docker happened to be running.
+    # Both paths go through here, so the engine is ensured here as well.
+    if (-not (Test-M2DockerRunning)) {
+        Write-Host 'Silnik Dockera jest zatrzymany - uruchamiam go przed budowaniem.' -ForegroundColor Yellow
+        Start-Docker
+    }
+    # Compose needs the .env before it can build anything - the database
+    # passwords are required variables. A copy unpacked by hand has no .env
+    # until start-server.ps1 writes one, and that used to run only after this
+    # build, so the update failed and "click GRAJ" failed the same way.
+    $identityScript = Join-Path $serverRoot 'start-server.ps1'
+    if (Test-Path -LiteralPath $identityScript -PathType Leaf) {
+        & $identityScript -IdentityOnly
+        if ($LASTEXITCODE -ne 0) { throw "Przygotowanie pliku .env zakonczylo sie kodem $LASTEXITCODE." }
+    }
+    # The overlay is the source of truth; the build context is only a copy of
+    # it. Refresh the copy before Docker reads it, or an update that added a
+    # source file compiles against the previous one - or, as in 1.23.2, against
+    # a header that is not there at all.
+    $synced = Sync-M2PlayerbotOverlay -ServerRoot $serverRoot
+    if ($synced -gt 0) {
+        Write-Host "Zsynchronizowano $synced plik(ow) zrodlowych bota do kontekstu budowania." -ForegroundColor DarkGray
+    }
+    # The engine patches are part of the overlay too, and until now nothing on a
+    # player's machine ever applied them.
+    $patched = Invoke-M2EnginePatches -ServerRoot $serverRoot
+    if ($patched -gt 0) {
+        Write-Host "Nalozono $patched latek silnika." -ForegroundColor DarkGray
+    }
     # See Stop-Server: compose progress on stderr must not be treated as failure
     # under $ErrorActionPreference='Stop' in Windows PowerShell 5.1.
     $previousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
+        # `up --build` on a fresh engine has raced its own pull: the images
+        # were built, then "No such image: mariadb:10.11" while creating the
+        # database container, and the update was reported as failed although
+        # the second click succeeded. Pull what is not built first; a failure
+        # here is not final, `up` tries again.
+        docker compose --project-directory $composeDir -f $composeFile pull --ignore-buildable 2>&1 | Out-Null
         docker compose --project-directory $composeDir -f $composeFile up -d --build
         $buildExit = $LASTEXITCODE
     }
     finally { $ErrorActionPreference = $previousPreference }
     if ($buildExit -ne 0) {
-        throw 'Nowa wersja plików została zapisana, ale Docker nie zbudował serwera. Kopia plików jest w katalogu backups.'
+        Set-Content -LiteralPath $rebuildMarkerPath -Value ([DateTime]::UtcNow.ToString('o')) -Encoding UTF8
+        throw 'Nowa wersja plików została zapisana, ale Docker nie zbudował serwera. Kliknij GRAJ — launcher dokończy budowanie. Kopia plików jest w katalogu backups.'
     }
+    if (Test-RebuildPending) { Remove-Item -LiteralPath $rebuildMarkerPath -Force -ErrorAction SilentlyContinue }
 }
 
 function Show-UpdateStatus {
@@ -220,8 +298,14 @@ function Update-Server {
     }
     $result = Invoke-M2PackageUpdate -Component $component -TargetRoot $serverRoot -BackupRoot (Join-Path $serverRoot 'backups')
     Write-Host "Podmieniono $($result.Files) plików. Kopia: $($result.Backup)" -ForegroundColor Green
-    Rebuild-Server
+    # From here the files on disk are the new version whatever happens to the
+    # build, and VERSION on disk already says so. Recording it only after a
+    # successful rebuild meant a deferred build left the launcher reporting the
+    # previous version for ever - it kept offering the same update and kept
+    # re-downloading and re-applying it, one backup directory per attempt. What
+    # tracks the build is the rebuild marker, not the version number.
     Save-State -ServerVersion $result.Version -ClientVersion ''
+    Rebuild-Server
     Write-Host "Serwer działa w wersji $($result.Version)." -ForegroundColor Green
 }
 
@@ -284,12 +368,17 @@ function Get-PlayerbotCount {
 }
 
 function Set-PlayerbotCount {
-    # Writes PLAYERBOT_AUTOSPAWN_COUNT to .env. The game core reads it once on
-    # startup and spawns at most this many of the *seeded* bots, so the effective
-    # ceiling is the number of seeded playerbots (350 in the canonical seed).
+    # Writes PLAYERBOT_AUTOSPAWN_COUNT to .env. The core reads it once at startup
+    # and spawns at most this many of the bots it will accept, which is a
+    # different and usually smaller number: only characters the canonical seed
+    # created are in the registry. A world carrying bots from an older bootstrap
+    # keeps them, but they never spawn, so asking for more than the registry
+    # holds simply gets the registry. The core says both numbers at startup:
+    #   PLAYERBOT_AUTH: loaded <n> registered bot identities
+    #   PLAYERBOT: autospawn requested=<x> registered_started=<n>
     param([Parameter(Mandatory = $true)][int]$Count)
     if ($Count -lt 0) { $Count = 0 }
-    if ($Count -gt 1000) { $Count = 1000 }
+    if ($Count -gt 1500) { $Count = 1500 }
     $envPath = Get-PlayerbotEnvPath
     if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
         throw "Brak pliku .env: $envPath. Uruchom najpierw serwer (GRAJ), aby go utworzyć."
@@ -309,7 +398,7 @@ function Set-PlayerbotCount {
 
 function Set-BotCountAction {
     $current = Get-PlayerbotCount
-    Write-Host "Aktualnie gra: $current botów (limit = liczba zaseedowanych botów, w kanonicznej paczce 350)." -ForegroundColor Gray
+    Write-Host "Aktualnie gra: $current botów (efektywny limit = liczba botów w Twoim świecie; kanoniczna paczka ma 350)." -ForegroundColor Gray
 
     # -BotCount passed (from the GUI or scripting) is non-interactive: never call
     # Read-Host, because the GUI runs this in a hidden, non-interactive console.
@@ -328,7 +417,7 @@ function Set-BotCountAction {
         return
     }
 
-    $answer = Read-Host 'Ilu botów ma grać (0-350)'
+    $answer = Read-Host 'Ilu botów ma grać (0-1500)'
     if ($answer -notmatch '^\d+$') { Write-Host 'Anulowano: to nie jest liczba.' -ForegroundColor Yellow; return }
     $applied = Set-PlayerbotCount -Count ([int]$answer)
     Write-Host "Zapisano: $applied grających botów." -ForegroundColor Green
@@ -362,12 +451,24 @@ function Get-CurrentInstallTargetVolume {
 }
 
 function Import-DatabaseAction {
+    if (-not (Test-M2DockerRunning)) {
+        Write-Host 'Silnik Dockera jest zatrzymany, więc nie widać żadnych baz.' -ForegroundColor Yellow
+        Write-Host 'Uruchom Docker (akcja StartDocker lub przycisk „URUCHOM DOCKER") i spróbuj ponownie.' -ForegroundColor Yellow
+        Write-Host 'Żadne dane nie zginęły — bazy są na dysku, tylko Docker ich teraz nie pokazuje.' -ForegroundColor Gray
+        return
+    }
     $target = Get-CurrentInstallTargetVolume
     if (-not $target) {
         Write-Host 'Nie można ustalić bazy tej instalacji. Uruchom najpierw serwer (GRAJ) choć raz, aby utworzyć tożsamość i wolumen.' -ForegroundColor Yellow
         return
     }
     Write-Host "Baza docelowa (ta instalacja): $target" -ForegroundColor Gray
+    if (-not (Test-M2VolumeInitialized -Volume $target)) {
+        Write-Host 'Ta instalacja nie ma jeszcze gotowej bazy danych.' -ForegroundColor Yellow
+        Write-Host 'Najpierw kliknij GRAJ i pozwól serwerowi wystartować choć raz (utworzy bazę ze schematami gry),' -ForegroundColor Yellow
+        Write-Host 'a dopiero potem importuj świat. Import na pustą bazę zostawiłby instalację bez schematów.' -ForegroundColor Yellow
+        return
+    }
     $sources = @(Get-M2DbDataVolumes | Where-Object { $_.Name -ne $target })
     if ($sources.Count -eq 0) {
         Write-Host 'Nie znaleziono innej bazy Docker do importu na tym komputerze.' -ForegroundColor Yellow
@@ -381,7 +482,11 @@ function Import-DatabaseAction {
     }
     else {
         Write-Host 'Dostępne bazy do importu:' -ForegroundColor Cyan
-        for ($i = 0; $i -lt $sources.Count; $i++) { Write-Host ("  [{0}] {1}" -f ($i + 1), $sources[$i].Project) }
+        for ($i = 0; $i -lt $sources.Count; $i++) {
+            $label = $sources[$i].Project
+            if ($sources[$i].CreatedAt) { $label = '{0}   (utworzona {1:yyyy-MM-dd HH:mm})' -f $label, $sources[$i].CreatedAt }
+            Write-Host ("  [{0}] {1}" -f ($i + 1), $label)
+        }
         $pick = Read-Host 'Wybierz numer źródła (Enter = anuluj)'
         if ($pick -notmatch '^\d+$') { Write-Host 'Anulowano.' -ForegroundColor Yellow; return }
         $idx = [int]$pick - 1
@@ -393,6 +498,8 @@ function Import-DatabaseAction {
     $stats = Get-M2VolumeWorldStats -Volume $chosen.Name
     if ($stats.Ok) {
         Write-Host ("Źródło: {0} postaci, najwyższy poziom {1}." -f $stats.Players, $stats.MaxLevel) -ForegroundColor Green
+        if ($stats.Created) { Write-Host ("  Baza utworzona: {0}" -f $stats.Created) -ForegroundColor Gray }
+        if ($stats.LastPlay -and $stats.LastPlay -ne '0') { Write-Host ("  Ostatnia gra: {0}" -f $stats.LastPlay) -ForegroundColor Gray }
     }
     else {
         Write-Host 'Nie udało się odczytać statystyk źródła (mimo to można spróbować importu).' -ForegroundColor Yellow
@@ -403,14 +510,69 @@ function Import-DatabaseAction {
     Write-Host "Źródło pozostaje nietknięte. Obecny świat trafi do kopii w 'backups' przed nadpisaniem." -ForegroundColor Yellow
     if (-not (Confirm-Operation "Kontynuować import z '$($chosen.Project)'?")) { Write-Host 'Anulowano.' -ForegroundColor Yellow; return }
 
+    # Read this install's game DB user/password so the import can re-apply the
+    # user and grants afterwards (guards against the migrator failing to
+    # authenticate after a swap).
+    $dbUser = 'metin2'; $dbPass = ''
+    $importEnvPath = Join-Path $serverRoot 'linux-port\docker\.env'
+    if (Test-Path -LiteralPath $importEnvPath -PathType Leaf) {
+        $importEnvText = [IO.File]::ReadAllText($importEnvPath)
+        $userMatch = [Regex]::Match($importEnvText, '(?m)^M2_DB_USER=(.+?)\s*$')
+        if ($userMatch.Success) { $dbUser = $userMatch.Groups[1].Value }
+        $passMatch = [Regex]::Match($importEnvText, '(?m)^M2_DB_PASSWORD=(.+?)\s*$')
+        if ($passMatch.Success) { $dbPass = $passMatch.Groups[1].Value }
+    }
+
     Write-Host 'Zatrzymuję serwer, aby zwolnić bazę docelową...' -ForegroundColor Cyan
     Stop-Server
 
     Write-Host 'Importuję bazę (to może potrwać chwilę)...' -ForegroundColor Cyan
-    $result = Invoke-M2DatabaseImport -SourceVolume $chosen.Name -TargetVolume $target -BackupRoot (Join-Path $serverRoot 'backups')
+    $result = Invoke-M2DatabaseImport -SourceVolume $chosen.Name -TargetVolume $target -BackupRoot (Join-Path $serverRoot 'backups') -DbUser $dbUser -DbPassword $dbPass
     Write-Host ("Gotowe. Zaimportowany świat: {0} postaci, najwyższy poziom {1}." -f $result.Players, $result.MaxLevel) -ForegroundColor Green
     Write-Host ("Kopia poprzedniego świata: {0}" -f $result.Backup) -ForegroundColor Gray
     Write-Host 'Kliknij GRAJ (lub akcja Start), aby uruchomić serwer z zaimportowanym światem.' -ForegroundColor Green
+}
+
+function Get-InstallDbCredentials {
+    $result = [pscustomobject]@{ User = 'metin2'; Password = '' }
+    $envPath = Join-Path $serverRoot 'linux-port\docker\.env'
+    if (Test-Path -LiteralPath $envPath -PathType Leaf) {
+        $text = [IO.File]::ReadAllText($envPath)
+        $userMatch = [Regex]::Match($text, '(?m)^M2_DB_USER=(.+?)\s*$')
+        if ($userMatch.Success) { $result.User = $userMatch.Groups[1].Value }
+        $passMatch = [Regex]::Match($text, '(?m)^M2_DB_PASSWORD=(.+?)\s*$')
+        if ($passMatch.Success) { $result.Password = $passMatch.Groups[1].Value }
+    }
+    return $result
+}
+
+function Repair-DatabaseAction {
+    if (-not (Test-M2DockerRunning)) {
+        Write-Host 'Silnik Dockera jest zatrzymany, więc nie widać żadnych baz.' -ForegroundColor Yellow
+        Write-Host 'Uruchom Docker (akcja StartDocker lub przycisk „URUCHOM DOCKER") i spróbuj ponownie.' -ForegroundColor Yellow
+        Write-Host 'Żadne dane nie zginęły — bazy są na dysku, tylko Docker ich teraz nie pokazuje.' -ForegroundColor Gray
+        return
+    }
+    $target = Get-CurrentInstallTargetVolume
+    if (-not $target) {
+        Write-Host 'Nie można ustalić bazy tej instalacji. Uruchom najpierw serwer (GRAJ) choć raz.' -ForegroundColor Yellow
+        return
+    }
+    $creds = Get-InstallDbCredentials
+    if (-not $creds.Password) {
+        Write-Host 'Brak M2_DB_PASSWORD w linux-port\docker\.env — nie mam czego przywrócić.' -ForegroundColor Red
+        return
+    }
+    Write-Host "Naprawiam konto techniczne bazy dla instalacji: $target" -ForegroundColor Cyan
+    Write-Host 'To odtwarza wyłącznie użytkownika i uprawnienia bazy. Postacie, przedmioty i boty pozostają bez zmian.' -ForegroundColor Gray
+    Write-Host 'Zatrzymuję serwer, aby zwolnić bazę...' -ForegroundColor Cyan
+    Stop-Server
+    if (Repair-M2GameDbUser -Volume $target -DbUser $creds.User -DbPassword $creds.Password) {
+        Write-Host 'Gotowe. Konto i uprawnienia bazy odtworzone. Kliknij GRAJ, aby uruchomić serwer.' -ForegroundColor Green
+    }
+    else {
+        Write-Host 'Naprawa nie powiodła się. Zbierz logi (ZIP) i zgłoś problem.' -ForegroundColor Red
+    }
 }
 
 function Create-Logs {
@@ -428,16 +590,18 @@ function Create-Logs {
 
 function Send-Logs {
     $config = Get-Config
-    if (-not $config.supportUploadUrl) {
-        throw 'Nie ustawiono adresu pomocy. Utwórz ZIP akcją Logs i wyślij go ręcznie na Discordzie.'
+    $support = Get-M2SupportSettings -Config $config
+    if (-not $support.UploadUrl) {
+        throw "Kanał zgłoszeń jest teraz niedostępny. Utwórz ZIP akcją Logs i wyślij go ręcznie na Discordzie: $($support.ContactUrl)"
     }
     $bundle = Create-Logs
     Write-Host 'Paczka zawiera logi Dockera i konfigurację z usuniętymi hasłami.' -ForegroundColor Yellow
-    if (-not (Confirm-Operation "Wysłać $bundle do $($config.supportUploadUrl)?")) {
+    $target = if ($support.Source -eq 'manifest') { 'kanału zgłoszeń autora' } else { $support.UploadUrl }
+    if (-not (Confirm-Operation "Wysłać $bundle do $target?")) {
         Write-Host 'Nie wysłano. ZIP pozostał na dysku.' -ForegroundColor Yellow
         return
     }
-    $response = Send-M2SupportBundle -BundlePath $bundle -UploadUrl $config.supportUploadUrl
+    $response = Send-M2SupportBundle -BundlePath $bundle -UploadUrl $support.UploadUrl
     if ($response) { Write-Host "Wysłano. Odpowiedź serwera: $response" -ForegroundColor Green }
     else { Write-Host 'Wysłano paczkę diagnostyczną.' -ForegroundColor Green }
 }
@@ -476,6 +640,7 @@ function Invoke-Action {
         'Configure' { Configure-Launcher }
         'SetBots' { Set-BotCountAction }
         'ImportDb' { Import-DatabaseAction }
+        'RepairDb' { Repair-DatabaseAction }
         default { throw "Nieznana akcja: $SelectedAction" }
     }
 }
@@ -495,8 +660,9 @@ function Show-Menu {
         Write-Host ' 10. Utwórz paczkę diagnostyczną ZIP'
         Write-Host ' 11. Utwórz i wyślij logi (po potwierdzeniu)'
         Write-Host ' 12. Konfiguracja launchera'
-        Write-Host ' 13. Ustaw liczbę grających botów (0-350)'
+        Write-Host ' 13. Ustaw liczbę grających botów (0-1500)'
         Write-Host ' 14. Importuj bazę z innej instalacji (wyższe postacie)'
+        Write-Host ' 15. Napraw dostęp do bazy (gdy migrate/serwer nie startuje)'
         Write-Host '  0. Wyjście'
         Write-Host ''
         $choice = Read-Host 'Wybierz opcję'
@@ -506,6 +672,7 @@ function Show-Menu {
             '8' { 'UpdateAll' } '9' { 'Diagnose' } '10' { 'Logs' } '11' { 'SendLogs' } '12' { 'Configure' }
             '13' { 'SetBots' }
             '14' { 'ImportDb' }
+            '15' { 'RepairDb' }
             '0' { return }
             default { '' }
         }

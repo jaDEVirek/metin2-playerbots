@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 $ErrorActionPreference = 'Stop'
@@ -59,7 +59,7 @@ function New-LegacyDirectory {
     New-Item -ItemType Directory -Path $Directory -Force | Out-Null
     [IO.File]::WriteAllText(
         (Join-Path $Directory '.env'),
-        "MARIADB_ROOT_PASSWORD=$Secret`r`nM2_DB_PASSWORD=game-$Secret`r`nM2_COMPOSE_PROJECT_NAME=`r`n",
+        "MARIADB_ROOT_PASSWORD=$Secret`r`nM2_DB_PASSWORD=game-$Secret`r`nM2_BRAND=`r`nM2_CLIENT_URL=`r`nM2_COMPOSE_PROJECT_NAME=`r`n",
         [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText(
         (Join-Path $Directory 'docker-compose.yml'),
