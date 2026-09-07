@@ -346,6 +346,17 @@ RUN cat /tmp/mob_drop_item.m3.append.txt >> \
         /opt/metin2/share/locale/english/mob_drop_item.txt \
  && rm -f /tmp/mob_drop_item.m3.append.txt
 
+# The Moonlight Treasure Chest's contents. The reader keeps the first group it
+# sees for a vnum, so appending is not enough: the stock 50011 block is cut
+# out and ours goes on the end. Blocks are Group..} and the awk keeps every
+# one that does not name Vnum 50011.
+COPY special_item_group.moonlight.txt /tmp/special_item_group.moonlight.txt
+RUN f=/opt/metin2/share/locale/english/special_item_group.txt \
+ && awk 'BEGIN{keep=1} /^Group/{blk=""; keep=1} {blk=blk $0 "\n"} /Vnum[ \t]+50011/{keep=0} /^}/{ if (keep) printf "%s", blk; blk=""; keep=1 }' "$f" > "$f.new" \
+ && cat /tmp/special_item_group.moonlight.txt >> "$f.new" \
+ && mv "$f.new" "$f" \
+ && rm -f /tmp/special_item_group.moonlight.txt
+
 # The admin panel's in-game helper, compiled in stage 2b. A pure addition on
 # top of the line above: new files under quest/object/, the quest source next
 # to the 300 that ship with the pack, and two list files (quest_functions,

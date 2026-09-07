@@ -96,14 +96,20 @@ P2P_ALLOW_LINE="P2P_ALLOW_IP: 127.0.0.1 ${CONTAINER_IP}"
 # it look like a protocol bug rather than a load problem.  The shipped 3-core
 # split (~320/300/240 MB resident) is the tested layout.
 # -----------------------------------------------------------------------------
-# Keep the complete Chunjo progression path (M1 -> M2 -> easy Monkey Dungeon)
-# on one core. Server-side playerbots have no real client process that could
-# reconnect after a cross-core HEADER_GC_WARP, so splitting map 23 from maps 21
-# and 25 would strand them at the portal. The total map count per core stays
-# balanced (14/14/13).
-MAPS_first="1 4 5 6 3 43 112 107 67 68 72 208 302 304"
-MAPS_game1="21 23 24 25 26 108 61 63 69 70 73 216 217 303"
-MAPS_game2="41 44 45 46 109 62 64 65 66 71 104 301 351"
+# Keep the complete Chunjo progression path on one core. Server-side playerbots
+# have no real client process that could reconnect after a cross-core
+# HEADER_GC_WARP, so splitting any map they travel between from the rest would
+# strand them at the portal. That path is now M1 -> M2 -> easy Monkey Dungeon
+# -> Orc Valley (64) -> Yongbi Desert (63), which is why 64 sits here and not
+# with the other neutral maps; 303 moved the other way so the per-core map
+# count stays balanced (14/14/13).
+# 104 (the Spider Dungeon) moved from the first core to game1, where the bots
+# run: a bot cannot walk onto a map its own core does not host. Mount Sohan is
+# 61 and was on game1 all along; 43 is the second Jinno village and belongs
+# with the other Jinno maps.
+MAPS_first="1 4 5 6 3 112 107 67 68 72 208 302 304"
+MAPS_game1="21 23 24 25 26 108 61 63 64 69 70 73 216 217 104"
+MAPS_game2="41 43 44 45 46 109 62 65 66 71 301 303 351"
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -258,6 +264,8 @@ PK_PROTECT_LEVEL: 15
 MALL_URL: ${M2_MALL_URL}
 TRAFFIC_PROFILE:
 TEST_SERVER: ${M2_TEST_SERVER}
+MOONLIGHT_CHEST_PERMILLE: ${M2_MOONLIGHT_CHEST_PERMILLE:-10}
+MOONLIGHT_CHEST_STONE_PERMILLE: ${M2_MOONLIGHT_CHEST_STONE_PERMILLE:-300}
 MAX_LEVEL: ${M2_MAX_LEVEL}
 ${BIND_LINE}
 ${P2P_ALLOW_LINE}
