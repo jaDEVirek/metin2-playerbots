@@ -14,47 +14,6 @@
 
 namespace
 {
-	// A hub is only worth walking to if the navigation can actually get there.
-	//
-	// Orc Valley taught this. Its entrance opens onto one island of a river
-	// delta, and while the navigation refused water - which is to say, refused
-	// the bridges - all twelve of its hand-picked hubs sat on the far side of a
-	// crossing. A bot planned an impossible route, gave up after three tries,
-	// advanced to the next hub and planned another impossible route, twelve
-	// times, then round again: twelve bots on that one map produced 7812 of the
-	// 8259 "unreachable" lines in a session and never reached a hunting ground.
-	//
-	// That map is whole again, but the check stays, and not only as a memorial:
-	// the Monkey Dungeon really is chambered, with 7.5% of its walkable ground
-	// reachable from where a bot comes in, and any map may be built that way.
-	//
-	// Asking first costs a component lookup; the alternative costs a full A*
-	// that is guaranteed to fail.
-	size_t PickReachablePlayerBotHub(LPCHARACTER ch, const TPlayerBotMapPoint* hubs,
-			size_t hubCount, size_t firstIndex, bool& bFoundOut)
-	{
-		bFoundOut = false;
-		if (!ch || !hubs || hubCount == 0)
-			return firstIndex;
-
-		CPlayerBotNavigation& navigation =
-				CPlayerBotNavigation::instance(ch->GetMapIndex());
-		if (!navigation.Init(ch->GetMapIndex()))
-			return firstIndex;
-
-		for (size_t step = 0; step < hubCount; ++step)
-		{
-			const size_t index = (firstIndex + step) % hubCount;
-			if (navigation.CanReach(ch->GetX(), ch->GetY(),
-					hubs[index].x, hubs[index].y))
-			{
-				bFoundOut = true;
-				return index;
-			}
-		}
-		return firstIndex;
-	}
-
 	// The hub for this bot, from a banded table, by what the population has
 	// seen there. Level rules the band; a party hub needs a party of the
 	// challenge size with this bot leading it; among what is left the richest
@@ -86,15 +45,17 @@ namespace
 	// with his position is kept for PLAYERBOT_RAID_BOSS_CHECK_INTERVAL: a
 	// hundred bots choosing hubs in the same minute ask once.
 	bool IsPlayerBotBossAlive(long mapIndex, long x, long y, WORD wRace, DWORD dwNow,
-			long* pBossX, long* pBossY)
+			long* pBossX, long* pBossY, char* pName = NULL, size_t nameSize = 0)
 	{
-		struct TBossAnswer { DWORD dwStamp; bool bAlive; long lX; long lY; };
+		struct TBossAnswer { DWORD dwStamp; bool bAlive; long lX; long lY; char szName[32]; };
 		static std::map<WORD, TBossAnswer> s_mapAnswers;
 		std::map<WORD, TBossAnswer>::iterator it = s_mapAnswers.find(wRace);
 		if (it != s_mapAnswers.end() && dwNow - it->second.dwStamp < PLAYERBOT_RAID_BOSS_CHECK_INTERVAL)
 		{
 			if (pBossX) *pBossX = it->second.lX;
 			if (pBossY) *pBossY = it->second.lY;
+			if (pName && nameSize > 0)
+				strlcpy(pName, it->second.szName, nameSize);
 			return it->second.bAlive;
 		}
 		LPCHARACTER boss = NULL;
@@ -121,9 +82,85 @@ namespace
 		answer.bAlive = bAlive;
 		answer.lX = boss ? boss->GetX() : x;
 		answer.lY = boss ? boss->GetY() : y;
+		strlcpy(answer.szName, boss ? boss->GetName() : "Boss", sizeof(answer.szName));
 		if (pBossX) *pBossX = answer.lX;
 		if (pBossY) *pBossY = answer.lY;
+		if (pName && nameSize > 0)
+			strlcpy(pName, answer.szName, nameSize);
 		return bAlive;
+	}
+
+	// A boss is news, and news travels through the guild of whoever saw him.
+	//
+	// Before this every bot of the band walked to a boss hub the moment the
+	// sector said he was standing - a raid worth a hundred thousand outscored
+	// every hunting ground by two orders of magnitude - and the ones that
+	// arrived after he was down stood about at the table point waiting for a
+	// monster that was not there. Now the first bot to find him standing calls
+	// its own guild, and it is that guild's business until there are enough
+	// bodies on him; everybody else goes on hunting.
+	struct TPlayerBotRaidCall
+	{
+		DWORD dwGuild;
+		DWORD dwStamp;
+		TPlayerBotRaidCall() : dwGuild(0), dwStamp(0) {}
+	};
+	std::map<WORD, TPlayerBotRaidCall> s_mapPlayerBotRaidCalls;
+
+	void NotePlayerBotRaidSighting(LPCHARACTER ch, WORD wRace, const char* bossName,
+			DWORD dwNow)
+	{
+		if (!ch || !ch->GetGuild())
+			return;
+		TPlayerBotRaidCall& call = s_mapPlayerBotRaidCalls[wRace];
+		if (call.dwStamp != 0 && dwNow - call.dwStamp < PLAYERBOT_RAID_CALL_TIME)
+			return;
+		call.dwGuild = ch->GetGuild()->GetID();
+		call.dwStamp = dwNow;
+		char msg[128];
+		snprintf(msg, sizeof(msg), "%s stoi! Zbieramy sie na niego.",
+				bossName && *bossName ? bossName : "Boss");
+		ch->GetGuild()->Chat(msg);
+		sys_log(0, "PLAYERBOT_RAID: called pid=%u name=%s guild=%u race=%u boss=%s",
+				ch->GetPlayerID(), ch->GetName(), (unsigned int)call.dwGuild,
+				(unsigned int)wRace, bossName ? bossName : "?");
+	}
+
+	// Who has already set off. Counting the bots standing on the hub instead
+	// answers "nobody yet" to every one of a hundred bots deciding in the same
+	// second, because none of them has arrived - which is how a throttle of
+	// twelve let a hundred and forty-five head for one monster.
+	std::map<WORD, std::map<DWORD, DWORD> > s_mapPlayerBotRaidRoster;
+
+	int CountPlayerBotRaiders(WORD wRace, DWORD dwNow)
+	{
+		std::map<DWORD, DWORD>& roster = s_mapPlayerBotRaidRoster[wRace];
+		std::map<DWORD, DWORD>::iterator it = roster.begin();
+		while (it != roster.end())
+		{
+			if (dwNow - it->second > PLAYERBOT_RAID_CALL_TIME)
+				roster.erase(it++);
+			else
+				++it;
+		}
+		return (int)roster.size();
+	}
+
+	void NotePlayerBotRaider(WORD wRace, DWORD pid, DWORD dwNow)
+	{
+		s_mapPlayerBotRaidRoster[wRace][pid] = dwNow;
+	}
+
+	bool IsPlayerBotRaidCalled(LPCHARACTER ch, WORD wRace, DWORD dwNow)
+	{
+		if (!ch || !ch->GetGuild())
+			return false;
+		std::map<WORD, TPlayerBotRaidCall>::const_iterator it =
+				s_mapPlayerBotRaidCalls.find(wRace);
+		return it != s_mapPlayerBotRaidCalls.end() &&
+				it->second.dwStamp != 0 &&
+				dwNow - it->second.dwStamp < PLAYERBOT_RAID_CALL_TIME &&
+				it->second.dwGuild == ch->GetGuild()->GetID();
 	}
 
 	bool ChoosePlayerBotHuntingHub(LPCHARACTER ch, const TPlayerBotHuntingHub* hubs,
@@ -167,8 +204,11 @@ namespace
 			if (hub.wBossRace != 0)
 			{
 				long bossX = hub.x, bossY = hub.y;
-				if (!IsPlayerBotBossAlive(ch->GetMapIndex(), hub.x, hub.y, hub.wBossRace, dwNow, &bossX, &bossY))
+				char bossName[32] = "";
+				if (!IsPlayerBotBossAlive(ch->GetMapIndex(), hub.x, hub.y, hub.wBossRace,
+						dwNow, &bossX, &bossY, bossName, sizeof(bossName)))
 					continue;
+				NotePlayerBotRaidSighting(ch, hub.wBossRace, bossName, dwNow);
 				// Where the boss actually stands is walkable by definition; the
 				// question is whether it is this bot's terrain.
 				const DWORD bossGround = navigation.GetComponentAtWorld(bossX, bossY, 12);
@@ -182,6 +222,22 @@ namespace
 					continue;
 				}
 			}
+			// A hub is only worth walking to if the navigation can get there.
+			// Orc Valley taught this: its entrance opens onto one island of a
+			// river delta, and while the navigation refused water - which is to
+			// say, refused the bridges - all twelve of its hand-picked hubs sat
+			// on the far side of a crossing. A bot planned an impossible route,
+			// gave up after three tries, advanced to the next hub and planned
+			// another impossible route, twelve times, then round again: twelve
+			// bots on that one map produced 7812 of the 8259 "unreachable" lines
+			// in a session and never reached a hunting ground. Asking costs a
+			// component lookup; the alternative costs an A* guaranteed to fail.
+			//
+			// It is not the answer everywhere. A map may be built in chambers
+			// the terrain does not join at all - the Monkey Dungeon is ten of
+			// them - and there this question has only ever one answer, "the room
+			// you are already in". That map is walked by its own portal graph
+			// instead; see the chamber table in playerbot_movement.h.
 			else if (!navigation.CanReach(ch->GetX(), ch->GetY(), hub.x, hub.y))
 				continue;
 			DWORD samples = 0;
@@ -210,7 +266,22 @@ namespace
 				worth += worth * PLAYERBOT_SPOT_MATERIAL_BONUS_PERCENT / 100;
 			// The bot's share of what is there: the monsters in reach divided among
 			// the bots already in reach of them, plus this one.
-			int score = hub.wBossRace != 0 ? PLAYERBOT_RAID_WORTH : worth / (1 + others);
+			int score;
+			if (hub.wBossRace != 0)
+			{
+				// A raid is twelve, not a province. The guild that was called
+				// may fill it; anybody else takes only the first half, so a
+				// boss nobody called still gets killed and the rest of the band
+				// carries on hunting instead of queueing on a snowfield.
+				const int raiders = CountPlayerBotRaiders(hub.wBossRace, dwNow);
+				const int room = IsPlayerBotRaidCalled(ch, hub.wBossRace, dwNow)
+						? PLAYERBOT_RAID_CROWD : PLAYERBOT_RAID_CROWD / 2;
+				if (raiders >= room)
+					continue;
+				score = PLAYERBOT_RAID_WORTH;
+			}
+			else
+				score = worth / (1 + others);
 			// Nearer is better, all else equal: a camp across the delta costs a
 			// route of two hundred milliseconds to plan and three minutes to walk.
 			const int distance = DISTANCE_APPROX(ch->GetX() - hub.x, ch->GetY() - hub.y);
@@ -514,6 +585,28 @@ namespace
 		else if (ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2)
 		{
 			const DWORD pid = ch->GetPlayerID();
+			// The Bestial Captain, while he stands: anybody of the band goes,
+			// the way the valley goes for the Orc Chief. Nine sectors round his
+			// point are asked, once every thirty seconds for everybody.
+			if (ch->GetLevel() >= PLAYERBOT_M2_CAPTAIN_MIN_LEVEL)
+			{
+				long bossX = 0, bossY = 0;
+				if (IsPlayerBotBossAlive(ch->GetMapIndex(), PLAYERBOT_M2_CAPTAIN_X, PLAYERBOT_M2_CAPTAIN_Y,
+						591, dwNow, &bossX, &bossY) &&
+						DISTANCE_APPROX(ch->GetX() - bossX, ch->GetY() - bossY) > 600)
+				{
+					PlayerBotLogThrottled("raid_captain", dwNow,
+							"PLAYERBOT_RAID: heading for boss race=591 pid=%u name=%s level=%u map=%ld party=%u guild=%u",
+							ch->GetPlayerID(), ch->GetName(), ch->GetLevel(), ch->GetMapIndex(),
+							ch->GetParty() ? (unsigned int)ch->GetParty()->GetMemberCount() : 0U,
+							ch->GetGuild() ? (unsigned int)ch->GetGuild()->GetID() : 0U);
+					long offsetX = 0, offsetY = 0;
+					GetPlayerBotStableOffset(pid, 0x43415054U, 100, 350, offsetX, offsetY);
+					state.dwNextWanderTime = dwNow + 1500;
+					MovePlayerBot(ch, bossX + offsetX, bossY + offsetY, dwNow, 32, true);
+					return;
+				}
+			}
 			if (ShouldPlayerBotHuntM2Bestials(ch))
 			{
 				SetPlayerBotGoal(ch, state, BOT_GOAL_GET_EQUIPMENT, dwNow);
@@ -644,7 +737,12 @@ namespace
 				{ 432000, 176000, PLAYERBOT_SOHAN_ICE_MIN_LEVEL, PLAYERBOT_SOHAN_MAX_LEVEL, false },
 				{ 432000, 220800, PLAYERBOT_SOHAN_ICE_MIN_LEVEL, PLAYERBOT_SOHAN_MAX_LEVEL, false },
 				{ 489600, 227200, PLAYERBOT_SOHAN_ICE_MIN_LEVEL, PLAYERBOT_SOHAN_MAX_LEVEL, false },
-				{ 387200, 240000, PLAYERBOT_SOHAN_ICE_MIN_LEVEL, PLAYERBOT_SOHAN_MAX_LEVEL, false }
+				{ 387200, 240000, PLAYERBOT_SOHAN_ICE_MIN_LEVEL, PLAYERBOT_SOHAN_MAX_LEVEL, false },
+				// Nine Tails (1901, level 72, a hundred and sixty-six thousand
+				// health, two ice golems and a yeti beside him) from boss.txt cell
+				// (749,629) with a spread of 150x200 cells, back every two hours:
+				// a party's raid, like the Queen's.
+				{ PLAYERBOT_SOHAN_NINE_TAILS_X, PLAYERBOT_SOHAN_NINE_TAILS_Y, PLAYERBOT_SOHAN_MIN_LEVEL, 255, true, 1901 }
 			};
 			const TPlayerBotHuntingHub spiderHubs[] = {
 				{ 70000, 505300, PLAYERBOT_SPIDER_MIN_LEVEL, 255, false }, { 80400, 519800, PLAYERBOT_SPIDER_MIN_LEVEL, 255, false },
@@ -656,6 +754,32 @@ namespace
 				// A party's work and nobody else's: two hundred thousand health at
 				// level sixty.
 				{ 89700, 525100, PLAYERBOT_SPIDER_MIN_LEVEL, 255, true, 2091 }
+			};
+			// The Hwang Temple, from the density of its own regen.txt rather than
+			// from the map: every spawn point binned into 6400-unit cells and the
+			// richest taken, which is the same unit the population's own memory
+			// scores a place by. It falls into two bands, which is how the map is
+			// built - the Elite Esoterics of 52-55 in the west where the temple
+			// is entered, the Tree Turtle Soldier and the Bogey of 55-58 in the
+			// east. Every one of these was then checked against milgyo's
+			// server_attr for standing room; two of the density centres came out
+			// inside a wall and a river and were moved to the nearest free cell,
+			// which is what the odd numbers are.
+			//
+			// No boss hub. Its two boss points roll among three races - the
+			// Esoteric Summoner at 54, the Frog General at 61 and the Yellow
+			// Tiger Spectre at 75 - and a boss hub names one race and asks the
+			// sector whether that one is standing.
+			const TPlayerBotHuntingHub hwangHubs[] = {
+				{ 553600, 118400, PLAYERBOT_HWANG_MIN_LEVEL, 255, false, 0 },
+				{ 553600,  92800, PLAYERBOT_HWANG_MIN_LEVEL, 255, false, 0 },
+				{ 553600,  67200, PLAYERBOT_HWANG_MIN_LEVEL, 255, false, 0 },
+				{ 585600,  66950, PLAYERBOT_HWANG_MIN_LEVEL, 255, false, 0 },
+				{ 630500, 137600, PLAYERBOT_HWANG_EAST_MIN_LEVEL, 255, false, 0 },
+				{ 630400, 118400, PLAYERBOT_HWANG_EAST_MIN_LEVEL, 255, false, 0 },
+				{ 624000, 112000, PLAYERBOT_HWANG_EAST_MIN_LEVEL, 255, false, 0 },
+				{ 630400,  86400, PLAYERBOT_HWANG_EAST_MIN_LEVEL, 255, false, 0 },
+				{ 604800,  67200, PLAYERBOT_HWANG_EAST_MIN_LEVEL, 255, false, 0 }
 			};
 			const bool inDesert = ch->GetMapIndex() == PLAYERBOT_MAP_DESERT;
 			const TPlayerBotHuntingHub* hubs = orcValleyHubs;
@@ -674,6 +798,11 @@ namespace
 			{
 				hubs = spiderHubs;
 				hubCount = sizeof(spiderHubs) / sizeof(spiderHubs[0]);
+			}
+			else if (ch->GetMapIndex() == PLAYERBOT_MAP_HWANG)
+			{
+				hubs = hwangHubs;
+				hubCount = sizeof(hwangHubs) / sizeof(hwangHubs[0]);
 			}
 			const DWORD pid = ch->GetPlayerID();
 			// A stone anybody has seen on this map comes before any hub while the
@@ -703,8 +832,28 @@ namespace
 			// on a stone hunt, which is done by covering ground.
 			const DWORD hubStick = IsPlayerBotMetinHunting(state, dwNow)
 					? PLAYERBOT_METIN_EXPEDITION_HUB_STICK : PLAYERBOT_HUB_STICK_TIME;
+			// A hub is kept for a few minutes so a bot does not cross the map
+			// twice for a slightly better camp - but a boss hub is only a place
+			// while the boss is standing on it. Keeping one for four minutes
+			// after he went down is what put a column of bots on an empty
+			// snowfield with nothing to fight: the stick has to ask again.
+			const bool stickIsBoss = state.wHuntingHub < hubCount &&
+					hubs[state.wHuntingHub].wBossRace != 0;
+			bool stickBossStanding = true;
+			if (stickIsBoss)
+			{
+				long bossX = 0, bossY = 0;
+				stickBossStanding = IsPlayerBotBossAlive(ch->GetMapIndex(),
+						hubs[state.wHuntingHub].x, hubs[state.wHuntingHub].y,
+						hubs[state.wHuntingHub].wBossRace, dwNow, &bossX, &bossY);
+				if (!stickBossStanding)
+					PlayerBotLogThrottled("raid_over", dwNow,
+							"PLAYERBOT_RAID: boss down, going back to work race=%u pid=%u name=%s map=%ld",
+							(unsigned int)hubs[state.wHuntingHub].wBossRace,
+							ch->GetPlayerID(), ch->GetName(), ch->GetMapIndex());
+			}
 			if (state.wHuntingHub < hubCount && state.dwHubChosenTime != 0 &&
-					dwNow - state.dwHubChosenTime < hubStick &&
+					dwNow - state.dwHubChosenTime < hubStick && stickBossStanding &&
 					ch->GetLevel() >= hubs[state.wHuntingHub].bMinLevel &&
 					ch->GetLevel() <= hubs[state.wHuntingHub].bMaxLevel)
 			{
@@ -769,11 +918,15 @@ namespace
 				state.wHuntingHub = (WORD)hubIndex;
 				state.dwHubChosenTime = dwNow;
 				if (hubs[hubIndex].wBossRace != 0)
-					sys_log(0, "PLAYERBOT_RAID: heading for boss race=%u pid=%u name=%s level=%u map=%ld party=%u guild=%u",
+				{
+					NotePlayerBotRaider(hubs[hubIndex].wBossRace, pid, dwNow);
+					sys_log(0, "PLAYERBOT_RAID: heading for boss race=%u pid=%u name=%s level=%u map=%ld party=%u guild=%u raiders=%d",
 							(unsigned int)hubs[hubIndex].wBossRace, ch->GetPlayerID(), ch->GetName(),
 							ch->GetLevel(), ch->GetMapIndex(),
 							ch->GetParty() ? (unsigned int)ch->GetParty()->GetMemberCount() : 0U,
-							ch->GetGuild() ? (unsigned int)ch->GetGuild()->GetID() : 0U);
+							ch->GetGuild() ? (unsigned int)ch->GetGuild()->GetID() : 0U,
+							CountPlayerBotRaiders(hubs[hubIndex].wBossRace, dwNow));
+				}
 				sys_log(0, "PLAYERBOT_SPOT: hub chosen pid=%u name=%s level=%u map=%ld hub=%u pos=(%ld,%ld) band=%u-%u party_hub=%d party=%u guild=%u score=%d",
 						pid, ch->GetName(), ch->GetLevel(), ch->GetMapIndex(), (unsigned int)hubIndex,
 						hubs[hubIndex].x, hubs[hubIndex].y, hubs[hubIndex].bMinLevel, hubs[hubIndex].bMaxLevel,
@@ -782,38 +935,80 @@ namespace
 						ch->GetGuild() ? ch->GetGuild()->GetID() : 0U, hubScore);
 			}
 		}
-		else if (ch->GetMapIndex() == PLAYERBOT_MAP_MONKEY_EASY)
+		else if (IsPlayerBotMonkeyMap(ch->GetMapIndex()))
 		{
-			// Rooms from metin2_map_monkey_dungeon_12/regen.txt. The navigation
-			// grid, not straight-line Goto, connects them through the maze corridors.
-			const TPlayerBotMapPoint rooms[8] = {
-				{ 852300, 454900 }, { 872600, 450800 }, { 889800, 451500 },
-				{ 861200, 478600 }, { 873100, 471400 }, { 890800, 470400 },
-				{ 860800, 496600 }, { 898600, 443100 }
-			};
+			// Chambers joined only by the GOTO doors - the table and the
+			// reasoning are in playerbot_movement.h. A bot patrols the spawn
+			// points of the chamber it is standing in, and once it has worked
+			// that chamber over it walks to the portal for the next one. Every
+			// route it plans therefore lies inside one chamber, which is the
+			// only kind of route this maze has: asking for a room across a
+			// portal is what left the whole population in the entrance corridor.
+			const long mapIndex = ch->GetMapIndex();
+			long baseX = 0, baseY = 0;
+			GetPlayerBotMonkeyBase(mapIndex, baseX, baseY);
 			const DWORD pid = ch->GetPlayerID();
-			bool bRoomReachable = false;
-			const size_t roomIndex = PickReachablePlayerBotHub(ch, rooms, 8,
-					(pid + state.uMetinHotspotIndex) % 8, bRoomReachable);
-			if (!bRoomReachable)
+			// UpdatePlayerBotMonkeyChamber answered this at the top of the tick.
+			const int chamber = state.bMonkeyChamber == 255
+					? -1 : (int)state.bMonkeyChamber;
+			if (chamber < 0)
 			{
-				// A closed door or a corridor the grid does not join. Same answer
-				// as on the frontier: hunt where you are.
+				// Between the rooms is not a place. Work the ground here rather
+				// than plan a route to somewhere that cannot be walked to.
 				targetX = ch->GetX() + number(-450, 450);
 				targetY = ch->GetY() + number(-450, 450);
 			}
 			else
 			{
-				long offsetX = 0, offsetY = 0;
-				GetPlayerBotStableOffset(pid, 0x4d4f4e4bU + (DWORD)roomIndex,
-						50, 250, offsetX, offsetY);
-				targetX = rooms[roomIndex].x + offsetX;
-				targetY = rooms[roomIndex].y + offsetY;
-				if (DISTANCE_APPROX(ch->GetX() - targetX, ch->GetY() - targetY) < 900)
+				const TPlayerBotMonkeyChamber& room = PLAYERBOT_MONKEY_CHAMBERS[chamber];
+				int exitChambers[8];
+				int exitDoors[8];
+				const int exits =
+						dwNow - state.dwMonkeyChamberTime >= PLAYERBOT_MONKEY_CHAMBER_DWELL
+						? GetPlayerBotMonkeyChamberExits(mapIndex, chamber,
+								exitChambers, exitDoors, 8)
+						: 0;
+				int chosenExit = -1;
+				for (int step = 0; step < exits && chosenExit < 0; ++step)
 				{
-					++state.uMetinHotspotIndex;
-					targetX = ch->GetX() + number(-450, 450);
-					targetY = ch->GetY() + number(-450, 450);
+					// Its own order over the doors, and never straight back the
+					// way it came unless that is the only one: a population that
+					// walks through the dungeon instead of bouncing off its
+					// first wall. uMetinHotspotIndex is in the hash because the
+					// stuck handling below advances it, so a door that cannot be
+					// reached is not chosen twice.
+					const int candidate = (int)((PlayerBotNavHash(pid ^
+							(0x4d4b4559U + (DWORD)chamber * 31U +
+							(DWORD)state.uMetinHotspotIndex)) + (DWORD)step) % (DWORD)exits);
+					if (exits > 1 && exitChambers[candidate] == (int)state.bMonkeyPrevChamber)
+						continue;
+					chosenExit = candidate;
+				}
+
+				long doorX = 0, doorY = 0;
+				if (chosenExit >= 0 && GetPlayerBotMonkeyDoorPosition(mapIndex,
+						exitDoors[chosenExit], doorX, doorY))
+				{
+					// The crossing is the walk: warp_npc_event teleports anyone
+					// within 300 units of the GOTO NPC, so the door's own cell is
+					// the destination and arriving at it is the whole move.
+					targetX = doorX;
+					targetY = doorY;
+				}
+				else
+				{
+					const int spot = state.bMonkeySpot % room.bSpotCount;
+					long offsetX = 0, offsetY = 0;
+					GetPlayerBotStableOffset(pid, 0x4d4f4e4bU + (DWORD)spot,
+							50, 250, offsetX, offsetY);
+					targetX = baseX + room.spots[spot].x * 100L + offsetX;
+					targetY = baseY + room.spots[spot].y * 100L + offsetY;
+					if (DISTANCE_APPROX(ch->GetX() - targetX, ch->GetY() - targetY) < 900)
+					{
+						++state.bMonkeySpot;
+						targetX = ch->GetX() + number(-450, 450);
+						targetY = ch->GetY() + number(-450, 450);
+					}
 				}
 			}
 		}

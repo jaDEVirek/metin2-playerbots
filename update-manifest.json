@@ -1,12 +1,12 @@
 {
   "schema": 1,
   "channel": "stable",
-  "publishedAt": "2026-09-07T08:34:00Z",
-  "statusMessage": "Aktualizacja 1.30.2. Do Lochu Pajakow V1 boty ida jak w grze: przez cala Pustynie Yongbi do bramy w prawym dolnym rogu i z powrotem, po drodze nie bijac mobow (najwyzej Metin wart poziomu). Pierwszy start po aktualizacji kompiluje gre na nowo, kilka minut dluzej.",
+  "publishedAt": "2026-09-08T16:25:00Z",
+  "statusMessage": "Aktualizacja 1.30.25. Portale wreszcie dzialaja jak portale - boty dochodza tam, gdzie portal je teleportuje, w tym do Lochow Malp i z M3. Swieza instalacja buduje sie do konca: paczka wysyla juz wszystko, czego budowa dotyka. Boty kupuja sprzet ze straganow, a na rubiezach czesciej lacza sie w druzyny z szamanem. Pierwszy start po aktualizacji kompiluje gre na nowo, kilka minut dluzej.",
   "server": {
-    "version": "1.30.2",
-    "url": "https://github.com/TieruYT/metin2-playerbots/releases/download/v1.30.2/metin2-server-update-1.30.2.zip",
-    "sha256": "0372056948B5911C0B09F2DB8A44FBDD6AD943F087731B064A6EE5FF17B74336"
+    "version": "1.30.25",
+    "url": "https://github.com/TieruYT/metin2-playerbots/releases/download/v1.30.25/metin2-server-update-1.30.25.zip",
+    "sha256": "8083858BCBFEE5859E841F729A696A5EF43617B2036390CD6605C1ACF5475ADD"
   },
   "support": {
     "contactUrl": "https://discord.gg/pt5tvnrN6",

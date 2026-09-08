@@ -203,21 +203,108 @@ namespace
 		if (!CanPlayerBotUseFishingRod(ch))
 			return false;
 		const DWORD roll = PlayerBotNavHash(ch->GetPlayerID() ^ 0x46495348U) % 100U;
-		// Twenty collectors in a hundred and two of everyone else, stretched or
-		// shrunk by the FISHING weight. At the neutral 100 the two thresholds are
-		// exactly the ones this has always used.
-		const int chance = state.bPersonality == BOT_PERSONALITY_CAREFUL_COLLECTOR ? 20 : 2;
+		// Thirty collectors in a hundred and eight of everyone else, stretched or
+		// shrunk by the FISHING weight.
+		//
+		// Raised from 20/2 because fishing is the one errand that takes a bot to
+		// Joan and keeps it there: the bank, the Fisherman who sells the bait and
+		// the market ring are all on map 21, so an angler is a customer, a
+		// passer-by and a stall in one. Joan looked deserted with nineteen of
+		// eight hundred live bots standing on its map, and half of those nineteen
+		// were the anglers.
+		const int chance = state.bPersonality == BOT_PERSONALITY_CAREFUL_COLLECTOR ? 30 : 8;
 		return PlayerBotWeightedRoll(roll, chance, PLAYERBOT_WEIGHT_FISHING);
 	}
 
-	// Anglers spread out along the shoreline rather than stacking on one tile.
-	// The band is walked along Y because that is the way this stretch of bank
-	// runs; every resulting point is inside the verified standable rectangle.
-	void GetPlayerBotFishingStand(DWORD playerID, long& standX, long& standY)
+	// Which angler stands where. A stand is claimed for the session and released
+	// with it, because a hash cannot promise what the Discord asked for: fifty
+	// anglers drawing from fifty slots collide by the birthday problem long
+	// before they fill them, and what that looks like in game is a heap.
+	//
+	// The engine constrains none of this. CHARACTER::fishing() tests only the
+	// cell the angler is standing on; it computes a point four hundred units in
+	// front of the character and then never reads it. So the bank is chosen to
+	// look right - standable ground with the river in front - and the spacing is
+	// a metre because that is what was asked for.
+	struct TPlayerBotFishingStand
 	{
-		const DWORD hash = PlayerBotNavHash(playerID ^ 0x42414e4bU);
-		standX = PLAYERBOT_FISHING_BANK_X + (long)(hash % 5U) * 50;
-		standY = PLAYERBOT_FISHING_BANK_Y + (long)((hash / 5U) % 10U) * 50;
+		DWORD dwPid;
+		DWORD dwTouched;
+	};
+	std::map<int, TPlayerBotFishingStand> s_mapPlayerBotFishingStands;
+
+	void ReleasePlayerBotFishingStand(DWORD playerID)
+	{
+		for (std::map<int, TPlayerBotFishingStand>::iterator it =
+				s_mapPlayerBotFishingStands.begin();
+				it != s_mapPlayerBotFishingStands.end(); ++it)
+		{
+			if (it->second.dwPid == playerID)
+			{
+				s_mapPlayerBotFishingStands.erase(it);
+				return;
+			}
+		}
+	}
+
+	void GetPlayerBotFishingStand(DWORD playerID, DWORD dwNow, long& standX, long& standY)
+	{
+		const int slots = (int)PLAYERBOT_FISHING_STAND_COUNT;
+		int mine = -1;
+		for (std::map<int, TPlayerBotFishingStand>::iterator it =
+				s_mapPlayerBotFishingStands.begin();
+				it != s_mapPlayerBotFishingStands.end(); ++it)
+		{
+			if (it->second.dwPid == playerID)
+			{
+				mine = it->first;
+				it->second.dwTouched = dwNow;
+				break;
+			}
+		}
+		if (mine < 0)
+		{
+			// From its own place in the row, then along it: the same bot comes
+			// back to the same stand session after session while the bank is
+			// empty, and takes the next free one when it is not.
+			const int start = (int)(PlayerBotNavHash(playerID ^ 0x42414e4bU) % (DWORD)slots);
+			for (int step = 0; step < slots && mine < 0; ++step)
+			{
+				const int slot = (start + step) % slots;
+				std::map<int, TPlayerBotFishingStand>::const_iterator it =
+						s_mapPlayerBotFishingStands.find(slot);
+				if (it == s_mapPlayerBotFishingStands.end() ||
+						dwNow - it->second.dwTouched >= PLAYERBOT_FISHING_STAND_CLAIM)
+					mine = slot;
+			}
+			// More anglers than stands one day: share a stand rather than refuse
+			// to fish.
+			if (mine < 0)
+				mine = start;
+			TPlayerBotFishingStand& claim = s_mapPlayerBotFishingStands[mine];
+			claim.dwPid = playerID;
+			claim.dwTouched = dwNow;
+		}
+		standX = PLAYERBOT_FISHING_STANDS[mine].x;
+		standY = PLAYERBOT_FISHING_STANDS[mine].y;
+	}
+
+	// The water this stand looks at. Due east was right for the one straight
+	// stretch the first version knew about and wrong for every bend.
+	void GetPlayerBotFishingFacing(DWORD playerID, long& waterX, long& waterY)
+	{
+		waterX = PLAYERBOT_FISHING_WATER_X;
+		waterY = 0;
+		for (std::map<int, TPlayerBotFishingStand>::const_iterator it =
+				s_mapPlayerBotFishingStands.begin();
+				it != s_mapPlayerBotFishingStands.end(); ++it)
+		{
+			if (it->second.dwPid != playerID)
+				continue;
+			waterX = PLAYERBOT_FISHING_STANDS[it->first].waterX;
+			waterY = PLAYERBOT_FISHING_STANDS[it->first].waterY;
+			return;
+		}
 	}
 
 	bool IsPlayerBotHoldingRod(LPCHARACTER ch)
@@ -225,6 +312,14 @@ namespace
 		LPITEM rod = ch ? ch->GetWear(WEAR_WEAPON) : NULL;
 		return rod && rod->GetType() == ITEM_ROD;
 	}
+
+	// A bot stops walking at PLAYERBOT_NAV_ARRIVAL_DISTANCE from its goal, so an
+	// arrival test tighter than that can never pass: the walk reports success,
+	// the caller asks for another step, nothing moves, and the bot stands in the
+	// gap with no failure recorded anywhere. Both files are included here, so
+	// the rule can be checked rather than remembered.
+	static_assert(PLAYERBOT_FISHING_ARRIVE >= PLAYERBOT_NAV_ARRIVAL_DISTANCE,
+			"an arrival radius below the navigation's own strands the bot short of it");
 
 	bool EquipPlayerBotRod(LPCHARACTER ch)
 	{
@@ -442,8 +537,13 @@ namespace
 			// in its own right - twenty-six recipes on this proto consume one as
 			// it is. Prying open the one the bot's own anvil is about to ask for
 			// trades a certain material for a chance at a different one.
+			// A shell is worth something whole, so the first few are never
+			// gambled with: they go to the anvil or onto the counter, and only
+			// the surplus is pried open.
 			if (vnum == PLAYERBOT_SHELLFISH_VNUM &&
-					(PlayerBotNeedsRefineMaterial(ch, vnum) || !ShouldPlayerBotOpenShellfish(ch, get_dword_time())))
+					(ch->CountSpecifyItem(PLAYERBOT_SHELLFISH_VNUM) <= PLAYERBOT_SHELLFISH_KEEP ||
+					 PlayerBotNeedsRefineMaterial(ch, vnum) ||
+					 !ShouldPlayerBotOpenShellfish(ch, get_dword_time())))
 				continue;
 			const int stoneBefore = ch->CountSpecifyItem(PLAYERBOT_STONE_PIECE_VNUM);
 			const int whiteBefore = ch->CountSpecifyItem(PLAYERBOT_PEARL_FIRST_VNUM);
@@ -475,21 +575,67 @@ namespace
 		return false;
 	}
 
+	// One bot, one colour, for good.
+	//
+	// The dye is fished up and dropped often enough that bots were carrying it
+	// about as scrap. The engine takes it straight from UseItem - SetPart on
+	// PART_HAIR, no client involved - and the colour is permanent, which is
+	// exactly why it is worth using: eight hundred characters that all look
+	// alike stop looking like one character copied eight hundred times. Used
+	// once and once only; everything after the first is goods, and the engine
+	// would refuse a second one for three levels anyway.
+	bool ManagePlayerBotHairDye(LPCHARACTER ch)
+	{
+		if (!ch || ch->GetPart(PART_HAIR) != 0)
+			return false;
+		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
+		{
+			LPITEM item = ch->GetInventoryItem(cell);
+			if (!item)
+				continue;
+			const DWORD vnum = item->GetVnum();
+			// Only the range char_item.cpp answers for, and not the remover:
+			// washing out a colour that was never applied consumes the item and
+			// changes nothing.
+			if (vnum <= PLAYERBOT_HAIR_DYE_FIRST_VNUM ||
+					vnum > PLAYERBOT_HAIR_DYE_LAST_VNUM)
+				continue;
+			if (!ch->UseItem(TItemPos(INVENTORY, cell)))
+				continue;
+			sys_log(0, "PLAYERBOT_LOOK: hair dyed pid=%u name=%s vnum=%u part=%d",
+					ch->GetPlayerID(), ch->GetName(), vnum, ch->GetPart(PART_HAIR));
+			return true;
+		}
+		return false;
+	}
+
 	bool EndPlayerBotFishingSession(LPCHARACTER ch, TPlayerBotAIState& state,
 			DWORD dwNow, const char* reason)
 	{
 		if (ch && ch->m_pkFishingEvent)
 			ch->fishing_take();
 
+		if (ch)
+			ReleasePlayerBotFishingStand(ch->GetPlayerID());
 		state.bFishingSession = false;
 		state.bIsFishing = false;
 		state.dwFishingCastTime = 0;
+		state.dwFishingIdleSince = 0;
 		state.dwFishingSessionEndTime = 0;
 		state.dwNextFishingActionTime = 0;
 		state.dwNextFishingCheckTime = dwNow +
 				number(PLAYERBOT_FISHING_REST_MIN, PLAYERBOT_FISHING_REST_MAX);
 		StowPlayerBotRod(ch);
 		ClearPlayerBotRoute(state, true);
+		// An angler that has just packed the rod away is the one bot reliably
+		// standing in Joan with nothing left to do. Half of them wander over to
+		// the market ring for a while instead of walking straight back out -
+		// which is the whole of what makes that square look inhabited, since the
+		// bank, the bait merchant and the stalls are all on this one map.
+		if (ch && ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M1 &&
+				number(1, 100) <= PLAYERBOT_TOWN_LINGER_PERCENT)
+			state.dwTownLingerUntil = dwNow + number(
+					(int)PLAYERBOT_TOWN_LINGER_MIN, (int)PLAYERBOT_TOWN_LINGER_MAX);
 		if (ch)
 			sys_log(0, "PLAYERBOT_FISHING: session over pid=%u name=%s pearls=%d/%d/%d reason=%s",
 					ch->GetPlayerID(), ch->GetName(),
@@ -502,47 +648,77 @@ namespace
 
 	// Rod and bait both come from the Rybak, who stands on the bank the bots fish
 	// from, so restocking and fishing share one walk.
+	// Buying one thing from the Rybak, and saying out loud when it will not
+	// happen. Three quite different failures used to leave by the same door and
+	// arrive as "cannot_afford_tackle": an item this world does not price, a bot
+	// that genuinely has no money, and a bot whose bag has no free cell. The
+	// first is a serverfile question, the second fixes itself, the third is a
+	// bag the merchant pass should have emptied - and no log told them apart.
+	bool BuyPlayerBotTackleItem(LPCHARACTER ch, DWORD vnum, int count,
+			const char* what, DWORD dwNow)
+	{
+		TItemTable* proto = ITEM_MANAGER::instance().GetTable(vnum);
+		if (!proto)
+		{
+			PlayerBotLogThrottled("tackle_no_proto", dwNow,
+					"PLAYERBOT_FISHING: %s has no item table pid=%u name=%s vnum=%u",
+					what, ch->GetPlayerID(), ch->GetName(), vnum);
+			return false;
+		}
+		const long long price = GetPlayerBotNpcPurchasePrice(proto, count);
+		if (price <= 0)
+		{
+			PlayerBotLogThrottled("tackle_no_price", dwNow,
+					"PLAYERBOT_FISHING: %s has no price on this world pid=%u name=%s vnum=%u count=%d",
+					what, ch->GetPlayerID(), ch->GetName(), vnum, count);
+			return false;
+		}
+		if (ch->GetGold() < price)
+			RaisePlayerBotEmergencyGold(ch, price, what);
+		if (ch->GetGold() < price)
+		{
+			PlayerBotLogThrottled("tackle_no_gold", dwNow,
+					"PLAYERBOT_FISHING: cannot afford %s pid=%u name=%s vnum=%u count=%d price=%lld gold=%d",
+					what, ch->GetPlayerID(), ch->GetName(), vnum, count,
+					price, ch->GetGold());
+			return false;
+		}
+		if (!ch->AutoGiveItem(vnum, count, -1, false))
+		{
+			// Not poverty - the bag. Reported from the Discord as bots standing
+			// under the Rybak with money and no bait.
+			PlayerBotLogThrottled("tackle_no_room", dwNow,
+					"PLAYERBOT_FISHING: no bag room for %s pid=%u name=%s vnum=%u count=%d gold=%d",
+					what, ch->GetPlayerID(), ch->GetName(), vnum, count, ch->GetGold());
+			return false;
+		}
+		ch->PointChange(POINT_GOLD, -price);
+		sys_log(0, "PLAYERBOT_FISHING: bought %s pid=%u name=%s vnum=%u count=%d price=%lld",
+				what, ch->GetPlayerID(), ch->GetName(), vnum, count, price);
+		return true;
+	}
+
 	bool RestockPlayerBotTackle(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
 	{
 		if (!ch)
 			return false;
 
-		bool bought = false;
+		// "Nothing needed buying" and "buying failed" are not the same answer,
+		// and returning the same false for both ended the session of every bot
+		// that was already carrying what it came for.
+		bool refused = false;
 		if (!IsPlayerBotHoldingRod(ch) && ch->CountSpecifyItem(PLAYERBOT_FISHING_ROD_VNUM) <= 0)
 		{
-			TItemTable* proto = ITEM_MANAGER::instance().GetTable(PLAYERBOT_FISHING_ROD_VNUM);
-			if (!proto)
-				return false;
-			const long long price = GetPlayerBotNpcPurchasePrice(proto, 1);
-			if (ch->GetGold() < price)
-				RaisePlayerBotEmergencyGold(ch, price, "fishing_rod");
-			if (price <= 0 || ch->GetGold() < price)
-				return false;
-			if (!ch->AutoGiveItem(PLAYERBOT_FISHING_ROD_VNUM, 1, -1, false))
-				return false;
-			ch->PointChange(POINT_GOLD, -price);
-			bought = true;
-			sys_log(0, "PLAYERBOT_FISHING: bought rod pid=%u name=%s vnum=%u price=%lld",
-					ch->GetPlayerID(), ch->GetName(), PLAYERBOT_FISHING_ROD_VNUM, price);
+			if (!BuyPlayerBotTackleItem(ch, PLAYERBOT_FISHING_ROD_VNUM, 1, "fishing_rod", dwNow))
+				refused = true;
 		}
 
-		if (ch->CountSpecifyItem(PLAYERBOT_FISHING_BAIT_VNUM) < PLAYERBOT_FISHING_BAIT_RESTOCK)
+		if (!refused &&
+				ch->CountSpecifyItem(PLAYERBOT_FISHING_BAIT_VNUM) < PLAYERBOT_FISHING_BAIT_RESTOCK)
 		{
-			TItemTable* proto = ITEM_MANAGER::instance().GetTable(PLAYERBOT_FISHING_BAIT_VNUM);
-			if (!proto)
-				return bought;
-			const long long price = GetPlayerBotNpcPurchasePrice(proto, PLAYERBOT_FISHING_BAIT_BUNDLE);
-			if (ch->GetGold() < price)
-				RaisePlayerBotEmergencyGold(ch, price, "fishing_bait");
-			if (price <= 0 || ch->GetGold() < price)
-				return bought;
-			if (!ch->AutoGiveItem(PLAYERBOT_FISHING_BAIT_VNUM, PLAYERBOT_FISHING_BAIT_BUNDLE, -1, false))
-				return bought;
-			ch->PointChange(POINT_GOLD, -price);
-			bought = true;
-			sys_log(0, "PLAYERBOT_FISHING: bought bait pid=%u name=%s vnum=%u count=%d price=%lld",
-					ch->GetPlayerID(), ch->GetName(), PLAYERBOT_FISHING_BAIT_VNUM,
-					PLAYERBOT_FISHING_BAIT_BUNDLE, price);
+			if (!BuyPlayerBotTackleItem(ch, PLAYERBOT_FISHING_BAIT_VNUM,
+					PLAYERBOT_FISHING_BAIT_BUNDLE, "fishing_bait", dwNow))
+				refused = true;
 		}
 		// And one piece of Dried Wood for the end of the session, from the same
 		// counter: the dead fish get grilled instead of vendored. The wood costs
@@ -559,13 +735,15 @@ namespace
 						ch->AutoGiveItem(PLAYERBOT_CAMPFIRE_VNUM, 1, -1, false))
 				{
 					ch->PointChange(POINT_GOLD, -price);
-					bought = true;
 					sys_log(0, "PLAYERBOT_FISHING: bought campfire pid=%u name=%s price=%lld",
 							ch->GetPlayerID(), ch->GetName(), price);
 				}
 			}
 		}
-		return bought;
+		// The wood is a nicety and never a reason to end a session, so it does
+		// not speak here. What matters is whether the two things the bot cannot
+		// fish without were refused.
+		return !refused;
 	}
 
 	bool ManagePlayerBotFishing(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
@@ -645,16 +823,18 @@ namespace
 		}
 		else
 		{
-			GetPlayerBotFishingStand(ch->GetPlayerID(), destX, destY);
-			// The bank spots are hand-picked world coordinates. server_attr is the
-			// only authority on whether one is standable, and the town services
-			// already learned that a hand-picked point can be a cell the navigation
-			// refuses. Snap to a verified walkable cell before walking at it.
+			GetPlayerBotFishingStand(ch->GetPlayerID(), dwNow, destX, destY);
+			// A last check against the navigation's own grid, in case a stand
+			// falls in a cell it refuses - but within two cells, not twelve.
+			// Twelve is six hundred world units against an arrival radius of
+			// twenty-five, which is the same mistake the portal walk made: two
+			// stands a hundred and fifty apart could both be dragged onto one
+			// cell, and two anglers were found eight units apart because of it.
 			CPlayerBotNavigation& navigation =
 					CPlayerBotNavigation::instance(ch->GetMapIndex());
 			PIXEL_POSITION bank;
 			if (navigation.Init(ch->GetMapIndex()) &&
-					navigation.FindNearestWalkableWorld(destX, destY, 12, bank,
+					navigation.FindNearestWalkableWorld(destX, destY, 2, bank,
 							ch->GetPlayerID()))
 			{
 				destX = bank.x;
@@ -740,6 +920,27 @@ namespace
 		if (dwNow < state.dwNextFishingActionTime)
 			return true;
 
+		// Ready to fish and not fishing. If that goes on long enough the session
+		// is over: a rod that will not go on, a bait that will not seat, or
+		// anything else nobody has thought of yet, all end the same way instead
+		// of standing at the water for hours.
+		if (state.bIsFishing)
+			state.dwFishingIdleSince = 0;
+		else
+		{
+			if (state.dwFishingIdleSince == 0)
+				state.dwFishingIdleSince = dwNow;
+			else if (dwNow - state.dwFishingIdleSince >= PLAYERBOT_FISHING_NO_CAST_GIVE_UP)
+			{
+				sys_log(0, "PLAYERBOT_FISHING: no cast pid=%u name=%s rod=%d bait=%d idle_ms=%u",
+						ch->GetPlayerID(), ch->GetName(),
+						IsPlayerBotHoldingRod(ch) ? 1 : 0,
+						ch->CountSpecifyItem(PLAYERBOT_FISHING_BAIT_VNUM),
+						(unsigned int)(dwNow - state.dwFishingIdleSince));
+				return EndPlayerBotFishingSession(ch, state, dwNow, "never_cast");
+			}
+		}
+
 		LPITEM rod = ch->GetWear(WEAR_WEAPON);
 		if (!state.bIsFishing && rod && rod->GetSocket(2) == 0 && !BaitPlayerBotRod(ch))
 		{
@@ -786,7 +987,9 @@ namespace
 
 			// Face straight across at the river rather than along the bank: the
 			// water lies due east of this stretch.
-			ch->SetRotationToXY(PLAYERBOT_FISHING_WATER_X, ch->GetY());
+			long waterX = 0, waterY = 0;
+			GetPlayerBotFishingFacing(ch->GetPlayerID(), waterX, waterY);
+			ch->SetRotationToXY(waterX, waterY != 0 ? waterY : ch->GetY());
 			ch->fishing();
 			if (!ch->m_pkFishingEvent)
 			{

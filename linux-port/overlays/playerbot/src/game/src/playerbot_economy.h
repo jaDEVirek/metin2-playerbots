@@ -370,6 +370,11 @@ namespace
 				vnum == PLAYERBOT_SHELLFISH_VNUM || vnum == PLAYERBOT_CAMPFIRE_VNUM ||
 				(vnum >= PLAYERBOT_PEARL_FIRST_VNUM && vnum <= PLAYERBOT_PEARL_LAST_VNUM))
 			return false;
+		// Hair dye. The merchant pays nothing for it and a player will: it is
+		// the only way to change a character's colour for good, and the anglers
+		// pull it out of the water by the handful.
+		if (IsPlayerBotHairDye(vnum))
+			return false;
 		// A dead fish waits for the campfire at the end of the next session, as
 		// long as the bot has the wood for one; a grilled fish is a potion.
 		if (item->GetType() == ITEM_FISH && item->GetSubType() == FISH_DEAD &&
@@ -402,8 +407,12 @@ namespace
 			if (ch->GetSkillGroup() == 0)
 				return false;
 			const DWORD skillVnum = GetPlayerBotSkillBookSkillVnum(item);
+			// Somebody else's skill is not scrap. Aura Miecza found by a ninja
+			// was going to the merchant for a fraction of what the warrior three
+			// stalls away would pay for it - the stall pass takes these, and
+			// only a book nobody in the world could want is loot.
 			if (!IsPlayerBotOwnSkill(ch, skillVnum))
-				return true;
+				return skillVnum == 0;
 			// Its own, and only so many of them - see PLAYERBOT_BOOK_KEEP_PER_SKILL.
 			return CountPlayerBotSkillBooksAhead(ch, item, skillVnum) >= PLAYERBOT_BOOK_KEEP_PER_SKILL;
 		}
@@ -887,6 +896,11 @@ namespace
 		// performed in the separate blacksmith phase after the bot walks there.
 		const bool isMage = (ch->GetJob() == JOB_SHAMAN || ch->GetJob() == JOB_SURA);
 		const BYTE botLvl = ch->GetLevel();
+		// What this visit actually bought. The purchase used to be silent - the
+		// only line was "misc merchant visit" - so "do the bots really buy the
+		// big stock?" could only be answered by querying the database, which is
+		// not a question an operator should have to take that far.
+		DWORD boughtRed = 0, boughtBlue = 0;
 
 		if (botLvl <= 10)
 		{
@@ -894,11 +908,13 @@ namespace
 			{
 				ch->PointChange(POINT_GOLD, -240);
 				ch->AutoGiveItem(27001, 30); // Red Potion (S) 30x
+				boughtRed += 30;
 			}
 			if (isMage && blueCount < 20 && ch->GetGold() >= 400)
 			{
 				ch->PointChange(POINT_GOLD, -360);
 				ch->AutoGiveItem(27004, 15); // Blue Potion (S) 15x
+				boughtBlue += 15;
 			}
 		}
 		else
@@ -923,6 +939,7 @@ namespace
 				{
 					ch->PointChange(POINT_GOLD, -(int)(buy * RED_UNIT));
 					ch->AutoGiveItem(27002, buy);
+					boughtRed += buy;
 				}
 			}
 			// Skills spend SP continuously, so a warrior wants a reserve too. It
@@ -936,9 +953,18 @@ namespace
 				{
 					ch->PointChange(POINT_GOLD, -(int)(buy * BLUE_UNIT));
 					ch->AutoGiveItem(27005, buy);
+					boughtBlue += buy;
 				}
 			}
 		}
+
+		if (boughtRed != 0 || boughtBlue != 0)
+			sys_log(0, "PLAYERBOT_RESTOCK: bought pid=%u name=%s level=%u red=%u blue=%u "
+					"had_red=%u had_blue=%u gold_left=%d",
+					ch->GetPlayerID(), ch->GetName(), ch->GetLevel(),
+					(unsigned int)boughtRed, (unsigned int)boughtBlue,
+					(unsigned int)redCount, (unsigned int)blueCount,
+					(int)(ch->GetGold() / 1000));
 
 		// Even the level-one shoes add movement speed. Missing footwear is therefore
 		// a progression problem, not cosmetic equipment.

@@ -631,8 +631,15 @@ if ((Test-Path -LiteralPath $overlaySource -PathType Container) -and
         $from = Join-Path $PSScriptRoot $pair.From
         $to   = Join-Path $PSScriptRoot $pair.To
         if (-not (Test-Path -LiteralPath $from -PathType Leaf)) { continue }
+        # The target directory is made when it is missing. panel\schema and
+        # game\quest are ignored by Git, so a fresh install unpacked from the
+        # repository archive has neither - and skipping the copy for want of a
+        # directory left the panel image without its schema and the build
+        # failing at "COPY schema/" on every Start, update or not.
         $toParent = Split-Path -Parent $to
-        if (-not (Test-Path -LiteralPath $toParent -PathType Container)) { continue }
+        if (-not (Test-Path -LiteralPath $toParent -PathType Container)) {
+            New-Item -ItemType Directory -Path $toParent -Force | Out-Null
+        }
         $toHash = $null
         if (Test-Path -LiteralPath $to -PathType Leaf) {
             $toHash = (Get-FileHash -LiteralPath $to -Algorithm SHA256).Hash

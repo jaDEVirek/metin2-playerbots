@@ -1017,6 +1017,29 @@ namespace
 				ch, GetPlayerBotProgressionBootsVnum(ch), WEAR_FOOTS);
 	}
 
+	// "Full eq" as a player says it: every slot filled and nothing on the
+	// progression ladder left to buy.
+	bool IsPlayerBotFullyEquipped(LPCHARACTER ch)
+	{
+		if (!ch || !ch->IsItemLoaded())
+			return false;
+		static const BYTE slots[] = {
+			WEAR_WEAPON, WEAR_BODY, WEAR_HEAD, WEAR_SHIELD,
+			WEAR_WRIST, WEAR_FOOTS, WEAR_NECK, WEAR_EAR
+		};
+		for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); ++i)
+			if (!ch->GetWear(slots[i]))
+				return false;
+		return !NeedsPlayerBotProgressionWeapon(ch) &&
+				!NeedsPlayerBotProgressionArmor(ch) &&
+				!NeedsPlayerBotProgressionShield(ch) &&
+				!NeedsPlayerBotProgressionHelmet(ch) &&
+				!NeedsPlayerBotProgressionBoots(ch) &&
+				!NeedsPlayerBotProgressionWrist(ch) &&
+				!NeedsPlayerBotProgressionNecklace(ch) &&
+				!NeedsPlayerBotProgressionEarring(ch);
+	}
+
 	bool IsPlayerBotSpecialLevel30Weapon(LPITEM item)
 	{
 		if (!item || item->GetType() != ITEM_WEAPON)
@@ -1365,6 +1388,37 @@ namespace
 		return price;
 	}
 
+	// Is this piece one the bot could put on right now, and better than what it
+	// already wears there?
+	//
+	// The stall listed any weapon or armour whose slot was already filled, which
+	// reads as "this is a spare" and nearly always is. A player handing a bot a
+	// pair of +9 boots does not fill an empty slot, it beats a full one - and the
+	// counter got there first, because the private shop pass runs at the top of
+	// the tick and the equipment pass three hundred lines below it. Reported from
+	// the Discord by three people in one afternoon, each of whom had just given a
+	// bot something good and watched it go on sale at the top of the counter: a
+	// spare at +6 or better is the highest-scoring thing a stall can carry.
+	//
+	// "Could put on right now" is the engine's own CanEquipNow, so a piece the
+	// bot has not grown into is not held off the market on a promise: a level-30
+	// sword in the bag of a bot of five is goods, and stays goods.
+	bool IsPlayerBotWearableUpgrade(LPCHARACTER ch, LPITEM item, WORD cell)
+	{
+		if (!IsPlayerBotEquipmentCandidate(ch, item))
+			return false;
+		const int wearCell = item->FindEquipCell(ch);
+		if (wearCell < 0 || wearCell >= WEAR_MAX_NUM)
+			return false;
+		LPITEM worn = ch->GetWear((BYTE)wearCell);
+		if (worn && IS_SET(worn->GetFlag(), ITEM_FLAG_IRREMOVABLE))
+			return false;
+		if (!ch->CanEquipNow(item, TItemPos(INVENTORY, cell)))
+			return false;
+		return !worn || GetPlayerBotEquipmentScore(item, ch) >
+				GetPlayerBotEquipmentScore(worn, ch);
+	}
+
 	enum EPlayerBotPotionSupply
 	{
 		PLAYERBOT_POTION_SUPPLY_HP = 0,
@@ -1613,6 +1667,18 @@ namespace
 		}
 		if (bundle == 0)
 			return false;
+		// AutoGiveItem hands the item back even when it had nowhere to put it:
+		// with no free cell the bundle goes on the ground at the bot's feet, the
+		// bot pays, still "needs arrows", and buys again on the next pass - a
+		// market square carpeted in Wooden Arrows, twenty purchases an hour per
+		// archer. The junk sale has already run by now; a bag still full holds
+		// things worth keeping, and the arrows wait for the next visit.
+		if (ch->GetEmptyInventory(1) < 0)
+		{
+			sys_log(0, "PLAYERBOT_GEAR: no room for arrows pid=%u name=%s arrows=%d",
+					ch->GetPlayerID(), ch->GetName(), CountPlayerBotArrows(ch));
+			return false;
+		}
 
 		LPITEM arrows = ch->AutoGiveItem(
 				PLAYERBOT_WOODEN_ARROW_VNUM, bundle, -1, false);
@@ -1981,6 +2047,67 @@ namespace
 		}
 
 		return false;
+	}
+
+	// Every bot wears the third hand, and keeps wearing it.
+	//
+	// Without it a kill's yang lands on the ground as coin piles and the bot has
+	// to walk to each one; with it the engine credits the money on the spot
+	// (CHARACTER::RewardGold, IsEquipUniqueGroup(UNIQUE_GROUP_AUTOLOOT)). The
+	// bot spends its ticks fighting rather than fetching, and the hunting
+	// grounds stop filling with yang nobody collects.
+	//
+	// Nothing here is a purchase: the item is made, worn, and its wear clock
+	// wound back up before it can run out. See PLAYERBOT_THIRD_HAND_VNUM for
+	// why that clock has to be touched at all, and why it is 72018 and not the
+	// 71010 an item shop would sell.
+	void ManagePlayerBotThirdHand(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
+	{
+		if (!ch || !ch->IsItemLoaded() || ch->IsDead())
+			return;
+		if (dwNow < state.dwNextThirdHandTime)
+			return;
+		state.dwNextThirdHandTime = dwNow + PLAYERBOT_THIRD_HAND_INTERVAL;
+
+		// The bot's copy, worn or carried - carried counts, or a bot that could
+		// not put it on this minute would be handed another one every pass.
+		LPITEM hand = ch->GetWear(WEAR_UNIQUE1);
+		if (!hand || hand->GetVnum() != PLAYERBOT_THIRD_HAND_VNUM)
+			hand = ch->GetWear(WEAR_UNIQUE2);
+		if (hand && hand->GetVnum() != PLAYERBOT_THIRD_HAND_VNUM)
+			hand = NULL;
+		for (WORD cell = 0; cell < INVENTORY_MAX_NUM && !hand; ++cell)
+		{
+			LPITEM item = ch->GetInventoryItem(cell);
+			if (item && item->GetVnum() == PLAYERBOT_THIRD_HAND_VNUM)
+				hand = item;
+		}
+
+		if (!hand)
+		{
+			// AutoGiveItem hands the item over even when there is nowhere to put
+			// it, and it lands on the ground wearing the bot's name - the arrows
+			// and the stall bundles both learned this the hard way. Wait for a
+			// free cell instead.
+			if (ch->GetEmptyInventory(1) < 0)
+				return;
+			hand = ch->AutoGiveItem(PLAYERBOT_THIRD_HAND_VNUM, 1, -1, false);
+			if (!hand)
+				return;
+			sys_log(0, "PLAYERBOT_GEAR: third hand made pid=%u name=%s",
+					ch->GetPlayerID(), ch->GetName());
+		}
+
+		// CHARACTER::EquipItem refuses within a second and a half of an attack
+		// or a cast, which for a bot is most of its life - the first draft put
+		// the winding below behind a successful equip here and wound eight
+		// clocks out of six hundred. Trying is enough: what this pass does not
+		// manage, ManagePlayerBotEquipment picks out of the bag on its own.
+		if (!hand->IsEquipped())
+			ch->EquipItem(hand);
+
+		if (hand->GetSocket(ITEM_SOCKET_UNIQUE_REMAIN_TIME) < PLAYERBOT_THIRD_HAND_REWIND_BELOW)
+			hand->SetSocket(ITEM_SOCKET_UNIQUE_REMAIN_TIME, PLAYERBOT_THIRD_HAND_MINUTES);
 	}
 }
 

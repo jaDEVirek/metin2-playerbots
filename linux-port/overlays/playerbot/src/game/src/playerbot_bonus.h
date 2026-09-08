@@ -133,6 +133,59 @@ namespace
 		return wearCell == WEAR_WEAPON;
 	}
 
+	// The rolls a piece is priced up for: the top of what a line can be, or near
+	// enough that a player keeps the item for it. A deliberately shorter list
+	// than ScorePlayerBotBonusLine - the question here is not "is this line
+	// good" but "is this the line somebody pays extra for".
+	bool IsPlayerBotTopBonusLine(BYTE type, long value)
+	{
+		switch (type)
+		{
+			case APPLY_MAX_HP:                  return value >= 2000;
+			case APPLY_MAX_HP_PCT:              return value >= 8;
+			case APPLY_CRITICAL_PCT:            return value >= 10;
+			case APPLY_PENETRATE_PCT:           return value >= 10;
+			case APPLY_SKILL_DAMAGE_BONUS:      return value >= 15;
+			case APPLY_NORMAL_HIT_DAMAGE_BONUS: return value >= 15;
+			case APPLY_ATTBONUS_MONSTER:        return value >= 20;
+			case APPLY_ATT_SPEED:               return value >= 8;
+			case APPLY_MOV_SPEED:               return value >= 20;
+			case APPLY_STEAL_HP:                return value >= 8;
+			case APPLY_IMMUNE_STUN:             return true;
+			default:                            return false;
+		}
+	}
+
+	// What the lines on an item add to its asking price, as a percentage.
+	//
+	// No character is asked for, on purpose: this is what any buyer pays, not
+	// what one bot would wear, so the caster and weapon-slot weightings of
+	// ScorePlayerBotItemBonuses are left out of it.
+	int GetPlayerBotBonusPricePercent(LPITEM item)
+	{
+		if (!item)
+			return 0;
+		int lines = 0;
+		int top = 0;
+		const int count = item->GetAttributeCount();
+		for (int i = 0; i < count && i < ITEM_ATTRIBUTE_MAX_NUM; ++i)
+		{
+			const BYTE type = item->GetAttributeType(i);
+			const long value = item->GetAttributeValue(i);
+			if (type == 0 || value <= 0)
+				continue;
+			++lines;
+			if (IsPlayerBotTopBonusLine(type, value))
+				++top;
+		}
+		if (lines == 0)
+			return 0;
+		const int percent = lines * PLAYERBOT_SHOP_BONUS_PER_LINE +
+				(lines >= 4 ? PLAYERBOT_SHOP_BONUS_FOUR_PLUS : 0) +
+				top * PLAYERBOT_SHOP_BONUS_TOP_LINE;
+		return std::min(percent, PLAYERBOT_SHOP_BONUS_MAX_PERCENT);
+	}
+
 	int ScorePlayerBotItemBonuses(LPCHARACTER ch, LPITEM item, BYTE wearCell)
 	{
 		if (!ch || !item)

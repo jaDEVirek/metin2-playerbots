@@ -17,8 +17,43 @@
 
 namespace
 {
+	// Boxes the engine will not open, by vnum and until when.
+	//
+	// "Skrzynia Eksperta III" and "Skrzynia Mistrza I" (50192, 50193) are
+	// giftboxes a bot cannot use, and it asked anyway - close to six thousand
+	// refusals a minute between them. Worse, a refusal ended the whole pass, so
+	// every Moonlight chest sitting behind one of these in the bag was never
+	// reached: that is how 587 bots came to be holding nine thousand of them.
+	std::map<DWORD, DWORD> s_mapPlayerBotChestRefused;
+
 	// Opens one chest per pass. UseItem refuses when the bag has no room, and
 	// says so in the engine's own log; the bot's next town visit makes room.
+	// A box that belongs on a counter rather than in the bot's own hands.
+	//
+	// Two kinds qualify. One the engine will not let this bot open at all -
+	// 50192 and 50193, six thousand refusals a minute between them before the
+	// refusal was remembered - which is pure goods to whoever holds it. And the
+	// surplus of a stack big enough that selling it costs the bot nothing: the
+	// chest pass keeps eating the stack meanwhile, so most of what drops is
+	// still opened and only what piles up is sold. A stack goes up whole
+	// because a private shop line is a whole stack; splitting one is its own
+	// change and not this one.
+	bool IsPlayerBotSurplusChest(LPITEM item)
+	{
+		if (!item || (item->GetVnum() != PLAYERBOT_MOONLIGHT_CHEST_VNUM &&
+				item->GetType() != ITEM_GIFTBOX))
+			return false;
+		// A box the engine has refused stays goods. The refusal is a property of
+		// the box - 50192 and 50193 cannot be opened on this server at all, and
+		// 775 of them are sitting in bags as one cell each - not of the minute
+		// it was noticed, so the retry clock is not consulted here: that clock
+		// exists to stop the asking, not to make the box valuable again.
+		if (s_mapPlayerBotChestRefused.find(item->GetVnum()) !=
+				s_mapPlayerBotChestRefused.end())
+			return true;
+		return item->GetCount() >= PLAYERBOT_CHEST_STALL_MIN_STACK;
+	}
+
 	bool ManagePlayerBotChests(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
 	{
 		if (!ch || !ch->IsItemLoaded() || dwNow < state.dwNextChestTime)
@@ -58,9 +93,21 @@ namespace
 			if (!item || (item->GetVnum() != PLAYERBOT_MOONLIGHT_CHEST_VNUM &&
 					item->GetType() != ITEM_GIFTBOX))
 				continue;
+			// A box already on this bot's own counter. UseItem refuses a locked
+			// item, and that refusal is remembered by vnum for every bot in the
+			// world - so opening one that is for sale would stop the whole
+			// population opening that kind of box for the next few minutes.
+			if (item->isLocked())
+				continue;
+			std::map<DWORD, DWORD>::const_iterator refused =
+					s_mapPlayerBotChestRefused.find(item->GetVnum());
+			if (refused != s_mapPlayerBotChestRefused.end() && dwNow < refused->second)
+				continue;
 			if (ch->GetEmptyInventory(1) < 0)
 				return false;
 			const int before = ch->GetEmptyInventory(1);
+			const DWORD chestVnum = item->GetVnum();
+			const DWORD chestCount = item->GetCount();
 			if (ch->UseItem(TItemPos(INVENTORY, cell)))
 			{
 				sys_log(0, "PLAYERBOT_CHEST: opened pid=%u name=%s level=%u map=%ld free_before=%d free_after=%d",
@@ -68,7 +115,16 @@ namespace
 						before, ch->GetEmptyInventory(1));
 				return true;
 			}
-			return false;
+			// Not the end of the pass: the next box in the bag may well open,
+			// and giving up here is what kept the Moonlight chests behind these
+			// two out of reach. The refusal is remembered so the bot stops
+			// asking every eight seconds.
+			s_mapPlayerBotChestRefused[chestVnum] = dwNow + PLAYERBOT_CHEST_REFUSED_RETRY;
+			PlayerBotLogThrottled("chest_refused", dwNow,
+					"PLAYERBOT_CHEST: refused pid=%u name=%s vnum=%u count=%u free=%d",
+					ch->GetPlayerID(), ch->GetName(), chestVnum,
+					(unsigned int)chestCount, ch->GetEmptyInventory(1));
+			continue;
 		}
 		return false;
 	}

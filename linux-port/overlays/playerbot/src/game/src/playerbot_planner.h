@@ -93,8 +93,11 @@ namespace
 				PlayerBotNavHash(ch->GetPlayerID() ^ 0x4d455850U) % 600000U;
 		if (state.dwMetinExpeditionUntil != 0 || ch->GetLevel() < PLAYERBOT_METIN_EXPEDITION_MIN_LEVEL)
 			return;
+		// A battle horse is what a player raises for the stones, so its rider
+		// goes out for them twice as often.
 		const int chance = PLAYERBOT_METIN_EXPEDITION_CHANCE_PERCENT *
-				GetPlayerBotWeight(PLAYERBOT_WEIGHT_METIN) / PLAYERBOT_WEIGHT_NEUTRAL;
+				GetPlayerBotWeight(PLAYERBOT_WEIGHT_METIN) / PLAYERBOT_WEIGHT_NEUTRAL *
+				(CanPlayerBotEverFightOnHorse(ch) ? 2 : 1);
 		if (number(1, 100) > chance)
 			return;
 		state.dwMetinExpeditionUntil = dwNow + PLAYERBOT_METIN_EXPEDITION_DURATION;
@@ -153,8 +156,18 @@ namespace
 		OfferPlayerBotGoal(candidates, rank, count,
 				state.bAmbition == BOT_AMBITION_SKILLS && canReadBook,
 				BOT_GOAL_MASTER_SKILL, PLAYERBOT_WEIGHT_SKILL);
+		// The medal dropper does not wait for the horse ambition to come round.
+		//
+		// Farming medals is the whole of what that personality is for, and the
+		// ambition rotates: seventy-three bots of eight hundred and thirty-eight
+		// hold it at any moment, so thirteen droppers were idle nine times out of
+		// ten and all three Monkey Dungeons stood nearly empty - seven bots
+		// between them, none at all in the easy one. Everyone else still needs
+		// the ambition, so this does not turn the dungeon into a conveyor belt.
 		OfferPlayerBotGoal(candidates, rank, count,
-				state.bAmbition == BOT_AMBITION_HORSE && canAdvanceHorse,
+				canAdvanceHorse && (state.bAmbition == BOT_AMBITION_HORSE ||
+					GetPlayerBotPersonalityByPID(ch->GetPlayerID()) ==
+						BOT_PERSONALITY_MEDAL_DROPPER),
 				BOT_GOAL_HORSE, PLAYERBOT_WEIGHT_HORSE);
 		OfferPlayerBotGoal(candidates, rank, count,
 				state.bAmbition == BOT_AMBITION_BIOLOGIST && hasBiologistMission,

@@ -3,6 +3,7 @@
 #include "playerbot_world_rules.h"
 
 #include "char.h"
+#include "skill.h"
 #include "char_manager.h"
 #include "cmd.h"
 #include "desc.h"
@@ -55,6 +56,7 @@ extern void SendShout(const char* szText, BYTE bEmpire);
 #include "playerbot_navigation.h"
 #include "playerbot_world_memory.h"
 #include "playerbot_movement.h"
+#include "playerbot_combat_value_policy.h"
 #include "playerbot_battle_horse.h"
 #include "playerbot_gear.h"
 #include "playerbot_consumables.h"
@@ -75,6 +77,7 @@ extern void SendShout(const char* szText, BYTE bEmpire);
 #include "playerbot_wandering.h"
 #include "playerbot_status.h"
 #include "playerbot_targeting.h"
+#include "playerbot_lure.h"
 
 namespace
 {
@@ -155,14 +158,38 @@ namespace
 	{
 		if (state.bBotRole == BOT_ROLE_PARTY_FIGHTER)
 			return true;
-		return ch && ch->GetMapIndex() == PLAYERBOT_MAP_ORC_VALLEY &&
+		// Every frontier map, not the valley alone: a map change dissolves a
+		// party, so one made in the valley never reached V1 or Sohan, and the
+		// Spider Queen and Nine Tails - a party's work - had nobody to fight
+		// them. Sixteen bots in V1 and not one in a party.
+		return ch && IsPlayerBotFrontierMapIndex(ch->GetMapIndex()) &&
 				ch->GetLevel() >= PLAYERBOT_ORC_VALLEY_PARTY_MIN_LEVEL;
 	}
 
 	int GetPlayerBotPartyDesiredMax(LPCHARACTER ch)
 	{
-		return (ch && ch->GetMapIndex() == PLAYERBOT_MAP_ORC_VALLEY)
+		return (ch && IsPlayerBotFrontierMapIndex(ch->GetMapIndex()))
 				? PLAYERBOT_ORC_VALLEY_PARTY_MAX : PLAYERBOT_PARTY_DESIRED_MAX;
+	}
+
+	// Does this party already have somebody to cast Blessing?
+	bool PlayerBotPartyHasShaman(LPPARTY party)
+	{
+		if (!party)
+			return false;
+		struct FFindShaman
+		{
+			FFindShaman() : m_bFound(false) {}
+			void operator()(LPCHARACTER member)
+			{
+				if (member && member->GetJob() == JOB_SHAMAN)
+					m_bFound = true;
+			}
+			bool m_bFound;
+		};
+		FFindShaman finder;
+		party->ForEachOnlineMember(finder);
+		return finder.m_bFound;
 	}
 
 	bool ArePlayerBotsGuildMates(LPCHARACTER a, LPCHARACTER b)
@@ -240,8 +267,10 @@ namespace
 			return;
 		}
 
-		// 25% chance for a bot to prefer playing solo for a while
-		if (number(1, 100) <= 25)
+		// A stretch of hunting alone, less often where a party is the point.
+		const int soloPercent = IsPlayerBotFrontierMapIndex(ch->GetMapIndex())
+				? PLAYERBOT_PARTY_SOLO_PERCENT_FRONTIER : PLAYERBOT_PARTY_SOLO_PERCENT;
+		if (number(1, 100) <= soloPercent)
 		{
 			state.dwNextPartyCheckTime = dwNow + number(60000, 180000);
 			return;
@@ -252,7 +281,8 @@ namespace
 		{
 			TPartyFinder(LPCHARACTER me, const TPlayerBotAIState& st)
 				: m_me(me), m_state(st), m_pTargetParty(NULL),
-				  m_pSoloCandidate(NULL), m_iSoloAffinity(-1), m_bTargetPartyGuild(false) {}
+				  m_pSoloCandidate(NULL), m_iSoloAffinity(-1),
+				  m_bTargetPartyGuild(false), m_bTargetPartyShaman(false) {}
 			bool operator()(LPENTITY ent)
 			{
 				if (!ent || !ent->IsType(ENTITY_CHARACTER))
@@ -293,11 +323,21 @@ namespace
 							{
 								// A guild mate's party is taken at once; any other is
 								// kept in hand while the sweep looks for a guild mate's.
+								// Out on the frontier a party with a Shaman in it
+								// outranks one without, for the same reason a Shaman
+								// is worth pairing with in the first place - it is
+								// the one job that keeps the others standing.
 								const bool bGuild = ArePlayerBotsGuildMates(m_me, leader);
-								if (bGuild || !m_pTargetParty)
+								const bool bWantsShaman =
+										m_me->GetJob() != JOB_SHAMAN &&
+										IsPlayerBotFrontierMapIndex(m_me->GetMapIndex());
+								const bool bShamanParty = bWantsShaman && PlayerBotPartyHasShaman(cp);
+								if (bGuild || !m_pTargetParty ||
+										(bShamanParty && !m_bTargetPartyShaman && !m_bTargetPartyGuild))
 								{
 									m_pTargetParty = cp;
 									m_bTargetPartyGuild = bGuild;
+									m_bTargetPartyShaman = bShamanParty;
 								}
 								return !bGuild;
 							}
@@ -308,9 +348,17 @@ namespace
 						// Whoever it has got on with best, rather than whoever the
 						// sector happened to hand over first. A bot that has hunted
 						// with somebody before will look for them again.
+						// One Shaman in the pair, not two: the buffs land on the
+						// party whoever casts them, so a second Shaman adds
+						// nothing a first has not already given.
+						const bool bPairHasShaman =
+								(m_me->GetJob() == JOB_SHAMAN) != (candidate->GetJob() == JOB_SHAMAN);
 						const int affinity = GetPlayerBotAffinity(
 								m_state, candidate->GetPlayerID()) +
-								(ArePlayerBotsGuildMates(m_me, candidate) ? PLAYERBOT_GUILD_PARTY_POINTS : 0);
+								(ArePlayerBotsGuildMates(m_me, candidate) ? PLAYERBOT_GUILD_PARTY_POINTS : 0) +
+								((bPairHasShaman &&
+									IsPlayerBotFrontierMapIndex(m_me->GetMapIndex()))
+									? PLAYERBOT_PARTY_SHAMAN_POINTS : 0);
 						if (affinity > m_iSoloAffinity)
 						{
 							m_iSoloAffinity = affinity;
@@ -326,6 +374,7 @@ namespace
 			LPCHARACTER m_pSoloCandidate;
 			int m_iSoloAffinity;
 			bool m_bTargetPartyGuild;
+			bool m_bTargetPartyShaman;
 		};
 
 		TPartyFinder finder(ch, state);
@@ -593,17 +642,20 @@ namespace
 			}
 		}
 
-		// The day's wait the engine puts between two reads of one skill, cut to
-		// PLAYERBOT_BOOK_FAST_DELAY while the panel's BOOKS switch is on. The
-		// engine's own way round the wait is an Exorcism Scroll, which a bot
-		// rarely has; this is the scroll without the item.
+		// The day's wait the engine puts between two reads of one skill
+		// (SKILLBOOK_DELAY_MIN..MAX, eighteen to thirty hours) is waved away
+		// entirely while the panel's BOOKS switch is on. The engine's own way
+		// round it is an Exorcism Scroll, which a bot rarely has; this is the
+		// scroll without the item, and without a wait of its own - what a bot
+		// reads is limited by how many books it is holding, not by a clock.
+		//
+		// The two rules that decide how far a skill actually gets are the
+		// engine's and are not touched here: how many successful reads take it
+		// to G, and the roll on each read. A bot with a bagful still fails a
+		// third of them and still needs ten that land.
 		if (IsPlayerBotFastBooksEnabled() &&
 				get_global_time() < ch->GetSkillNextReadTime(bestSkillVnum))
-		{
-			const DWORD dwLastRead = state.mapBookReadTime[bestSkillVnum];
-			if (dwLastRead == 0 || dwNow - dwLastRead >= PLAYERBOT_BOOK_FAST_DELAY)
-				ch->SetSkillNextReadTime(bestSkillVnum, get_global_time());
-		}
+			ch->SetSkillNextReadTime(bestSkillVnum, get_global_time());
 		// Still waiting, and no scroll to wave the wait away: asking the engine
 		// anyway cost a refusal every eight seconds and a "read" line that read
 		// nothing - a hundred and ninety of them in eight minutes.
@@ -614,13 +666,89 @@ namespace
 		const BYTE oldLevel = ch->GetSkillLevel(bestSkillVnum);
 		if (ch->UseItem(TItemPos(INVENTORY, bestCell)))
 		{
-			state.mapBookReadTime[bestSkillVnum] = dwNow;
 			SetPlayerBotAction(state, BOT_ACTION_READ_BOOK, dwNow);
 			sys_log(0, "PLAYERBOT_AI: read skill book pid=%u name=%s skill=%u old_level=%u new_level=%u success=%d",
 					ch->GetPlayerID(), ch->GetName(), bestSkillVnum, oldLevel,
 					ch->GetSkillLevel(bestSkillVnum),
 					ch->GetSkillLevel(bestSkillVnum) > oldLevel ? 1 : 0);
 		}
+	}
+
+	// Once a minute, the reasons the level-40 bots in Bokjung are there.
+	const char* PLAYERBOT_M2_STAY_REASONS[] = {
+		"retreat", "defence", "visit", "errand", "market", "fishing", "stall",
+		"quest", "material", "travel", "no_plan", "none"
+	};
+	const int PLAYERBOT_M2_STAY_REASON_COUNT =
+			(int)(sizeof(PLAYERBOT_M2_STAY_REASONS) / sizeof(PLAYERBOT_M2_STAY_REASONS[0]));
+	int s_aiPlayerBotM2Stay[PLAYERBOT_M2_STAY_REASON_COUNT] = { 0 };
+	DWORD s_dwPlayerBotM2CensusTime = 0;
+	bool s_bPlayerBotM2CensusPass = false;
+
+	void NotePlayerBotM2Stay(const char* reason)
+	{
+		for (int i = 0; i < PLAYERBOT_M2_STAY_REASON_COUNT; ++i)
+			if (strcmp(reason, PLAYERBOT_M2_STAY_REASONS[i]) == 0)
+			{
+				++s_aiPlayerBotM2Stay[i];
+				return;
+			}
+	}
+
+	// One bot, one line, everything the 8 September audit asked to be able to
+	// read: what it is for, what is holding it, and what happens next.
+	//
+	// The census counts; this explains. A few bots a minute rather than all of
+	// them, because the point is to be able to follow one bot through a cycle,
+	// not to fill the log with a hundred identical lines.
+	void ReportPlayerBotM2Why(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
+	{
+		if (!ch)
+			return;
+		size_t redCount = 0, blueCount = 0;
+		CountPlayerBotPotions(ch, redCount, blueCount);
+		LPCHARACTER target = state.dwTargetVID != 0
+				? CHARACTER_MANAGER::instance().Find(state.dwTargetVID) : NULL;
+		sys_log(0, "PLAYERBOT_M2: why pid=%u name=%s level=%u goal=%u grind=%d service=%d service_age_ms=%u retry_in_ms=%d "
+				"departure_to=%ld departure_age_ms=%u red=%u blue=%u target=%s target_level=%u combat_reason=%s "
+				"route=%u/%u nav_defer=%u nav_wait_ms=%u action=%u",
+				ch->GetPlayerID(), ch->GetName(), ch->GetLevel(),
+				(unsigned int)state.bLongTermGoal,
+				IsPlayerBotGrindAllowedHere(ch) ? 1 : 0,
+				state.bServicePending ? 1 : 0,
+				state.dwServiceSince != 0 ? dwNow - state.dwServiceSince : 0,
+				state.dwServiceRetryAt != 0 ? (int)(state.dwServiceRetryAt - dwNow) : -1,
+				state.lDepartureMap,
+				state.dwDepartureSince != 0 ? dwNow - state.dwDepartureSince : 0,
+				(unsigned int)redCount, (unsigned int)blueCount,
+				target ? target->GetName() : "-",
+				target ? target->GetLevel() : 0,
+				playerbot_combat_value::ReasonName(
+						(playerbot_combat_value::Reason)state.bLastCombatReason),
+				(unsigned int)state.uRouteIndex, (unsigned int)state.vecRoute.size(),
+				(unsigned int)state.bNavDeferredCount,
+				state.dwFirstNavDeferTime != 0 ? dwNow - state.dwFirstNavDeferTime : 0,
+				(unsigned int)state.bCurrentAction);
+	}
+
+	void ReportPlayerBotM2Census()
+	{
+		char line[512];
+		int used = 0;
+		int total = 0;
+		for (int i = 0; i < PLAYERBOT_M2_STAY_REASON_COUNT; ++i)
+		{
+			total += s_aiPlayerBotM2Stay[i];
+			if (s_aiPlayerBotM2Stay[i] == 0)
+				continue;
+			const int written = snprintf(line + used, sizeof(line) - used, " %s=%d",
+					PLAYERBOT_M2_STAY_REASONS[i], s_aiPlayerBotM2Stay[i]);
+			if (written > 0 && used + written < (int)sizeof(line))
+				used += written;
+			s_aiPlayerBotM2Stay[i] = 0;
+		}
+		line[used] = 0;
+		sys_log(0, "PLAYERBOT_M2: census level40plus=%d%s", total, line);
 	}
 
 	bool ResetPlayerBotIfInactive(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
@@ -644,7 +772,10 @@ namespace
 				dwNow - state.dwLastBotSkillTime <= 10000;
 		// An angler stands still on purpose: a single cast can wait 40 s for the
 		// bite alone, so stillness at the bank is the activity, not a symptom.
-		if (moved || foughtRecently || castRecently || state.bFishingSession)
+		// A bot resting in town stands still on purpose, exactly like an angler
+		// waiting for a bite - stillness is the activity, not a symptom.
+		if (moved || foughtRecently || castRecently || state.bFishingSession ||
+				state.dwTownLingerUntil != 0)
 		{
 			state.dwLastMeaningfulActivityTime = dwNow;
 			state.lLastX = ch->GetX();
@@ -664,8 +795,29 @@ namespace
 				state.bVisitingStable ? 1 : 0, (unsigned int)state.uRouteIndex,
 				(unsigned int)state.vecRoute.size());
 
+		// The errand survives the reset. FinishPlayerBotTownVisit clears the
+		// phase and the stuck route - which is what the watchdog is for - but
+		// the need that brought the bot to town is handed to SERVICE_RECOVERY
+		// rather than to whatever monster is standing nearby, and the bot stays
+		// out of ordinary fights until its retry comes round.
 		if (state.bVisitingShop)
+		{
+			const bool stillNeeded = NeedsPlayerBotPotions(ch) ||
+					BlocksPlayerBotTravel(ch);
 			FinishPlayerBotTownVisit(ch, state, dwNow, false);
+			if (stillNeeded)
+			{
+				if (state.dwServiceSince == 0)
+					state.dwServiceSince = dwNow;
+				state.bServicePending = true;
+				state.dwServiceRetryAt = dwNow + number(
+						(int)PLAYERBOT_SERVICE_RETRY_MIN, (int)PLAYERBOT_SERVICE_RETRY_MAX);
+				state.dwNextShopCheckTime = state.dwServiceRetryAt;
+				sys_log(0, "PLAYERBOT_SERVICE: recovery armed pid=%u name=%s map=%ld retry_in_ms=%u age_ms=%u",
+						ch->GetPlayerID(), ch->GetName(), ch->GetMapIndex(),
+						state.dwServiceRetryAt - dwNow, dwNow - state.dwServiceSince);
+			}
+		}
 
 		// A leader and its nearby followers can keep each other in
 		// BOT_ACTION_PARTY_ASSEMBLE after a failed shared objective.  Merely
@@ -679,6 +831,10 @@ namespace
 			state.dwPartyExpireTime = 0;
 			state.dwNextPartyCheckTime = dwNow + number(60000, 120000);
 		}
+		// Deliberately not cleared here: bServicePending, dwServiceRetryAt,
+		// dwServiceSince and the departure intent. A reset drops a stale route
+		// and a stale target; the reason the bot came to town and the map it
+		// means to leave for outlive it.
 		state.bVisitingBiologist = false;
 		state.bVisitingStable = false;
 		state.bTacticalRetreat = false;
@@ -725,6 +881,7 @@ CPlayerBotManager::CPlayerBotManager()
 	  m_bPendingSpawnEmpire(0),
 	  m_dwSpawnWindowStarted(0),
 	  m_uSpawnWindowTotal(0),
+	  m_dwNextTopUpTime(0),
 	  m_bRegistryLoaded(false),
 	  m_bRegistryAvailable(false)
 {
@@ -841,7 +998,61 @@ bool CPlayerBotManager::LoadRegisteredBots()
 
 	sys_log(0, "PLAYERBOT_AUTH: loaded %u registered bot identities",
 			(unsigned int)m_setRegisteredBots.size());
+	ReportPlayerBotRegistryShortfall((unsigned int)m_setRegisteredBots.size());
 	return true;
+}
+
+// Why the cohort is smaller than the seed, in one line.
+//
+// The query above is a single conjunction: a row that fails any of six
+// conditions disappears without a word, and the only number anybody sees is
+// the total. An operator who asks the launcher for a thousand bots and gets
+// six hundred and fifty has nothing to go on - reported from the Discord
+// exactly that way - so the same joins are counted again, one column per
+// reason, and the answer is printed once at startup.
+//
+// LEFT JOINs and conditional sums, because the point is to count what the
+// working query threw away. It runs once per process and touches the same
+// rows the load already read.
+void CPlayerBotManager::ReportPlayerBotRegistryShortfall(unsigned int usable)
+{
+	const char* query =
+			"SELECT COUNT(*),"
+			" SUM(l.seed_version<>1 OR l.state NOT IN ('complete','adopted')),"
+			" SUM(p.id IS NULL),"
+			" SUM(p.id IS NOT NULL AND a.id IS NULL),"
+			" SUM(a.id IS NOT NULL AND pi.id IS NULL),"
+			" SUM(a.id IS NOT NULL AND BINARY a.login<>BINARY CONCAT('playerbot_',"
+			"  LPAD(l.pid-3,GREATEST(3,LENGTH(l.pid-3)),'0'))),"
+			" SUM(a.id IS NOT NULL AND BINARY a.social_id<>BINARY CONCAT('9',LPAD(l.pid-3,12,'0'))),"
+			" SUM(pi.id IS NOT NULL AND (pi.pid1<>l.pid OR pi.pid2<>0 OR pi.pid3<>0 OR pi.pid4<>0)),"
+			" SUM(pi.id IS NOT NULL AND pi.empire<>2) "
+			"FROM common.playerbot_seed_state AS l "
+			"LEFT JOIN player.player AS p ON p.id=l.pid "
+			"LEFT JOIN account.account AS a ON a.id=p.account_id "
+			"LEFT JOIN player.player_index AS pi ON pi.id=a.id";
+
+	std::unique_ptr<SQLMsg> msg(AccountDB::instance().DirectQuery(query));
+	if (!msg.get() || msg->uiSQLErrno != 0 || !msg->Get() || !msg->Get()->pSQLResult)
+		return;
+	MYSQL_ROW row = mysql_fetch_row(msg->Get()->pSQLResult);
+	if (!row)
+		return;
+
+	DWORD value[9];
+	for (int i = 0; i < 9; ++i)
+	{
+		value[i] = 0;
+		if (row[i])
+			str_to_number(value[i], row[i]);
+	}
+	sys_log(0, "PLAYERBOT_AUTH: registry rows=%u usable=%u rejected: "
+			"not_complete=%u no_character=%u no_account=%u no_index=%u "
+			"login=%u social_id=%u other_characters=%u wrong_empire=%u",
+			(unsigned int)value[0], usable, (unsigned int)value[1],
+			(unsigned int)value[2], (unsigned int)value[3], (unsigned int)value[4],
+			(unsigned int)value[5], (unsigned int)value[6], (unsigned int)value[7],
+			(unsigned int)value[8]);
 }
 
 bool CPlayerBotManager::IsRegistered(DWORD dwPlayerID)
@@ -902,6 +1113,53 @@ void CPlayerBotManager::SpawnPendingBatch(DWORD dwNow)
 		sys_log(0, "PLAYERBOT: staggered spawn complete scheduled=%u over=%ums",
 				(unsigned int)m_uSpawnWindowTotal,
 				(unsigned int)(dwNow - m_dwSpawnWindowStarted));
+}
+
+// Put back whoever the world has lost.
+//
+// SpawnRegistered fills the queue once and drains it over a minute, and that
+// was the whole of it: nothing ever looked again. A bot whose load failed, or
+// which left the world later, stayed gone until somebody restarted the server -
+// which is what "I asked for a thousand, six hundred and fifty arrived, and an
+// hour later I had three hundred and fifty" looks like from the inside.
+//
+// Bounded by what was actually asked for: only the identities inside the
+// original window are considered, so this restores the cohort and never grows
+// it. It runs a minute apart and reuses the same staggered queue, so a hundred
+// missing bots come back the way they arrived rather than all in one tick.
+void CPlayerBotManager::TopUpMissingBots(DWORD dwNow)
+{
+	// Not while the first fill is still running, and not before there was one.
+	if (m_uSpawnWindowTotal == 0 || !m_dequePendingSpawns.empty())
+		return;
+	if (m_dwNextTopUpTime != 0 && dwNow < m_dwNextTopUpTime)
+		return;
+	m_dwNextTopUpTime = dwNow + PLAYERBOT_TOPUP_INTERVAL;
+	if (!LoadRegisteredBots())
+		return;
+
+	size_t considered = 0, live = 0;
+	std::deque<DWORD> missing;
+	for (TRegisteredPlayerBotSet::const_iterator it = m_setRegisteredBots.begin();
+			it != m_setRegisteredBots.end() && considered < m_uSpawnWindowTotal;
+			++it, ++considered)
+	{
+		if (CHARACTER_MANAGER::instance().FindByPID(*it) != NULL)
+			++live;
+		else
+			missing.push_back(*it);
+	}
+	if (missing.empty())
+		return;
+
+	m_dequePendingSpawns = missing;
+	m_uSpawnBatchSize = std::max<size_t>(1, m_uSpawnBatchSize);
+	m_bPendingSpawnEmpire = 2;
+	m_dwNextSpawnBatchTime = 0;
+	sys_log(0, "PLAYERBOT: topping up asked=%u live=%u missing=%u",
+			(unsigned int)m_uSpawnWindowTotal, (unsigned int)live,
+			(unsigned int)missing.size());
+	SpawnPendingBatch(dwNow);
 }
 
 bool CPlayerBotManager::Despawn(DWORD dwPlayerID)
@@ -1057,6 +1315,8 @@ void CPlayerBotManager::Update()
 
 	// The next batch of the cohort, if one is due - see PLAYERBOT_SPAWN_WINDOW.
 	SpawnPendingBatch(dwNow);
+	// And a minute apart, whoever is missing from it.
+	TopUpMissingBots(dwNow);
 
 	// Once for the whole population: the panel may have moved a weight since
 	// the last tick, and every bot planned below must see the same numbers.
@@ -1095,6 +1355,10 @@ void CPlayerBotManager::Update()
 		s_dwPlayerBotLoadReportTime = dwNow;
 	}
 	ReportPlayerBotSpotMemory(dwNow);
+	s_bPlayerBotM2CensusPass = s_dwPlayerBotM2CensusTime == 0 ||
+			dwNow - s_dwPlayerBotM2CensusTime >= 60000;
+	if (s_bPlayerBotM2CensusPass)
+		s_dwPlayerBotM2CensusTime = dwNow;
 	RefreshPlayerBotMarketLedger(dwNow);
 
 	for (TPlayerBotMap::iterator it = m_mapBots.begin(); it != m_mapBots.end(); ++it)
@@ -1180,7 +1444,7 @@ void CPlayerBotManager::Update()
 		if (ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M1 ||
 				ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2 ||
 				ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M3 ||
-				ch->GetMapIndex() == PLAYERBOT_MAP_MONKEY_EASY ||
+				IsPlayerBotMonkeyMap(ch->GetMapIndex()) ||
 				IsPlayerBotFrontierMap(ch->GetMapIndex()))
 		{
 			const long currentMap = ch->GetMapIndex();
@@ -1218,11 +1482,8 @@ void CPlayerBotManager::Update()
 						fallbackX = PLAYERBOT_M3_ARRIVAL_X;
 						fallbackY = PLAYERBOT_M3_ARRIVAL_Y;
 					}
-					else if (currentMap == PLAYERBOT_MAP_MONKEY_EASY)
-					{
-						fallbackX = PLAYERBOT_MONKEY_EASY_ARRIVAL_X;
-						fallbackY = PLAYERBOT_MONKEY_EASY_ARRIVAL_Y;
-					}
+					else if (IsPlayerBotMonkeyMap(currentMap))
+						GetPlayerBotMonkeyArrival(currentMap, fallbackX, fallbackY);
 					else
 						GetPlayerBotFrontierArrival(currentMap, fallbackX, fallbackY);
 					foundSafe = navigation.FindNearestWalkableWorld(
@@ -1247,6 +1508,58 @@ void CPlayerBotManager::Update()
 			}
 		}
 
+		// Before anything may claim the tick: which Monkey Dungeon chamber this
+		// bot is in now, since a portal it walked past has already moved it.
+		UpdatePlayerBotMonkeyChamber(ch, state, dwNow);
+
+		// The census, once a minute: why each level-40 bot in Bokjung is there.
+		if (s_bPlayerBotM2CensusPass && ch->GetLevel() >= 40 &&
+				ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2)
+		{
+			NotePlayerBotM2Stay(ClassifyPlayerBotTownStay(ch, state, dwNow));
+			// A rotating handful explains itself in full. The rotation is by
+			// minute so following one bot across a cycle is possible without
+			// eight hundred lines a minute.
+			if ((ch->GetPlayerID() + dwNow / 60000U) % 24U == 0)
+				ReportPlayerBotM2Why(ch, state, dwNow);
+		}
+
+		// A service that cannot be finished must not hold the bot for ever: past
+		// PLAYERBOT_SERVICE_GIVE_UP the recovery is abandoned with a reason, and
+		// the ordinary planner has the bot back. Better a bot that hunts than a
+		// bot that waits on a merchant it will never reach.
+		if (state.bServicePending && state.dwServiceSince != 0 &&
+				dwNow - state.dwServiceSince > PLAYERBOT_SERVICE_GIVE_UP)
+		{
+			sys_log(0, "PLAYERBOT_SERVICE: gave up pid=%u name=%s map=%ld age_ms=%u red_low=%d blocked=%d",
+					ch->GetPlayerID(), ch->GetName(), ch->GetMapIndex(),
+					dwNow - state.dwServiceSince, NeedsPlayerBotPotions(ch) ? 1 : 0,
+					BlocksPlayerBotTravel(ch) ? 1 : 0);
+			state.bServicePending = false;
+			state.dwServiceRetryAt = 0;
+			state.dwServiceSince = 0;
+		}
+		// The need may simply have gone away - a bot that bought from a counter
+		// beside it, or whose gear turned up as loot.
+		if (state.bServicePending && !NeedsPlayerBotPotions(ch) &&
+				!BlocksPlayerBotTravel(ch))
+		{
+			state.bServicePending = false;
+			state.dwServiceRetryAt = 0;
+			state.dwServiceSince = 0;
+		}
+
+		// And whether the defence episode is over. It ends when the fighting
+		// has actually stopped, not when its timer runs out: otherwise the next
+		// attacker starts a fresh one and the bound means nothing.
+		if (state.dwDefenceEpisodeStart != 0 &&
+				(state.dwLastCombatActionTime == 0 ||
+				 dwNow - state.dwLastCombatActionTime > PLAYERBOT_DEFENCE_QUIET_TIME))
+		{
+			state.dwDefenceEpisodeStart = 0;
+			state.dwDefenceTargetVID = 0;
+		}
+
 		ManagePlayerBotStats(ch, state, dwNow);
 		ManagePlayerBotSkills(ch, state, dwNow);
 		if (RescuePlayerBotWithoutSectree(ch, state, dwNow))
@@ -1257,6 +1570,21 @@ void CPlayerBotManager::Update()
 
 		ManagePlayerBotSkillBooks(ch, state, dwNow);
 		ManagePlayerBotSoulStones(ch, state, dwNow);
+		ManagePlayerBotThirdHand(ch, state, dwNow);
+		// Opening a chest belongs with the other upkeep, not after it. Down at
+		// the bottom of the tick - past combat, loot, travel, the town and the
+		// wandering, each of which claims the tick - it was reached so rarely
+		// that 589 bots sat on 9624 Moonlight chests, the largest stack 106
+		// deep, and opened 190 in an hour between them. Their bags were not the
+		// problem: 29 cells of 90 in use on average, none above 84.
+		ManagePlayerBotChests(ch, state, dwNow);
+		// The catch, wherever the bot happens to be standing. It used to be
+		// opened only between casts, so an angler that walked away from the bank
+		// carried its fish around instead - and a live fish does not stack, so a
+		// bag with thirty of them has no room for anything the bot is out there
+		// for. One item a tick, like the chests above.
+		ProcessPlayerBotCatch(ch);
+		ManagePlayerBotHairDye(ch);
 		ManagePlayerBotGuild(ch, state, dwNow);
 		ManagePlayerBotParty(ch, state, dwNow);
 		// The regular levelup.quest opens a selection dialog. A fake descriptor
@@ -1339,6 +1667,16 @@ void CPlayerBotManager::Update()
 				ManagePlayerBotFishing(ch, state, dwNow))
 			continue;
 
+		// Spending time in town once the errand that brought the bot here is
+		// done - and above the travel pass, not below it. The rod carries a
+		// level limit of thirty, so every angler is old enough for the frontier
+		// and the travel pass walked each one straight back out of Joan on the
+		// tick its session ended: the rest never got a turn. It claims the tick
+		// like fishing does, for a bounded few minutes, and ends the moment
+		// anything real wants the bot.
+		if (ManagePlayerBotTownLinger(ch, state, dwNow))
+			continue;
+
 		// Move between the real Chunjo portals in controlled, staggered waves.
 		// M2, M3 and the empire-specific easy Monkey Dungeon share this core, so
 		// map changes remain visible to native desktop clients.
@@ -1366,7 +1704,6 @@ void CPlayerBotManager::Update()
 		{
 			size_t occupiedItems = 0;
 			size_t occupiedGridCells = 0;
-			size_t hpPots = 0;
 			for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
 			{
 				LPITEM it = ch->GetInventoryItem(cell);
@@ -1374,9 +1711,6 @@ void CPlayerBotManager::Update()
 				{
 					++occupiedItems;
 					occupiedGridCells += std::max(1, (int)it->GetSize());
-					const DWORD v = it->GetVnum();
-					if (v == 27001 || v == 27002 || v == 27003 || v == 27051)
-						++hpPots;
 				}
 			}
 
@@ -1387,13 +1721,25 @@ void CPlayerBotManager::Update()
 			const bool bInventoryFull =
 					occupiedGridCells * 100 >= INVENTORY_MAX_NUM * 45 ||
 					ch->GetEmptyInventory(3) < 0;
-			const bool bOutPotions = (hpPots == 0 && occupiedItems >= 15);
+			// The same question the planner asked. It used to be a different one:
+			// this counted stacks rather than potions, looked at four red vnums
+			// and no blue ones at all, and only fired on an empty belt in a
+			// half-full bag - while NeedsPlayerBotPotions, which decides the
+			// goal, counts individual potions and answers for red under 150 or
+			// blue under 100. So a bot with one stack of 32 reds and 56 blues
+			// carried BOT_GOAL_RESTOCK and never began the visit that would end
+			// it, and stood in Bokjung fighting whatever walked past instead:
+			// 116 bots of level 40 and over were on that map when this was
+			// found. The 5-10 minute shop cooldown above still paces the retry,
+			// and NeedsPlayerBotPotions wants the money for the trip, so a bot
+			// that cannot afford potions does not loop between merchants.
+			const bool bNeedsPotions = NeedsPlayerBotPotions(ch);
 			const bool bNeedsRefine = HasPlayerBotRefineOpportunity(ch);
 			const bool bNeedsGearUpgrade = bNeedsCoreGear || NeedsPlayerBotArrows(ch);
 			const bool bNeedsSellRun = CountPlayerBotJunkItems(ch) >= 12;
 			const bool bNeedsPotionCleanup = HasPlayerBotExcessPotions(ch);
 
-			if (bNeedsProfession || bInventoryFull || bOutPotions || bWeaponMissing ||
+			if (bNeedsProfession || bInventoryFull || bNeedsPotions || bWeaponMissing ||
 					bNeedsRefine || bNeedsGearUpgrade || bNeedsSellRun ||
 					bNeedsPotionCleanup)
 				StartPlayerBotTownVisit(ch, state, dwNow);
@@ -1442,7 +1788,6 @@ void CPlayerBotManager::Update()
 		UseHealthPotion(ch, state, dwNow);
 		UseManaPotion(ch, state, dwNow);
 		UseUtilityPotions(ch, state, dwNow);
-		ManagePlayerBotChests(ch, state, dwNow);
 		UsePlayerBotBoosters(ch, state, dwNow);
 		ManagePlayerBotScrollRefine(ch, state, dwNow);
 		// This also catches a bot loaded from the database at critically low HP
@@ -1497,6 +1842,13 @@ void CPlayerBotManager::Update()
 			continue;
 		if (HandlePlayerBotMultiPull(ch, state, dwNow))
 			continue;
+		// The Archer's luring course. It owns movement and the shot for as long
+		// as it runs - including the ticks it spends waiting for the bow - so it
+		// goes here, before target acquisition and after everything that keeps a
+		// bot alive. The multi-pull above can never be running at the same time:
+		// it refuses a bot that is in a party, and this one needs five.
+		if (HandlePlayerBotLureCourse(ch, state, dwNow))
+			continue;
 		// Before anything else looks at where this bot is: a half-completed warp
 		// leaves the position and the sector disagreeing, and the next logout
 		// saves coordinates no login can ever load.
@@ -1541,11 +1893,21 @@ void CPlayerBotManager::Update()
 		const bool bTargetIsMonster = (target && target->IsMonster());
 		const bool bTargetNeedsParty = bTargetIsMonster &&
 				target->GetLevel() > ch->GetLevel() + PLAYERBOT_MAX_TARGET_LEVEL_DELTA;
+		// Something ten levels up is not a fight a bot picks - but it is a
+		// fight a bot is in, once that something is hitting it. The level cap
+		// used to drop the target either way, so a bot set upon by anything
+		// strong stood there swinging at nothing and died running. Breaking off
+		// is the survival pass's decision and it still outranks this; what the
+		// cap decides is what a bot walks up to, not what it answers.
 		const bool bPartyCanContinue = !bTargetNeedsParty ||
+				(target && target->GetVictim() == ch) ||
 				CanPlayerBotPartyChallenge(ch, target, dwNow, NULL);
 
 		if (!target || target->IsDead() || (!bTargetIsMonster && !bTargetIsStone) ||
 			(bTargetIsStone && !IsPlayerBotMetinWorthFighting(ch, target)) ||
+			// And the same question for an ordinary monster, on a clock: the
+			// errand that justified this fight may have finished since it began.
+			(bTargetIsMonster && !IsPlayerBotHeldTargetStillWorth(ch, target, state, dwNow)) ||
 			!bPartyCanContinue ||
 			IsPlayerBotSafeZone(ch->GetMapIndex(), target ? target->GetX() : ch->GetX(),
 					target ? target->GetY() : ch->GetY()) ||
@@ -1559,6 +1921,12 @@ void CPlayerBotManager::Update()
 				TPlayerBotLoadTimer targetTimer(s_uPlayerBotLoadTargetUs);
 				++s_uPlayerBotLoadTargetSearches;
 				target = FindPlayerBotEngagedTarget(ch);
+				// An engaged monster is usually self-defence and passes, but the
+				// finder also returns what is fighting the party from across the
+				// field - so it goes through the same filter as everything else
+				// rather than round it.
+				if (target && !IsPlayerBotTargetWorthNow(ch, target, state, dwNow))
+					target = NULL;
 				if (!target)
 					target = FindDistributedTarget(ch, state, dwNow);
 				if (!target)
@@ -1566,7 +1934,13 @@ void CPlayerBotManager::Update()
 			}
 			state.dwTargetVID = target ? (DWORD)target->GetVID() : 0;
 			if (target && target->IsMonster())
+			{
 				RememberPlayerBotSpotFight(ch->GetMapIndex(), target->GetX(), target->GetY(), dwNow);
+				// If this one is hitting the bot, the defence episode starts here
+				// and nowhere else - a clock that is restarted on every tick, or
+				// on every blow, bounds nothing at all.
+				NotePlayerBotDefenceEpisode(ch, state, target, dwNow);
+			}
 
 			if (target)
 			{
@@ -1677,11 +2051,6 @@ void CPlayerBotManager::Update()
 		ch->SetPosition(POS_FIGHTING);
 		ch->SetRotationToXY(target->GetX(), target->GetY());
 
-		// In a compact party of five or more, an Archer periodically tags one
-		// additional nearby pack before returning to the shared focus target.
-		if (ExecutePlayerBotArcherLuring(ch, state, dwNow))
-			continue;
-
 		if (ExecutePlayerBotAttackSkill(ch, target, state, dwNow))
 		{
 			NotePlayerBotBattleHorseKill(ch, state, target);
@@ -1692,6 +2061,12 @@ void CPlayerBotManager::Update()
 		NotePlayerBotBattleHorseKill(ch, state, target);
 
 	}
+
+	// The census was taken over the pass that has just finished, so it is
+	// written here rather than at the top: one line, one minute, every bot of
+	// level forty and over standing in Bokjung counted once.
+	if (s_bPlayerBotM2CensusPass)
+		ReportPlayerBotM2Census();
 
 	// Publish one compact, atomic snapshot per game core. The web panel reads
 	// these files from the shared read-only game-var volume, so it sees the real

@@ -317,9 +317,34 @@ function Get-M2DockerPreflight {
     if ($dockerCliPresent) {
         [void]$checks.Add('OK: Docker CLI jest zainstalowany.')
         $dockerProbe = Invoke-M2DiagnosticProcess -FileName 'docker.exe' -Arguments 'info --format "{{.ServerVersion}}"' -TimeoutMilliseconds 3500
-        $dockerEngineReady = $dockerProbe.ExitCode -eq 0 -and -not $dockerProbe.TimedOut
+        $dockerProbeText = if ($null -ne $dockerProbe.Output) { $dockerProbe.Output.Trim() } else { '' }
+        # `docker info` exits 0 and still prints the daemon's own refusal. "Error
+        # response from daemon: Docker Desktop is unable to start" arrives on
+        # stderr, where the server version should be, and the exit code says
+        # nothing is wrong - so the check reported "OK: Docker Engine odpowiada
+        # (wersja Error response from daemon: Docker Desktop is unable to start)"
+        # and a verdict of "mozna uruchomic serwer", six times over, to a player
+        # whose WSL was broken. He therefore never saw the one warning that names
+        # what to repair, because that warning is only raised when the engine is
+        # known to be down. A version is digits and dots; anything else is the
+        # engine failing to answer.
+        $dockerVersion = ''
+        foreach ($probeLine in ($dockerProbeText -split "`r?`n")) {
+            $candidate = $probeLine.Trim()
+            if ($candidate -match '^\d+(\.\d+)+') {
+                $dockerVersion = $candidate
+                break
+            }
+        }
+        $dockerEngineReady = $dockerProbe.ExitCode -eq 0 -and -not $dockerProbe.TimedOut -and $dockerVersion -ne ''
         if ($dockerEngineReady) {
-            [void]$checks.Add("OK: Docker Engine odpowiada (wersja $($dockerProbe.Output.Trim())).")
+            [void]$checks.Add("OK: Docker Engine odpowiada (wersja $dockerVersion).")
+        }
+        elseif ($dockerProbeText -and -not $dockerProbe.TimedOut) {
+            # What the daemon said, not a tidy summary of it: the message names
+            # the fault and the player pastes it straight into a report.
+            [void]$checks.Add("BLAD: Docker Engine nie odpowiada: $dockerProbeText")
+            [void]$warnings.Add("Silnik Dockera nie wystartowal: $dockerProbeText")
         }
         elseif ($dockerProcessesRunning) {
             [void]$checks.Add('UWAGA: Docker Desktop jest otwarty, ale Engine jeszcze nie odpowiada.')
