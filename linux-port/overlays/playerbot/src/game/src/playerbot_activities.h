@@ -104,9 +104,9 @@ namespace
 		long approachX = 0, approachY = 0;
 		GetPlayerBotNpcApproach(ch->GetPlayerID(), stableX, stableY,
 				inM2 ? 0x4d324853U : 0x484f5253U, approachX, approachY);
-		if (DISTANCE_APPROX(ch->GetX() - approachX, ch->GetY() - approachY) > 650)
+		if (DISTANCE_APPROX(ch->GetX() - approachX, ch->GetY() - approachY) > PLAYERBOT_STABLE_ARRIVE_DISTANCE)
 		{
-			if (!MovePlayerBot(ch, approachX, approachY, dwNow, 20, true, true) &&
+			if (!MovePlayerBot(ch, approachX, approachY, dwNow, PLAYERBOT_STABLE_SNAP_CELLS, true, true) &&
 					state.bStuckCounter >= 6)
 			{
 				state.bVisitingStable = false;
@@ -321,6 +321,23 @@ namespace
 	static_assert(PLAYERBOT_FISHING_ARRIVE >= PLAYERBOT_NAV_ARRIVAL_DISTANCE,
 			"an arrival radius below the navigation's own strands the bot short of it");
 
+	// Rods in the bag, whatever their grade. The engine refines a rod as it
+	// is fished with (fishing.cpp: a roll per catch, and the rod becomes its
+	// GetRefinedVnum, a new item), so a bot's Wedka+1 is a Wedka+2 after a
+	// session and CountSpecifyItem(27400) says none: three of five anglers in
+	// Joan had bought rods until the bag was full of them.
+	int CountPlayerBotRods(LPCHARACTER ch)
+	{
+		int rods = 0;
+		for (WORD cell = 0; ch && cell < INVENTORY_MAX_NUM; ++cell)
+		{
+			LPITEM item = ch->GetInventoryItem(cell);
+			if (item && item->GetType() == ITEM_ROD)
+				++rods;
+		}
+		return rods;
+	}
+
 	bool EquipPlayerBotRod(LPCHARACTER ch)
 	{
 		if (!ch)
@@ -328,21 +345,25 @@ namespace
 		if (IsPlayerBotHoldingRod(ch))
 			return true;
 
+		// The best rod in the bag: the grades are consecutive vnums, so the
+		// highest vnum is the most refined one.
+		LPITEM best = NULL;
 		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
 		{
 			LPITEM item = ch->GetInventoryItem(cell);
-			if (!item || item->GetType() != ITEM_ROD)
-				continue;
-
-			LPITEM worn = ch->GetWear(WEAR_WEAPON);
-			if (worn && !ch->UnequipItem(worn))
-				return false;
-			if (ch->EquipItem(item))
-			{
-				sys_log(0, "PLAYERBOT_FISHING: rod equipped pid=%u name=%s vnum=%u",
-						ch->GetPlayerID(), ch->GetName(), item->GetVnum());
-				return true;
-			}
+			if (item && item->GetType() == ITEM_ROD && (!best || item->GetVnum() > best->GetVnum()))
+				best = item;
+		}
+		if (!best)
+			return false;
+		LPITEM worn = ch->GetWear(WEAR_WEAPON);
+		if (worn && !ch->UnequipItem(worn))
+			return false;
+		if (ch->EquipItem(best))
+		{
+			sys_log(0, "PLAYERBOT_FISHING: rod equipped pid=%u name=%s vnum=%u",
+					ch->GetPlayerID(), ch->GetName(), best->GetVnum());
+			return true;
 		}
 		return false;
 	}
@@ -665,7 +686,7 @@ namespace
 					what, ch->GetPlayerID(), ch->GetName(), vnum);
 			return false;
 		}
-		const long long price = GetPlayerBotNpcPurchasePrice(proto, count);
+		long long price = GetPlayerBotNpcPurchasePrice(proto, count);
 		if (price <= 0)
 		{
 			PlayerBotLogThrottled("tackle_no_price", dwNow,
@@ -675,7 +696,30 @@ namespace
 		}
 		if (ch->GetGold() < price)
 			RaisePlayerBotEmergencyGold(ch, price, what);
-		if (ch->GetGold() < price)
+		// Buy what the purse reaches rather than nothing at all. A bundle is
+		// twenty worms for eight hundred yang and the bot was refusing the whole
+		// purchase over the last few: caught on our own world with 556 yang in
+		// hand, which is thirteen worms and a session's fishing, standing at the
+		// Rybak buying none of them. Only for a stack - a rod is one item and
+		// either affordable or not.
+		if (ch->GetGold() < price && count > 1)
+		{
+			const long long unit = GetPlayerBotNpcPurchasePrice(proto, 1);
+			const long long spendable = (long long)ch->GetGold() *
+					PLAYERBOT_FISHING_TACKLE_SPEND_PERCENT / 100;
+			const int affordable = unit > 0
+					? (int)std::min<long long>(count, spendable / unit) : 0;
+			if (affordable > 0)
+			{
+				count = affordable;
+				price = GetPlayerBotNpcPurchasePrice(proto, count);
+				PlayerBotLogThrottled("tackle_part_buy", dwNow,
+						"PLAYERBOT_FISHING: buying what it can afford of %s pid=%u name=%s vnum=%u count=%d price=%lld gold=%d",
+						what, ch->GetPlayerID(), ch->GetName(), vnum, count,
+						price, ch->GetGold());
+			}
+		}
+		if (price <= 0 || ch->GetGold() < price)
 		{
 			PlayerBotLogThrottled("tackle_no_gold", dwNow,
 					"PLAYERBOT_FISHING: cannot afford %s pid=%u name=%s vnum=%u count=%d price=%lld gold=%d",
@@ -683,15 +727,27 @@ namespace
 					price, ch->GetGold());
 			return false;
 		}
-		if (!ch->AutoGiveItem(vnum, count, -1, false))
+		// The bag has to have room BEFORE the purchase, because AutoGiveItem
+		// does not refuse a full bag: char_item.cpp puts the item on the ground
+		// at the character's feet (AddToGround + StartDestroyEvent) and hands
+		// it back as a success. So the old "if (!AutoGiveItem)" below never
+		// fired, the bot paid, the rod lay on the grass, the bot still had no
+		// rod and bought another on the next pass - which is the photograph
+		// from the Discord: a herd of summoned horses round the Rybak standing
+		// in a carpet of "Wedka+1". The arrow purchase learned this first
+		// (playerbot_gear.h) and says so in the same words; the tackle purchase
+		// was written a day later without it. A stackable that already has a
+		// stack merges into it and needs no cell - that is the bait case.
+		const bool bMergesIntoStack = count > 1 && ch->CountSpecifyItem(vnum) > 0;
+		if (!bMergesIntoStack && ch->GetEmptyInventory(1) < 0)
 		{
-			// Not poverty - the bag. Reported from the Discord as bots standing
-			// under the Rybak with money and no bait.
 			PlayerBotLogThrottled("tackle_no_room", dwNow,
 					"PLAYERBOT_FISHING: no bag room for %s pid=%u name=%s vnum=%u count=%d gold=%d",
 					what, ch->GetPlayerID(), ch->GetName(), vnum, count, ch->GetGold());
 			return false;
 		}
+		if (!ch->AutoGiveItem(vnum, count, -1, false))
+			return false;
 		ch->PointChange(POINT_GOLD, -price);
 		sys_log(0, "PLAYERBOT_FISHING: bought %s pid=%u name=%s vnum=%u count=%d price=%lld",
 				what, ch->GetPlayerID(), ch->GetName(), vnum, count, price);
@@ -707,7 +763,7 @@ namespace
 		// and returning the same false for both ended the session of every bot
 		// that was already carrying what it came for.
 		bool refused = false;
-		if (!IsPlayerBotHoldingRod(ch) && ch->CountSpecifyItem(PLAYERBOT_FISHING_ROD_VNUM) <= 0)
+		if (!IsPlayerBotHoldingRod(ch) && CountPlayerBotRods(ch) <= 0)
 		{
 			if (!BuyPlayerBotTackleItem(ch, PLAYERBOT_FISHING_ROD_VNUM, 1, "fishing_rod", dwNow))
 				refused = true;
@@ -731,7 +787,9 @@ namespace
 			if (proto)
 			{
 				const long long price = GetPlayerBotNpcPurchasePrice(proto, 1);
+				// Same trap as the rod: no cell means the wood lands on the grass.
 				if (price > 0 && ch->GetGold() >= price &&
+						ch->GetEmptyInventory(1) >= 0 &&
 						ch->AutoGiveItem(PLAYERBOT_CAMPFIRE_VNUM, 1, -1, false))
 				{
 					ch->PointChange(POINT_GOLD, -price);
@@ -810,8 +868,7 @@ namespace
 		// Rod first, then worms: both come from the Rybak, who stands a short walk
 		// upstream of the bank. Running out of bait sends the bot back to him.
 		const bool needsTackle =
-				(!IsPlayerBotHoldingRod(ch) &&
-					ch->CountSpecifyItem(PLAYERBOT_FISHING_ROD_VNUM) <= 0) ||
+				(!IsPlayerBotHoldingRod(ch) && CountPlayerBotRods(ch) <= 0) ||
 				ch->CountSpecifyItem(PLAYERBOT_FISHING_BAIT_VNUM) <
 					PLAYERBOT_FISHING_BAIT_RESTOCK;
 

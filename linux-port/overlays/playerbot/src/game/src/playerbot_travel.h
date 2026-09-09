@@ -53,8 +53,8 @@ namespace
 		// Only a belt that is nearly out is worth crossing a map for. A bot with
 		// half its potions left has no business walking away from a good spot -
 		// it will fill up anyway the next time something else brings it to town.
-		return (redCount < 150 && ch->GetGold() >= 1200) ||
-				(blueCount < 100 && ch->GetGold() >= 1200);
+		return (redCount < PLAYERBOT_POTION_TRIP_RED && ch->GetGold() >= 1200) ||
+				(blueCount < PLAYERBOT_POTION_TRIP_BLUE && ch->GetGold() >= 1200);
 	}
 
 	bool NeedsPlayerBotEmergencyPotions(LPCHARACTER ch)
@@ -83,7 +83,8 @@ namespace
 		// These problems can make continued combat impossible or waste most future
 		// drops, so they justify an immediate cross-map return.
 		if (ch->GetWear(WEAR_WEAPON) == NULL || ch->GetWear(WEAR_BODY) == NULL ||
-				ch->GetWear(WEAR_SHIELD) == NULL || ch->GetWear(WEAR_HEAD) == NULL ||
+				(PlayerBotWantsShield(ch) && ch->GetWear(WEAR_SHIELD) == NULL) ||
+				ch->GetWear(WEAR_HEAD) == NULL ||
 				ch->GetWear(WEAR_FOOTS) == NULL || NeedsPlayerBotEmergencyPotions(ch) ||
 				NeedsPlayerBotArrows(ch) ||
 				ch->GetEmptyInventory(3) < 0)
@@ -114,14 +115,20 @@ namespace
 				ch->GetEmptyInventory(3) < 0;
 	}
 
-	bool NeedsPlayerBotM1OnlyServices(LPCHARACTER ch)
+	bool NeedsPlayerBotM1OnlyServices(LPCHARACTER ch, const TPlayerBotAIState& state, DWORD dwNow)
 	{
 		if (!ch)
 			return false;
-		// Bokjung has no profession trainers or Biologist. Everything else can be
-		// handled locally in M2, so only these two real activities justify M2 -> M1.
+		// Bokjung has no profession trainers, no Biologist and no old woman.
+		// Everything else can be handled locally in M2, so only these real
+		// activities justify M2 -> M1.
 		if (ch->GetLevel() >= 5 && ch->GetSkillGroup() == 0 &&
 				ch->GetJob() <= JOB_SHAMAN)
+			return true;
+		// Her too: a skill stuck at seventeen with no points left to try
+		// anything else is worth a trip to Joan while the character is still
+		// young enough for her to serve it.
+		if (ShouldPlayerBotResetSkills(ch, state, dwNow))
 			return true;
 
 		size_t missionIndex = 0;
@@ -229,17 +236,39 @@ namespace
 		// Dungeon - it is the only hosted map that drops the Frog Tongue, the
 		// Leaf, the Unknown Talisman+ and the Curse Book+, which eighteen refine
 		// recipes want and no counter in this world has ever carried.
+		// A Metin hunter by role never draws the Spider Dungeon: it has no
+		// stones (PlayerBotMapHasMetinStones), and the draw is for life, so
+		// that hunter would have spent its whole career looking for stones on
+		// the one frontier map that spawns none. Sohan takes its share; the
+		// expedition roll in playerbot_planner.h makes the same check for the
+		// half-hour hunters, whose draw stands.
+		TPlayerBotAIStateMap::const_iterator role = s_mapPlayerBotAIStates.find(ch->GetPlayerID());
+		const bool stoneHunter = role != s_mapPlayerBotAIStates.end() &&
+				role->second.bBotRole == BOT_ROLE_METIN_HUNTER;
+		// Fifty-four and up: the second Spider Dungeon takes the draw the
+		// first one had - spiders of sixty to sixty-eight that never attack
+		// first, against V1's fifty to fifty-eight - and a stone hunter
+		// still goes to Sohan, because neither dungeon has a stone.
+		if (level >= PLAYERBOT_SPIDER_V2_MIN_LEVEL)
+		{
+			switch (draw % 3U)
+			{
+				case 0: return stoneHunter ? PLAYERBOT_MAP_SOHAN : PLAYERBOT_MAP_SPIDER_V2;
+				case 1: return PLAYERBOT_MAP_SOHAN;
+				default: return PLAYERBOT_MAP_HWANG;
+			}
+		}
 		if (level >= PLAYERBOT_HWANG_MIN_LEVEL)
 		{
 			switch (draw % 3U)
 			{
-				case 0: return PLAYERBOT_MAP_SPIDER_V1;
+				case 0: return stoneHunter ? PLAYERBOT_MAP_SOHAN : PLAYERBOT_MAP_SPIDER_V1;
 				case 1: return PLAYERBOT_MAP_SOHAN;
 				default: return PLAYERBOT_MAP_HWANG;
 			}
 		}
 		if (level >= PLAYERBOT_SPIDER_MIN_LEVEL && level >= PLAYERBOT_SOHAN_MIN_LEVEL)
-			return (draw & 1U) != 0 ? PLAYERBOT_MAP_SPIDER_V1 : PLAYERBOT_MAP_SOHAN;
+			return (draw & 1U) != 0 && !stoneHunter ? PLAYERBOT_MAP_SPIDER_V1 : PLAYERBOT_MAP_SOHAN;
 		// Thirty-six to forty-seven: the valley and the desert share them, the
 		// same way thirty to thirty-five already do. See
 		// PLAYERBOT_DESERT_MAX_LEVEL for what was sitting unused.
@@ -322,14 +351,43 @@ namespace
 	{
 		if (!ch || !HasPlayerBotM3ReadyEquipment(ch))
 			return false;
+		// The farm is for a drop, and a full bag has no cell for it.
+		if (IsPlayerBotBagFull(ch))
+			return false;
 		// The M3 dropper is there for the weapons it will sell, so owning one
 		// changes nothing, and it stays as long as the map can still be hunted.
 		if (GetPlayerBotPersonalityByPID(ch->GetPlayerID()) == BOT_PERSONALITY_M3_DROPPER)
 			return ch->GetLevel() <= 32;
-		if (ch->GetLevel() > 24 || HasPlayerBotSpecialLevel30Weapon(ch, true))
+		if (HasPlayerBotSpecialLevel30Weapon(ch, true))
 			return false;
-		// A stable third of the eligible population farms infected animals for
-		// class-specific level-30 weapons. Other bots remain in M2 for Bestials.
+		// Twenty-four was the cap, and it made the weapon a thing a bot either
+		// got young or never got: past it the only route left was a counter it
+		// never walked to. Measured: 205 of the 393 bots of thirty-six and up
+		// holding over a million yang owned no level-30 weapon anywhere -
+		// "bots flying round the valley at thirty-seven with six million in the
+		// bag and a +6 cone sword", as the Discord put it. The farm stays worth
+		// working to forty: the infected animals are around thirty, and the
+		// kill-drop curve (aiPercentByDeltaLev) is still at seventy percent ten
+		// levels above them and falls off a cliff only after that.
+		if (ch->GetLevel() > PLAYERBOT_LEVEL30_WEAPON_HUNT_MAX_LEVEL)
+			return false;
+		// The farm is one map. See PLAYERBOT_M3_CROWD_SHARE_PERCENT: the door
+		// closes at the share and the bots inside keep their place until the
+		// crowd is well over it, so the ones sent home are not sent straight
+		// back through the door they just left.
+		const int crowd = GetPlayerBotsOnMap(PLAYERBOT_MAP_CHUNJO_M3);
+		const int share = std::max(PLAYERBOT_M3_CROWD_MIN,
+				GetPlayerBotsAlive() * PLAYERBOT_M3_CROWD_SHARE_PERCENT / 100);
+		if (ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M3
+				? crowd > share * PLAYERBOT_M3_CROWD_STAY_PERCENT / 100
+				: crowd >= share)
+			return false;
+		// A stable third of the young population farms infected animals for
+		// class-specific level-30 weapons; the rest stay in M2 for Bestials.
+		// Past thirty-five nobody is left in M2 to share the work with, so the
+		// third becomes everyone - within the share above.
+		if (ch->GetLevel() > 35)
+			return true;
 		return (PlayerBotNavHash(ch->GetPlayerID() ^ 0x4d335850U) % 3U) == 0;
 	}
 
@@ -341,7 +399,7 @@ namespace
 		// owned weapon or not, for as long as they are worth its level.
 		if (GetPlayerBotPersonalityByPID(ch->GetPlayerID()) == BOT_PERSONALITY_M2_DROPPER)
 			return ch->GetLevel() >= 25 && ch->GetLevel() <= 40;
-		if (ch->GetLevel() < 25 || ch->GetLevel() > 35 ||
+		if (ch->GetLevel() < 25 || ch->GetLevel() > PLAYERBOT_LEVEL30_WEAPON_HUNT_MAX_LEVEL ||
 				HasPlayerBotSpecialLevel30Weapon(ch, true) ||
 				ShouldPlayerBotVisitM3(ch))
 			return false;
@@ -354,6 +412,11 @@ namespace
 	bool ShouldPlayerBotPursueHorseExpedition(LPCHARACTER ch, DWORD dwNow)
 	{
 		if (!ch)
+			return false;
+		// A medal needs a cell. This gate is what the Monkey Dungeon's exit
+		// decision and the planner both read, so a bot already inside with a
+		// full bag finishes its medal and leaves, and a dropper does too.
+		if (IsPlayerBotBagFull(ch))
 			return false;
 		// The medal dropper goes for the medals themselves, whatever its own horse
 		// needs, in whichever dungeon its level earns them.
@@ -380,22 +443,27 @@ namespace
 		BYTE chance = 10;
 		switch (ch->GetJob())
 		{
+			// The medal is the market's short: a battle horse used to end a
+			// bot's trips almost for good (4% a window), and the cohort past
+			// forty-six has one, so the hard dungeon - the only place a medal
+			// drops at full odds for them - saw a few bots an hour. Three
+			// times the after-horse chance, the before-horse ones unchanged.
 			case JOB_WARRIOR:
-				chance = hasCombatHorse ? 4 : (ch->GetHorseLevel() == 0 ? 34 : 26);
+				chance = hasCombatHorse ? 12 : (ch->GetHorseLevel() == 0 ? 34 : 26);
 				break;
 			case JOB_SURA:
 				// Skill group 1 is Weaponry (WP); group 2 is Black Magic.
 				chance = ch->GetSkillGroup() == 1
-						? (hasCombatHorse ? 4 : (ch->GetHorseLevel() == 0 ? 32 : 25))
-						: (hasCombatHorse ? 2 : (ch->GetHorseLevel() == 0 ? 14 : 9));
+						? (hasCombatHorse ? 12 : (ch->GetHorseLevel() == 0 ? 32 : 25))
+						: (hasCombatHorse ? 6 : (ch->GetHorseLevel() == 0 ? 14 : 9));
 				break;
 			case JOB_ASSASSIN:
 				chance = ch->GetSkillGroup() == 2
-						? (hasCombatHorse ? 1 : (ch->GetHorseLevel() == 0 ? 6 : 4))
-						: (hasCombatHorse ? 2 : (ch->GetHorseLevel() == 0 ? 18 : 14));
+						? (hasCombatHorse ? 3 : (ch->GetHorseLevel() == 0 ? 6 : 4))
+						: (hasCombatHorse ? 6 : (ch->GetHorseLevel() == 0 ? 18 : 14));
 				break;
 			case JOB_SHAMAN:
-				chance = hasCombatHorse ? 2 : (ch->GetHorseLevel() == 0 ? 15 : 10);
+				chance = hasCombatHorse ? 6 : (ch->GetHorseLevel() == 0 ? 15 : 10);
 				break;
 		}
 		TPlayerBotAIStateMap::const_iterator stateIt =
@@ -470,7 +538,8 @@ namespace
 		// bot to the gate; a warp out of it becomes the desert's far corner and
 		// the walk back to the Bokjung gate. Both call back in here with the
 		// desert as the target, which neither rule touches.
-		if (targetMap == PLAYERBOT_MAP_SPIDER_V1 && ch->GetMapIndex() != PLAYERBOT_MAP_DESERT)
+		if (IsPlayerBotSpiderMap(targetMap) && ch->GetMapIndex() != PLAYERBOT_MAP_DESERT &&
+				!IsPlayerBotSpiderMap(ch->GetMapIndex()))
 		{
 			state.lDesertCrossingTo = targetMap;
 			state.lDesertCrossingX = targetX;
@@ -479,7 +548,8 @@ namespace
 			return TransitionPlayerBotMap(ch, state, PLAYERBOT_MAP_DESERT,
 					PLAYERBOT_DESERT_ARRIVAL_X, PLAYERBOT_DESERT_ARRIVAL_Y, dwNow, "desert_crossing_to_v1");
 		}
-		if (ch->GetMapIndex() == PLAYERBOT_MAP_SPIDER_V1 && targetMap != PLAYERBOT_MAP_DESERT)
+		if (IsPlayerBotSpiderMap(ch->GetMapIndex()) && targetMap != PLAYERBOT_MAP_DESERT &&
+				!IsPlayerBotSpiderMap(targetMap))
 		{
 			state.lDesertCrossingTo = targetMap;
 			state.lDesertCrossingX = targetX;
@@ -574,6 +644,98 @@ namespace
 		return true;
 	}
 
+	// The gate itself, found on the map. A warp NPC (CHAR_TYPE_WARP) carries
+	// its destination in its name - "%s %ld %ld", world coordinates in cells,
+	// exactly what FuncCheckWarp in char.cpp reads - and the engine sends a
+	// player within 300 units of it there. Our portal constants were read out
+	// of npc.txt once; the package an operator installed from may place a
+	// gate elsewhere, and a bot walking to where the gate used to be stands
+	// beside it for good ("do portalu, tuz przed nim, zawraca, kolko wokol
+	// M2"). So the point walked to is the living NPC whose destination lies
+	// on the target map, the one nearest the point asked for, remembered per
+	// map and destination for PLAYERBOT_WARP_NPC_CACHE_MS. The Teleporter is
+	// not a warp NPC - he is a quest - so a trip through him keeps the
+	// constant, and pays.
+	struct FPlayerBotFindWarp
+	{
+		long m_lTargetMap;
+		long m_lNearX, m_lNearY;
+		LPCHARACTER m_found;
+		long m_lBest;
+		FPlayerBotFindWarp(long targetMap, long nearX, long nearY)
+			: m_lTargetMap(targetMap), m_lNearX(nearX), m_lNearY(nearY), m_found(NULL), m_lBest(-1) {}
+		void operator()(LPENTITY entity)
+		{
+			if (!entity || !entity->IsType(ENTITY_CHARACTER))
+				return;
+			LPCHARACTER npc = static_cast<LPCHARACTER>(entity);
+			if (!npc->IsWarp())
+				return;
+			char szTmp[64];
+			long lToX = 0, lToY = 0;
+			if (3 != sscanf(npc->GetName(), " %63s %ld %ld ", szTmp, &lToX, &lToY))
+				return;
+			if (SECTREE_MANAGER::instance().GetMapIndex(lToX * 100, lToY * 100) != m_lTargetMap)
+				return;
+			const long d = DISTANCE_APPROX(npc->GetX() - m_lNearX, npc->GetY() - m_lNearY);
+			if (m_lBest < 0 || d < m_lBest)
+			{
+				m_lBest = d;
+				m_found = npc;
+			}
+		}
+	};
+
+	bool FindPlayerBotWarpNpc(long mapIndex, long targetMap, long nearX, long nearY,
+			DWORD dwNow, long& outX, long& outY)
+	{
+		struct TGateAnswer { DWORD dwStamp; bool bFound; long lX; long lY; };
+		static std::map<std::pair<long, long>, TGateAnswer> s_mapGates;
+		const std::pair<long, long> key(mapIndex, targetMap);
+		std::map<std::pair<long, long>, TGateAnswer>::iterator it = s_mapGates.find(key);
+		if (it != s_mapGates.end() && dwNow - it->second.dwStamp < PLAYERBOT_WARP_NPC_CACHE_MS)
+		{
+			outX = it->second.lX;
+			outY = it->second.lY;
+			return it->second.bFound;
+		}
+		LPSECTREE_MAP pMap = SECTREE_MANAGER::instance().GetMap(mapIndex);
+		if (!pMap)
+			return false;
+		FPlayerBotFindWarp finder(targetMap, nearX, nearY);
+		pMap->for_each(finder);
+		TGateAnswer& answer = s_mapGates[key];
+		answer.dwStamp = dwNow;
+		answer.bFound = finder.m_found != NULL;
+		answer.lX = answer.bFound ? finder.m_found->GetX() : 0;
+		answer.lY = answer.bFound ? finder.m_found->GetY() : 0;
+		if (it == s_mapGates.end())
+		{
+			if (answer.bFound)
+				sys_log(0, "PLAYERBOT_WORLD: gate to map=%ld on map=%ld at (%ld,%ld) name=%s asked=(%ld,%ld) off_by=%ld",
+						targetMap, mapIndex, answer.lX, answer.lY, finder.m_found->GetName(),
+						nearX, nearY, finder.m_lBest);
+			else
+				sys_log(0, "PLAYERBOT_WORLD: no warp npc to map=%ld on map=%ld, keeping the point (%ld,%ld)",
+						targetMap, mapIndex, nearX, nearY);
+		}
+		outX = answer.lX;
+		outY = answer.lY;
+		return answer.bFound;
+	}
+
+	bool IsPlayerBotTeleporterPoint(long x, long y)
+	{
+		return (x == PLAYERBOT_M1_TELEPORTER_X && y == PLAYERBOT_M1_TELEPORTER_Y) ||
+				(x == PLAYERBOT_M2_TO_M3_TELEPORTER_X && y == PLAYERBOT_M2_TO_M3_TELEPORTER_Y);
+	}
+
+	int GetPlayerBotTeleporterFee(LPCHARACTER ch)
+	{
+		return std::max(PLAYERBOT_TELEPORTER_FEE_PER_FIVE_LEVELS,
+				((int)ch->GetLevel() / 5) * PLAYERBOT_TELEPORTER_FEE_PER_FIVE_LEVELS);
+	}
+
 	bool MovePlayerBotToWorldPortal(LPCHARACTER ch, TPlayerBotAIState& state,
 			long portalX, long portalY, long targetMap, long targetX, long targetY,
 			DWORD dwNow, const char* reason)
@@ -583,6 +745,37 @@ namespace
 		SetPlayerBotAction(state, BOT_ACTION_TRAVEL, dwNow);
 		state.dwTargetVID = 0;
 		ch->SetVictim(NULL);
+
+		// Through the Teleporter, at his price, or through the gate where it
+		// actually stands.
+		const bool viaTeleporter = IsPlayerBotTeleporterPoint(portalX, portalY);
+		if (viaTeleporter)
+		{
+			if (ch->GetLevel() < PLAYERBOT_TELEPORTER_MIN_LEVEL ||
+					ch->GetGold() < GetPlayerBotTeleporterFee(ch))
+			{
+				PlayerBotLogThrottled("teleporter_refused", dwNow,
+						"PLAYERBOT_WORLD: teleporter refuses pid=%u name=%s level=%u gold=%d fee=%d to=%ld reason=%s",
+						ch->GetPlayerID(), ch->GetName(), (unsigned int)ch->GetLevel(), ch->GetGold(),
+						GetPlayerBotTeleporterFee(ch), targetMap, reason ? reason : "?");
+				// Not again this tick, nor the next thousand: the fee is earned
+				// at a counter or a merchant, and both run only on a tick the
+				// travel pass does not take. A departure held for a purchase
+				// keeps its map (lDepartureMap) and comes back when the wait
+				// is over.
+				state.dwNextWorldTravelTime = dwNow + PLAYERBOT_TELEPORTER_RETRY_MS;
+				return false;
+			}
+		}
+		else
+		{
+			long gateX = 0, gateY = 0;
+			if (FindPlayerBotWarpNpc(ch->GetMapIndex(), targetMap, portalX, portalY, dwNow, gateX, gateY))
+			{
+				portalX = gateX;
+				portalY = gateY;
+			}
+		}
 
 		// Warp NPCs trigger at 300 units and hand the client to whichever core
 		// hosts the target map, which is not a conversation a bot descriptor can
@@ -599,7 +792,16 @@ namespace
 			state.iPortalWalkBest = 0;
 			state.wPortalWalkTicks = 0;
 			state.wPortalWalkRouteIndex = 0;
-			return TransitionPlayerBotMap(ch, state, targetMap, targetX, targetY, dwNow, reason);
+			const int fee = viaTeleporter ? GetPlayerBotTeleporterFee(ch) : 0;
+			if (!TransitionPlayerBotMap(ch, state, targetMap, targetX, targetY, dwNow, reason))
+				return false;
+			if (fee > 0)
+			{
+				ch->PointChange(POINT_GOLD, -fee);
+				sys_log(0, "PLAYERBOT_WORLD: teleporter fee pid=%u name=%s level=%u fee=%d to=%ld gold_left=%d",
+						ch->GetPlayerID(), ch->GetName(), (unsigned int)ch->GetLevel(), fee, targetMap, ch->GetGold());
+			}
+			return true;
 		}
 
 		// Walking to a portal has to be able to fail, and this is what it looked
@@ -680,6 +882,14 @@ namespace
 			char szStuckTag[64];
 			snprintf(szStuckTag, sizeof(szStuckTag), "portal_stuck:%s",
 					reason ? reason : "?");
+			// Into syserr as well: a support bundle carries syserr and not
+			// syslog, and the one bundle sent about a bot circling a gate held
+			// nothing about the gate.
+			PlayerBotErrThrottled(szStuckTag, dwNow,
+					"PLAYERBOT_WORLD: portal walk stalled pid=%u name=%s map=%ld pos=(%ld,%ld) portal=(%ld,%ld) distance=%d reason=%s riding=%d last=%u",
+					ch->GetPlayerID(), ch->GetName(), ch->GetMapIndex(), ch->GetX(), ch->GetY(),
+					portalX, portalY, distance, reason ? reason : "?", ch->IsRiding() ? 1 : 0,
+					(unsigned int)state.bLastNavOutcome);
 			PlayerBotLogThrottled(szStuckTag, dwNow,
 					"PLAYERBOT_WORLD: portal walk stalled pid=%u name=%s map=%ld pos=(%ld,%ld) portal=(%ld,%ld) distance=%d reason=%s "
 					"ticks=%u route=%u/%u plan_in=%d defer=%u stuck=%u seg=%d riding=%d last=%u",
@@ -800,7 +1010,7 @@ namespace
 		const bool m2LevelingCohort = IsPlayerBotM2LevelingCohort(ch);
 		const bool wantsM3 = ShouldPlayerBotVisitM3(ch);
 		const bool needsCriticalTownServices = NeedsPlayerBotCriticalTownServices(ch);
-		const bool needsM1OnlyServices = NeedsPlayerBotM1OnlyServices(ch);
+		const bool needsM1OnlyServices = NeedsPlayerBotM1OnlyServices(ch, state, dwNow);
 		// M2 has its own blacksmith. Only the remote M3 farm needs to schedule a
 		// return to town for equipment progression.
 		const bool scheduledRemoteRefine = mapIndex == PLAYERBOT_MAP_CHUNJO_M3 &&
@@ -836,9 +1046,6 @@ namespace
 					playerbot_world_rules::DecideMonkeyExit(context);
 			if (exitDecision != playerbot_world_rules::MONKEY_STAY)
 			{
-				SetPlayerBotGoal(ch, state,
-						exitDecision == playerbot_world_rules::MONKEY_EXIT_RESTOCK
-						? BOT_GOAL_RESTOCK : BOT_GOAL_HORSE, dwNow);
 				const char* reason = "monkey_horse_complete_direct";
 				if (exitDecision == playerbot_world_rules::MONKEY_EXIT_RESTOCK)
 					reason = "monkey_restock_direct";
@@ -864,7 +1071,7 @@ namespace
 		if (mapIndex == PLAYERBOT_MAP_CHUNJO_M3 && ch->GetLevel() > 24 &&
 				!ShouldPlayerBotVisitM3(ch))
 		{
-			SetPlayerBotGoal(ch, state, BOT_GOAL_LEVEL_UP, dwNow);
+			// The walk does not own the goal - see the desert crossing below.
 			return MovePlayerBotToWorldPortal(ch, state,
 					PLAYERBOT_M3_RETURN_PORTAL_X, PLAYERBOT_M3_RETURN_PORTAL_Y,
 					PLAYERBOT_MAP_CHUNJO_M2, PLAYERBOT_M2_FROM_M3_X,
@@ -921,8 +1128,14 @@ namespace
 					return false;
 				}
 			}
-			const bool toV1 = state.lDesertCrossingTo == PLAYERBOT_MAP_SPIDER_V1;
-			SetPlayerBotGoal(ch, state, BOT_GOAL_LEVEL_UP, dwNow);
+			const bool toV1 = IsPlayerBotSpiderMap(state.lDesertCrossingTo);
+			// The walk does not own the goal. This leg, and the four others
+			// like it, stamped LEVEL_UP on every tick they ran; the planner put
+			// its own answer back five seconds later, and 350 bots on the
+			// frontier flipped "zapasy" <-> "poziom" for as long as a crossing
+			// took - twelve thousand of twenty thousand goal lines, and a
+			// status that read "to town for supplies" and "to the Spider
+			// Dungeon" by turns. The planner decides; the walk walks.
 			return MovePlayerBotToWorldPortal(ch, state,
 					toV1 ? PLAYERBOT_DESERT_V1_GATE_X : PLAYERBOT_DESERT_EXIT_X,
 					toV1 ? PLAYERBOT_DESERT_V1_GATE_Y : PLAYERBOT_DESERT_EXIT_Y,
@@ -994,15 +1207,12 @@ namespace
 					GetPlayerBotFrontierArrival(directMap, arriveX, arriveY);
 					char reason[48];
 					snprintf(reason, sizeof(reason), "m1_direct_to_%s", GetPlayerBotFrontierName(directMap));
-					SetPlayerBotGoal(ch, state, BOT_GOAL_LEVEL_UP, dwNow);
 					return MovePlayerBotToWorldPortal(ch, state,
 							PLAYERBOT_M1_TELEPORTER_X, PLAYERBOT_M1_TELEPORTER_Y,
 							directMap, arriveX, arriveY, dwNow, reason);
 				}
 			}
 
-			SetPlayerBotGoal(ch, state, needsHorseExpedition ? BOT_GOAL_HORSE :
-					(wantsM3 ? BOT_GOAL_GET_EQUIPMENT : BOT_GOAL_LEVEL_UP), dwNow);
 			return MovePlayerBotToWorldPortal(ch, state,
 					PLAYERBOT_M1_TO_M2_PORTAL_X, PLAYERBOT_M1_TO_M2_PORTAL_Y,
 					PLAYERBOT_MAP_CHUNJO_M2, PLAYERBOT_M2_ARRIVAL_X, PLAYERBOT_M2_ARRIVAL_Y,
@@ -1020,8 +1230,6 @@ namespace
 			// potion, inventory and refine needs are served by the real Bokjung NPCs.
 			if (needsM1OnlyServices)
 			{
-				SetPlayerBotGoal(ch, state, ch->GetSkillGroup() == 0
-						? BOT_GOAL_CHOOSE_PROFESSION : BOT_GOAL_BIOLOGIST, dwNow);
 				return MovePlayerBotToWorldPortal(ch, state,
 						PLAYERBOT_M2_TO_M1_PORTAL_X, PLAYERBOT_M2_TO_M1_PORTAL_Y,
 						PLAYERBOT_MAP_CHUNJO_M1, PLAYERBOT_M1_RETURN_X,
@@ -1072,7 +1280,6 @@ namespace
 				GetPlayerBotMonkeyArrival(monkeyMap, monkeyX, monkeyY);
 				char reason[48];
 				snprintf(reason, sizeof(reason), "horse_to_monkey_%s", GetPlayerBotMonkeyName(monkeyMap));
-				SetPlayerBotGoal(ch, state, BOT_GOAL_HORSE, dwNow);
 				return MovePlayerBotToWorldPortal(ch, state,
 						PLAYERBOT_M2_MONKEY_PORTAL_X, PLAYERBOT_M2_MONKEY_PORTAL_Y,
 						monkeyMap, monkeyX, monkeyY, dwNow, reason);
@@ -1080,7 +1287,6 @@ namespace
 
 			if (wantsM3 && !needsCriticalTownServices)
 			{
-				SetPlayerBotGoal(ch, state, BOT_GOAL_GET_EQUIPMENT, dwNow);
 				return MovePlayerBotToWorldPortal(ch, state,
 						PLAYERBOT_M2_TO_M3_TELEPORTER_X, PLAYERBOT_M2_TO_M3_TELEPORTER_Y,
 						PLAYERBOT_MAP_CHUNJO_M3, PLAYERBOT_M3_ARRIVAL_X,
@@ -1093,7 +1299,6 @@ namespace
 			// the pearls it brings back are worth more than the hunting it skips.
 			if (WantsPlayerBotFishingTrip(ch, state, dwNow))
 			{
-				SetPlayerBotGoal(ch, state, BOT_GOAL_HUNTING, dwNow);
 				return MovePlayerBotToWorldPortal(ch, state,
 						PLAYERBOT_M2_TO_M1_PORTAL_X, PLAYERBOT_M2_TO_M1_PORTAL_Y,
 						PLAYERBOT_MAP_CHUNJO_M1, PLAYERBOT_M1_RETURN_X,
@@ -1111,7 +1316,6 @@ namespace
 				GetPlayerBotFrontierArrival(frontierMap, arriveX, arriveY);
 				char reason[48];
 				snprintf(reason, sizeof(reason), "level_to_%s", GetPlayerBotFrontierName(frontierMap));
-				SetPlayerBotGoal(ch, state, BOT_GOAL_LEVEL_UP, dwNow);
 				return MovePlayerBotToWorldPortal(ch, state,
 						PLAYERBOT_M2_TO_M3_TELEPORTER_X, PLAYERBOT_M2_TO_M3_TELEPORTER_Y,
 						frontierMap, arriveX, arriveY, dwNow, reason);
@@ -1123,7 +1327,6 @@ namespace
 			// hunted anything.
 			if (!m2LevelingCohort && !IsPlayerBotPastM2Ceiling(ch))
 			{
-				SetPlayerBotGoal(ch, state, BOT_GOAL_LEVEL_UP, dwNow);
 				const bool moving = MovePlayerBotToWorldPortal(ch, state,
 						PLAYERBOT_M2_TO_M1_PORTAL_X, PLAYERBOT_M2_TO_M1_PORTAL_Y,
 						PLAYERBOT_MAP_CHUNJO_M1, PLAYERBOT_M1_RETURN_X, PLAYERBOT_M1_RETURN_Y,
@@ -1156,9 +1359,9 @@ namespace
 					!HasPlayerBotSpecialLevel30Weapon(ch, true))
 				return false;
 
-			SetPlayerBotGoal(ch, state,
-					(needsCriticalTownServices || needsM1OnlyServices) ? BOT_GOAL_RESTOCK :
-					(scheduledRemoteRefine ? BOT_GOAL_GET_EQUIPMENT : BOT_GOAL_LEVEL_UP), dwNow);
+			// The walk does not own the goal - see the desert crossing above. This
+			// line stamped "poziom" on every tick a bot left the frontier for a
+			// non-critical errand, against the planner's "zapasy" five seconds later.
 			const char* reason = "m3_weapon_found";
 			if (needsCriticalTownServices || needsM1OnlyServices)
 				reason = "m3_services_to_m2";
@@ -1204,20 +1407,38 @@ namespace
 			// the trip is taken alone, the party re-forms on the way back.
 			const bool wantsMedal = settledIn && needsHorseExpedition &&
 					ch->GetParty() == NULL;
-			if (!visitExpired && !outOfBand && !needsTown && !wantsMedal)
+			// And the level-30 weapon, for the same reason as the medal: the
+			// decision to farm it was only ever read in town, and a bot that
+			// reached the frontier without one had no way back to the farm.
+			// Handed to M2, where the ordinary M3 branch takes over.
+			const bool wantsWeapon = settledIn && !wantsMedal &&
+					ShouldPlayerBotVisitM3(ch) && ch->GetParty() == NULL;
+			if (!visitExpired && !outOfBand && !needsTown && !wantsMedal && !wantsWeapon)
 				return false;
 
-			SetPlayerBotGoal(ch, state, needsTown ? BOT_GOAL_RESTOCK :
-					(wantsMedal ? BOT_GOAL_HORSE : BOT_GOAL_LEVEL_UP), dwNow);
+			// A share of the bots keeps Joan as home: the services trip goes
+			// there, and only the services trip - a medal, a weapon hunt and
+			// a graduation are Bokjung's business.
+			const bool joanHome = needsTown &&
+					(PlayerBotNavHash(ch->GetPlayerID() ^ 0x4a4f414eU) % 1000U) <
+						(DWORD)PLAYERBOT_JOAN_HOME_PER_MILLE;
 			const char* reason = "frontier_visit_complete";
-			if (needsTown)
+			if (joanHome)
+				reason = "frontier_services_to_m1";
+			else if (needsTown)
 				reason = "frontier_services_to_m2";
 			else if (outOfBand)
 				reason = "frontier_level_graduated";
 			else if (wantsMedal)
 				reason = "frontier_horse_to_m2";
+			else if (wantsWeapon)
+				reason = "frontier_weapon_to_m2";
 			long exitX = 0, exitY = 0;
 			GetPlayerBotFrontierExit(mapIndex, exitX, exitY);
+			if (joanHome)
+				return MovePlayerBotToWorldPortal(ch, state, exitX, exitY,
+						PLAYERBOT_MAP_CHUNJO_M1, PLAYERBOT_M1_RETURN_X, PLAYERBOT_M1_RETURN_Y,
+						dwNow, reason);
 			return MovePlayerBotToWorldPortal(ch, state, exitX, exitY,
 					PLAYERBOT_MAP_CHUNJO_M2, PLAYERBOT_M2_FROM_M3_X, PLAYERBOT_M2_FROM_M3_Y,
 					dwNow, reason);
@@ -1233,7 +1454,6 @@ namespace
 		// the frontier maps carry real warp NPCs of their own, and walking inside
 		// one's trigger radius hands the character to a map the AI has no plan
 		// for. Nothing would ever bring it back, so it would sit there for good.
-		SetPlayerBotGoal(ch, state, BOT_GOAL_LEVEL_UP, dwNow);
 		if (TransitionPlayerBotMap(ch, state, PLAYERBOT_MAP_CHUNJO_M2,
 				PLAYERBOT_M2_FROM_M3_X, PLAYERBOT_M2_FROM_M3_Y, dwNow, "stranded_recovery"))
 		{

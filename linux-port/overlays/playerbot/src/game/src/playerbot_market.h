@@ -86,6 +86,12 @@ namespace
 		// find the book yourself. What a bot wants is a small working stock of
 		// its own build's skills - two or three, not every book to Grand Master
 		// - and only while the skill can still be read up.
+		// A Forgetting Scroll on somebody's counter is what a bot past the old
+		// woman's thirty with a skill stuck at seventeen came to market for.
+		if (offer->GetVnum() == PLAYERBOT_SKILL_FORGET_SCROLL_VNUM)
+			return GetPlayerBotStuckSkill(ch) != 0 &&
+					ch->GetLevel() > PLAYERBOT_SKILL_RESET_MAX_LEVEL &&
+					ch->CountSpecifyItem(PLAYERBOT_SKILL_FORGET_SCROLL_VNUM) == 0;
 		if (offer->GetType() == ITEM_SKILLBOOK)
 		{
 			const DWORD skillVnum = GetPlayerBotSkillBookSkillVnum(offer);
@@ -93,11 +99,11 @@ namespace
 					!IsPlayerBotOwnSkill(ch, skillVnum))
 				return false;
 			// Already at the grade a book stops helping, or already holding the
-			// working stock: somebody else needs it more.
-			if (ch->GetSkillMasterType(skillVnum) >= SKILL_GRAND_MASTER)
-				return false;
+			// working stock: somebody else needs it more. The limit is the
+			// bag's own (GetPlayerBotBookKeepLimit) - a few for a skill not yet
+			// readable, the full stock once it is.
 			return CountPlayerBotSkillBooksAhead(ch, offer, skillVnum) <
-					PLAYERBOT_BOOK_KEEP_PER_SKILL;
+					GetPlayerBotBookKeepLimit(ch, skillVnum);
 		}
 
 		// A horse medal, if this bot still has a horse to raise. Buying one is
@@ -569,6 +575,13 @@ namespace
 	// what the listing decisions said in between. Read the top of that list
 	// against the drops: a material with thirty bots short and nothing on any
 	// counter is not being held back by the ledger, it is not being found.
+	// Declared in playerbot_economy.h for the junk rule.
+	DWORD GetPlayerBotLedgerDemand(DWORD vnum)
+	{
+		TPlayerBotMarketLedger::const_iterator it = s_mapMarketLedger.find(vnum);
+		return it == s_mapMarketLedger.end() ? 0 : it->second.dwDemandBots;
+	}
+
 	void RefreshPlayerBotMarketLedger(DWORD dwNow)
 	{
 		if (s_dwMarketLedgerTime != 0 &&

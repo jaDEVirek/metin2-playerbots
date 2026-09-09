@@ -302,7 +302,38 @@ namespace
 			const BYTE weaponSubType = item->GetSubType();
 			if (weaponSubType == WEAPON_DAGGER || weaponSubType == WEAPON_BOW)
 				attack *= 2;
-			score += attack * 1000;
+
+			// The percent lines, as the engine applies them: average damage
+			// multiplies every ordinary hit, skill damage every cast, and both
+			// multiply *this weapon's* damage - so they scale the attack score
+			// rather than adding a flat few thousand beside a million. A
+			// ninja was found wearing a copper bow of 90-156 with a Deer Horn
+			// Bow +8 of 151-244 and +47% average in the bag; by the numbers
+			// the bag one is a third again better before the line is counted.
+			// Negative lines count too: -17% skill damage on that bow is
+			// seventeen percent of every cast.
+			long avgPct = 0, skillPct = 0;
+			for (int i = 0; i < ITEM_APPLY_MAX_NUM; ++i)
+			{
+				const BYTE t = item->GetProto()->aApplies[i].bType;
+				if (t == APPLY_NORMAL_HIT_DAMAGE_BONUS) avgPct += item->GetProto()->aApplies[i].lValue;
+				else if (t == APPLY_SKILL_DAMAGE_BONUS) skillPct += item->GetProto()->aApplies[i].lValue;
+			}
+			for (int i = 0; i < ITEM_ATTRIBUTE_MAX_NUM; ++i)
+			{
+				const BYTE t = item->GetAttributeType(i);
+				if (t == APPLY_NORMAL_HIT_DAMAGE_BONUS) avgPct += item->GetAttributeValue(i);
+				else if (t == APPLY_SKILL_DAMAGE_BONUS) skillPct += item->GetAttributeValue(i);
+			}
+			const int style = GetPlayerBotSchoolStyle(ch);
+			const int avgWeight = style < 0 ? PLAYERBOT_WEAPON_OWN_LINE_PERCENT
+					: (style > 0 ? PLAYERBOT_WEAPON_OTHER_LINE_PERCENT : 60);
+			const int skillWeight = style > 0 ? PLAYERBOT_WEAPON_OWN_LINE_PERCENT
+					: (style < 0 ? PLAYERBOT_WEAPON_OTHER_LINE_PERCENT : 60);
+			long long multiplier = 100 + (avgPct * avgWeight + skillPct * skillWeight) / 100;
+			if (multiplier < 20)
+				multiplier = 20;
+			score += attack * 1000 * multiplier / 100;
 
 			// A level-30 average-damage weapon used to be handed a flat 350000
 			// here. Damage is scored at a thousand a point, so that was more than
@@ -362,13 +393,23 @@ namespace
 			}
 		}
 
+		// A weapon's two damage-percent lines were folded into its attack
+		// above; everything else is a flat line.
+		const bool bWeaponPctDone = item->GetType() == ITEM_WEAPON;
 		for (int i = 0; i < ITEM_APPLY_MAX_NUM; ++i)
-			score += ScorePlayerBotApply(item->GetProto()->aApplies[i].bType,
-					item->GetProto()->aApplies[i].lValue, ch);
-
+		{
+			const BYTE t = item->GetProto()->aApplies[i].bType;
+			if (bWeaponPctDone && (t == APPLY_NORMAL_HIT_DAMAGE_BONUS || t == APPLY_SKILL_DAMAGE_BONUS))
+				continue;
+			score += ScorePlayerBotApply(t, item->GetProto()->aApplies[i].lValue, ch);
+		}
 		for (int i = 0; i < ITEM_ATTRIBUTE_MAX_NUM; ++i)
-			score += ScorePlayerBotApply(item->GetAttributeType(i),
-					item->GetAttributeValue(i), ch);
+		{
+			const BYTE t = item->GetAttributeType(i);
+			if (bWeaponPctDone && (t == APPLY_NORMAL_HIT_DAMAGE_BONUS || t == APPLY_SKILL_DAMAGE_BONUS))
+				continue;
+			score += ScorePlayerBotApply(t, item->GetAttributeValue(i), ch);
+		}
 
 		if (item->GetImmuneFlag() != 0)
 			score += 1000;
@@ -485,9 +526,16 @@ namespace
 		const WORD oldCell = oldItem->GetCell();
 		const DWORD vnum = oldItem->GetVnum();
 		const BYTE refine = oldItem->GetRefineLevel();
+		// Both ends of the gift, in log.log: the giver's history says where
+		// its spare went, the receiver's says where its new piece came from.
+		char szHint[64];
+		snprintf(szHint, sizeof(szHint), "%s", sharer.m_receiver->GetName());
+		LogManager::instance().ItemLog(ch, oldItem, "PLAYERBOT_GIFT_OUT", szHint);
 		oldItem->RemoveFromCharacter();
 		if (oldItem->AddToCharacter(sharer.m_receiver, TItemPos(INVENTORY, receiverCell)))
 		{
+			snprintf(szHint, sizeof(szHint), "%s", ch->GetName());
+			LogManager::instance().ItemLog(sharer.m_receiver, oldItem, "PLAYERBOT_GIFT_IN", szHint);
 			sys_log(0, "PLAYERBOT_AI: gifted reserve gear pid=%u name=%s -> target_pid=%u target_name=%s vnum=%u refine=%u improvement=%lld",
 					ch->GetPlayerID(), ch->GetName(), sharer.m_receiver->GetPlayerID(),
 					sharer.m_receiver->GetName(), vnum, refine, sharer.m_bestImprovement);
@@ -586,6 +634,12 @@ namespace
 		{
 			sys_log(0, "PLAYERBOT_AI: equipped upgrade pid=%u name=%s wear=%d old_vnum=%u new_vnum=%u old_score=%lld new_score=%lld",
 					ch->GetPlayerID(), ch->GetName(), bestWearCell, oldVnum, newVnum, oldScore, bestScore);
+			// The one line a player asks about first - "why is my top Sura
+			// suddenly without her +8" - is the swap, so it goes to log.log
+			// with what came off.
+			char szHint[64];
+			snprintf(szHint, sizeof(szHint), "slot %d zamiast %u", bestWearCell, oldVnum);
+			LogManager::instance().ItemLog(ch, bestItem, "PLAYERBOT_EQUIP", szHint);
 
 			if (bestOldItem)
 				SharePlayerBotOldGearNearby(ch, bestOldItem);
@@ -1211,18 +1265,30 @@ namespace
 		return true;
 	}
 
+	// Arrows this bot can nock now. A progression chest hands an archer the
+	// next tier early - 8003 wants level forty, 8004 forty-five - and counting
+	// those said "a hundred arrows, no need to buy" to a bot of thirty-four
+	// whose bow had nothing to fire: PrepareWeapon failed on every tick, the
+	// tick left through a town visit no frontier map can start, and twelve
+	// archers stood at arrival points for twenty minutes at a time.
+	bool IsPlayerBotUsableArrow(LPCHARACTER ch, LPITEM item)
+	{
+		return item && item->GetType() == ITEM_WEAPON && item->GetSubType() == WEAPON_ARROW &&
+				item->GetCount() > 0 && item->GetLevelLimit() <= ch->GetLevel();
+	}
+
 	int CountPlayerBotArrows(LPCHARACTER ch)
 	{
 		if (!ch)
 			return 0;
 		int count = 0;
 		LPITEM worn = ch->GetWear(WEAR_ARROW);
-		if (worn && worn->GetType() == ITEM_WEAPON && worn->GetSubType() == WEAPON_ARROW)
+		if (IsPlayerBotUsableArrow(ch, worn))
 			count += worn->GetCount();
 		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
 		{
 			LPITEM item = ch->GetInventoryItem(cell);
-			if (item && item->GetType() == ITEM_WEAPON && item->GetSubType() == WEAPON_ARROW)
+			if (IsPlayerBotUsableArrow(ch, item))
 				count += item->GetCount();
 		}
 		return count;
@@ -1239,11 +1305,22 @@ namespace
 		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
 		{
 			LPITEM item = ch->GetInventoryItem(cell);
-			if (item && item->GetType() == ITEM_WEAPON && item->GetSubType() == WEAPON_ARROW &&
-					item->GetCount() > 0 && ch->EquipItem(item, WEAR_ARROW))
+			if (IsPlayerBotUsableArrow(ch, item) && ch->EquipItem(item, WEAR_ARROW))
 				return true;
 		}
 		return false;
+	}
+
+	// Whether a shield slot is a slot this bot can fill at all: never with a
+	// bow or a two-handed weapon in hand. Counting it as "missing" for an
+	// archer made every archer critically short of town services for life -
+	// sent out of M3 the moment it arrived and straight back by the weapon
+	// hunt, fifteen seconds a round trip.
+	bool PlayerBotWantsShield(LPCHARACTER ch)
+	{
+		LPITEM weapon = ch ? ch->GetWear(WEAR_WEAPON) : NULL;
+		return !(weapon && weapon->GetType() == ITEM_WEAPON &&
+				(weapon->GetSubType() == WEAPON_BOW || weapon->GetSubType() == WEAPON_TWO_HANDED));
 	}
 
 	bool NeedsPlayerBotArrows(LPCHARACTER ch)

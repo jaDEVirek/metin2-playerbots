@@ -800,6 +800,19 @@ namespace
 			return;
 		}
 
+		// The target pass owns the saddle while there is a target it may hit
+		// from it: it mounts ("mounted_combat") on its approach, and the leg
+		// that brought the bot here - a known-stone walk, a wander leg - used
+		// to climb down again the moment the route's end was close, so a
+		// warrior with a battle horse next to a Metin mounted and dismounted
+		// once a second for as long as the stone stood (botgrom2, V1, a
+		// hundred pairs a minute in one operator's bundle).
+		if (!fightOnHorse && !keepHorseAtDestination && ch->IsRiding() && state.dwTargetVID != 0)
+		{
+			LPCHARACTER target = CHARACTER_MANAGER::instance().Find(state.dwTargetVID);
+			if (target && CanPlayerBotFightOnHorse(ch, target))
+				return;
+		}
 		const int distance = DISTANCE_APPROX(ch->GetX() - destX, ch->GetY() - destY);
 		if (!allowHorse || distance <= PLAYERBOT_HORSE_DISMOUNT_DISTANCE)
 			SetPlayerBotRidingForTravel(ch, state, false, dwNow,
@@ -1117,7 +1130,17 @@ namespace
 			// is still obstructed from the character's exact interpolated point.
 			// Moving those few centimetres to the cell centre is what makes the
 			// next corner safe; skipping it caused route=0/0 retry loops.
-			if (state.uRouteIndex + 1 < state.vecRoute.size())
+			//
+			// Unless the character is already standing on it. Then there is
+			// nothing left to move by: Goto refuses a destination equal to the
+			// position, the walk reported that as "moved" because the waypoint
+			// was within arrival distance, and the bot stood on its own first
+			// waypoint for good - sixteen of eighteen watchdog resets in an
+			// afternoon were nav_out=11 at route=0/2 on a cell centre. Consumed,
+			// the obstructed segment goes through the blocked-segment branch
+			// below, which has the rescues and counts the failure.
+			if (state.uRouteIndex + 1 < state.vecRoute.size() &&
+					(ch->GetX() != waypoint.x || ch->GetY() != waypoint.y))
 			{
 				const PIXEL_POSITION& nextWaypoint = state.vecRoute[state.uRouteIndex + 1];
 				if (!navigation.SegmentClearWorld(ch->GetX(), ch->GetY(),
@@ -1254,6 +1277,32 @@ namespace
 					state.lIssuedWaypointY = 0;
 					state.iNavLastWaypointDistance = -1;
 					state.bLastNavOutcome = PLAYERBOT_NAV_OUT_CORNERED;
+					return true;
+				}
+			}
+			// Third rescue: both ends are cell centres already, so neither
+			// alignment can change the answer, and the corner after this one is
+			// not in reach either. The static grid planned this segment; the
+			// live supercover test disagrees at a grazed corner, and it will
+			// disagree identically on every replan. Walk it: the server moves a
+			// bot along a straight line with no collision, so the worst case is
+			// a shoulder through a decorative corner - the alternative, measured
+			// at the Monkey Dungeon exit, was a bot stopping short of the portal
+			// and turning back for good.
+			if (!movedSelf && !movedTarget)
+			{
+				ch->SetRotationToXY(waypoint.x, waypoint.y);
+				if (ch->Goto(waypoint.x, waypoint.y))
+				{
+					ch->SendMovePacket(FUNC_MOVE, 0, waypoint.x, waypoint.y,
+							ch->GetCurrentMoveDuration(), dwNow);
+					state.lIssuedWaypointX = waypoint.x;
+					state.lIssuedWaypointY = waypoint.y;
+					state.bLastNavOutcome = PLAYERBOT_NAV_OUT_FORCED;
+					PlayerBotLogThrottled("nav_forced_corner", dwNow,
+							"PLAYERBOT_NAV: forced through a grazed corner pid=%u name=%s map=%ld pos=(%ld,%ld) waypoint=(%ld,%ld) dest=(%ld,%ld)",
+							ch->GetPlayerID(), ch->GetName(), mapIndex,
+							ch->GetX(), ch->GetY(), waypoint.x, waypoint.y, destX, destY);
 					return true;
 				}
 			}
