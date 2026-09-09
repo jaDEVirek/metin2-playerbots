@@ -30,6 +30,8 @@ linux-port/docker/mariadb/initdb.d/10-import-dumps.sh
 # Waits for the database before seeding. Its timeout decides whether a slow
 # recovery fails the whole compose "up".
 linux-port/docker/mariadb/playerbot/apply.sh
+linux-port/docker/mariadb/playerbot/itemshop_schema.sql
+linux-port/docker/itemshop/*
 # Discovers the overlay sources and copies them into the build context.
 linux-port/docker/prepare-context.sh
 linux-port/docker/panel/app/admin_panel.py
@@ -56,6 +58,9 @@ linux-port/docker/game/src/server/game/src/playerbot_*
 # built. prepare-context.sh never runs on a player's machine, so a patch that
 # only lives under overlays/playerbot/patches reaches nobody; the staged,
 # patched file does - the same way the playerbot sources do.
+linux-port/docker/game/src/server/game/src/char.cpp
+linux-port/docker/game/src/server/game/src/cmd.cpp
+linux-port/docker/game/src/server/game/src/cmd_gm.cpp
 linux-port/docker/game/src/server/game/src/item_manager.cpp
 linux-port/docker/game/src/server/game/src/config.cpp
 linux-port/docker/game/src/server/game/src/input_main.cpp
@@ -67,8 +72,50 @@ linux-port/docker/game/src/server/game/src/shop.h
 linux-port/overlays/playerbot/patches/*.patch
 # Assigns maps to game cores. The bots' route now includes Orc Valley, and
 # a server-side bot cannot cross between cores, so this must ship with it.
-linux-port/docker/game/bin/m2-render-config
+# Every container-side script, not just the one that assigns maps.
+# Reported from the Discord: an install with no panel/bin/apply_rates.sh had
+# no way to get one, because updates carried entrypoint.sh and nothing else
+# beside it - and the same held for m2-rates, m2-supervise, m2-gm and m2-lang,
+# which are the whole of how the game container is driven. A script that ships
+# only in the installer is a script no update can ever repair.
+linux-port/docker/game/bin/*
+linux-port/docker/panel/bin/*
 linux-port/docker/game/Dockerfile
+# Every other build context that "docker compose up" builds on the player's
+# machine. Only the game's Dockerfile used to ship, and an update therefore
+# could not repair one of the others: a two-byte panel/Dockerfile - reported
+# from the Discord - failed the bake before it started, so game and seban-panel
+# were CANCELED with it and nothing came up at all. Clicking PLAY again cannot
+# help, because nothing in the update replaces the broken file.
+linux-port/docker/panel/Dockerfile
+linux-port/docker/panel/.dockerignore
+linux-port/docker/game/.dockerignore
+linux-port/docker/client-builder/Dockerfile
+linux-port/docker/client-builder/.dockerignore
+linux-port/docker/webclient-fetcher/Dockerfile
+linux-port/docker/wsbridge/Dockerfile
+linux-port/docker/wsbridge/.dockerignore
+linux-port/docker/updater/Dockerfile
+# ...and everything those Dockerfiles COPY out of their own build context.
+# A Dockerfile that ships without what it reads fails the build at the COPY
+# instead of at the bake, which is what "failed to compute cache key ...
+# /rates: not found" means, and no amount of clicking PLAY can repair it.
+#
+# Being tracked by Git is not the same as being delivered: an install put
+# together from an update package has only what this file lists, and
+# panel/bin/apply_rates.sh was tracked and still missing on the machine that
+# reported it. Whatever a COPY names has to be here, or be written on the
+# player's machine by start-server.ps1 - there is no third way in.
+#
+# rates/ and pack/ carry only their README from us: the pack.sh beside it is
+# cut from the operator's own reference server files by prepare-context.sh and
+# is not ours to hand out. The README is enough to make the directory exist,
+# and both Dockerfiles already test for the script before using it.
+linux-port/docker/game/rates/*
+linux-port/docker/client-builder/pack/*
+linux-port/docker/client-builder/bin/*
+linux-port/docker/updater/bin/*
+linux-port/docker/wsbridge/bin/*
 # The chest table the Dockerfile COPYs, at the path the COPY reads it from.
 # The update builds the image the moment the files land, before start-server
 # gets to stage it, so the package puts it there itself.

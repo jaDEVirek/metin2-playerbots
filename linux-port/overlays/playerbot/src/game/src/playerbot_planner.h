@@ -93,8 +93,19 @@ namespace
 				PlayerBotNavHash(ch->GetPlayerID() ^ 0x4d455850U) % 600000U;
 		if (state.dwMetinExpeditionUntil != 0 || ch->GetLevel() < PLAYERBOT_METIN_EXPEDITION_MIN_LEVEL)
 			return;
+		// No expedition from, or towards, a map without stones: the frontier
+		// draw sends a third of the bots past fifty-two to the Spider Dungeon,
+		// and an expedition there had them travelling for half an hour to
+		// find nothing. They roll again next hour, from wherever they stand.
+		const long frontier = GetPlayerBotFrontierMapForLevel(ch);
+		if (!PlayerBotMapHasMetinStones(ch->GetMapIndex()) ||
+				(frontier != 0 && !PlayerBotMapHasMetinStones(frontier)))
+			return;
+		// A battle horse is what a player raises for the stones, so its rider
+		// goes out for them twice as often.
 		const int chance = PLAYERBOT_METIN_EXPEDITION_CHANCE_PERCENT *
-				GetPlayerBotWeight(PLAYERBOT_WEIGHT_METIN) / PLAYERBOT_WEIGHT_NEUTRAL;
+				GetPlayerBotWeight(PLAYERBOT_WEIGHT_METIN) / PLAYERBOT_WEIGHT_NEUTRAL *
+				(CanPlayerBotEverFightOnHorse(ch) ? 2 : 1);
 		if (number(1, 100) > chance)
 			return;
 		state.dwMetinExpeditionUntil = dwNow + PLAYERBOT_METIN_EXPEDITION_DURATION;
@@ -133,6 +144,15 @@ namespace
 					state.bVisitingStable ? BOT_GOAL_HORSE : BOT_GOAL_REFINE, dwNow);
 			return;
 		}
+		// A fishing session owns the tick, and so it owns the goal: the session
+		// stamped FISHING every tick and this planner answered RESTOCK every
+		// five seconds - forty-three anglers, six thousand goal lines in twelve
+		// minutes, and "zapasy" over the head of a bot that was fishing.
+		if (state.bFishingSession)
+		{
+			SetPlayerBotGoal(ch, state, BOT_GOAL_FISHING, dwNow);
+			return;
+		}
 
 		// --- and everything that is ------------------------------------------
 		const bool canAdvanceHorse = ShouldPlayerBotPursueHorseExpedition(ch, dwNow);
@@ -153,8 +173,18 @@ namespace
 		OfferPlayerBotGoal(candidates, rank, count,
 				state.bAmbition == BOT_AMBITION_SKILLS && canReadBook,
 				BOT_GOAL_MASTER_SKILL, PLAYERBOT_WEIGHT_SKILL);
+		// The medal dropper does not wait for the horse ambition to come round.
+		//
+		// Farming medals is the whole of what that personality is for, and the
+		// ambition rotates: seventy-three bots of eight hundred and thirty-eight
+		// hold it at any moment, so thirteen droppers were idle nine times out of
+		// ten and all three Monkey Dungeons stood nearly empty - seven bots
+		// between them, none at all in the easy one. Everyone else still needs
+		// the ambition, so this does not turn the dungeon into a conveyor belt.
 		OfferPlayerBotGoal(candidates, rank, count,
-				state.bAmbition == BOT_AMBITION_HORSE && canAdvanceHorse,
+				canAdvanceHorse && (state.bAmbition == BOT_AMBITION_HORSE ||
+					GetPlayerBotPersonalityByPID(ch->GetPlayerID()) ==
+						BOT_PERSONALITY_MEDAL_DROPPER),
 				BOT_GOAL_HORSE, PLAYERBOT_WEIGHT_HORSE);
 		OfferPlayerBotGoal(candidates, rank, count,
 				state.bAmbition == BOT_AMBITION_BIOLOGIST && hasBiologistMission,

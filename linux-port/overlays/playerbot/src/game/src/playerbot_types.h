@@ -60,16 +60,52 @@ namespace
 	const DWORD PLAYERBOT_INVENTORY_MAINTENANCE_MIN = 30000;
 	const DWORD PLAYERBOT_INVENTORY_MAINTENANCE_MAX = 60000;
 	const int PLAYERBOT_POTION_HP_PERCENT = 65;
+	// Below this many the belt is worth a trip, wherever the bot is.
+	//
+	// It was 150 red and 100 blue, on the argument that a bot with half its
+	// potions has no business leaving a good spot - true, and also the reason
+	// the population looked like this, measured over every bot of forty and up:
+	// red potions at a MEDIAN of 32, 502 of 812 under the trigger, 473 under
+	// fifty, against 254 holding the six hundred they set out with. A bot on
+	// the frontier is a portal and a map from the merchant, and the travel
+	// pass yields to fights on the way; a trigger of 150 fired with the belt
+	// already at seven by the time it arrived - "potki 7/0" over a level 47
+	// walking to the weapon merchant, photographed. Twice the distance, then,
+	// so the walk starts while there is still something to fight with.
+	const size_t PLAYERBOT_POTION_TRIP_RED = 300;
+	const size_t PLAYERBOT_POTION_TRIP_BLUE = 200;
+	// And the big potions from here on. See ManagePlayerBotMiscMerchant.
+	const BYTE PLAYERBOT_BIG_POTION_MIN_LEVEL = 40;
 	const int PLAYERBOT_POTION_SP_PERCENT = 30;
 	const int PLAYERBOT_RECOVERY_HP_PERCENT = 75;
 	const int PLAYERBOT_RECOVERY_INITIAL_HP_PERCENT = 20;
 	const int PLAYERBOT_RECOVERY_REST_HEAL_PERCENT = 5;
 	const int PLAYERBOT_RETREAT_START_HP_PERCENT = 35;
+	// Finishing a stone that is nearly broken, instead of walking away from it.
+	//
+	// Reported from the Discord by two people: "bots often fight a Metin and
+	// leave at the end when their health goes". They do, and this is why - the
+	// emergency recovery above drops the target at
+	// PLAYERBOT_RECOVERY_INITIAL_HP_PERCENT whatever the target is. For a
+	// monster that is right: it chases, and a bot that stands there dies. A
+	// Metin stone is the opposite case - it is CHAR_TYPE_STONE and not
+	// CHAR_TYPE_MONSTER, it does not follow anybody, and leaving one at a
+	// sliver of health throws away the whole fight, because the bot comes back
+	// to a stone at full health or finds it gone.
+	//
+	// So a stone within sight of breaking is finished, and only while the bot is
+	// still clearly above the floor where dying becomes the likely outcome.
+	// Dying costs experience; this is not licence to stand in the shockwave.
+	const int PLAYERBOT_STONE_FINISH_STONE_HP_PERCENT = 15;
+	const int PLAYERBOT_STONE_FINISH_OWN_HP_PERCENT = 10;
 	const int PLAYERBOT_RETREAT_END_HP_PERCENT = 65;
 	const DWORD PLAYERBOT_RETREAT_MOVE_INTERVAL = 1800;
 	const DWORD PLAYERBOT_ATTACK_INTERVAL = 1200;
 	const DWORD PLAYERBOT_POTION_INTERVAL = 1000;
-	const DWORD PLAYERBOT_REVIVE_DELAY = 11000;
+	// How long a bot lies where it fell. A player sees a body on the ground and
+	// then sees it get up; eleven seconds was close to that already and ten is
+	// what it is meant to be.
+	const DWORD PLAYERBOT_REVIVE_DELAY = 10000;
 	const DWORD PLAYERBOT_GEAR_RETRY_INTERVAL = 1000;
 	const DWORD PLAYERBOT_EQUIPMENT_CHECK_INTERVAL = 1000;
 	const DWORD PLAYERBOT_EQUIPMENT_COMBAT_DELAY = 1700;
@@ -153,15 +189,108 @@ namespace
 	// to the merchant. Before this a bot kept every book for a skill it could
 	// not read for weeks, and the bag filled with them.
 	const int PLAYERBOT_BOOK_KEEP_PER_SKILL = 12;
-	// With the panel's BOOKS switch on, the engine's day between two reads of
-	// the same skill (SKILLBOOK_DELAY_MIN to MAX: eighteen to thirty hours) is
-	// cut to this. A bot then reads a skill from M1 to G1 in an evening
-	// instead of a month, which is what a player with Exorcism Scrolls does.
-	const DWORD PLAYERBOT_BOOK_FAST_DELAY = 1800000;
+	// And for a skill it cannot read yet - not at Master - only a few against
+	// the day it gets there. Twelve of every own skill, readable or not, was
+	// 2636 books in 929 bags on a world where the bots at forty still had
+	// their skills in the teens: the books sat for weeks and the counters
+	// carried four of them in two hours. A skill already at Grand Master
+	// keeps none; a book cannot take it further.
+	const int PLAYERBOT_BOOK_KEEP_UNREADABLE = 3;
+	// The Metin dropper keeps every book for its counter - and a dropper whose
+	// stall roll never came kept them for good: a bag of eighty books, the
+	// loot pass with nowhere to put a drop, and the bot farming stones it
+	// could not pick up ("chlop biega z calym eq i dalej farmi metiny nie
+	// podnoszac nic"). Under bag pressure it opens a stall whatever the roll,
+	// and what is still beyond this many books goes to the merchant.
+	const int PLAYERBOT_DROPPER_BOOK_KEEP = 20;
 	// A bag this short of cells is under pressure: what was worth keeping on
 	// the chance of a key or a buyer goes to the merchant, so the chests and
 	// the loot still have somewhere to land.
 	const int PLAYERBOT_BAG_PRESSURE_FREE_CELLS = 8;
+	// A bag this full is an errand, not a state to hunt in. Above this share
+	// of the ninety cells the bot goes and does something about it - the
+	// merchant, its own counter, the storekeeper, the blacksmith - and no
+	// expedition whose point is a drop starts: a Master of Equipment ran the
+	// Monkey Dungeon for two hours after a medal that had no cell to land in
+	// ("eq pelne od dawna a on se napierdala 2 godziny malpy").
+	const int PLAYERBOT_BAG_FULL_PERCENT = 80;
+	// The storekeeper (Dozorca, 9005): npc.txt cell (609,596) on map 21, base
+	// (0,102400); cell (471,347) on map 23, base (102400,204800). A bot's
+	// safebox is one page of forty-five cells behind the default password -
+	// the DB accepts "000000" for an account that never set one - and it is
+	// where the skill books go that the bag cannot hold and the counter has
+	// not sold: a book never goes to the merchant. PLAYERBOT_SAFEBOX_BOOK_KEEP
+	// surplus books stay in the bag as goods for the counter; the rest are
+	// deposited once the bag is under pressure.
+	const long PLAYERBOT_STOREKEEPER_X = 60900;
+	const long PLAYERBOT_STOREKEEPER_Y = 162000;
+	const long PLAYERBOT_M2_STOREKEEPER_X = 149500;
+	const long PLAYERBOT_M2_STOREKEEPER_Y = 239500;
+	const char* const PLAYERBOT_SAFEBOX_PASSWORD = "000000";
+	// What the storekeeper's quest charges once for the first page
+	// (warehouse.quest: 500 yang, then set_safebox_level(1)), remembered in
+	// the bot's own flag because the quest's state is not ours to set.
+	const int PLAYERBOT_SAFEBOX_FEE = 500;
+	const char* const PLAYERBOT_SAFEBOX_PAID_FLAG = "playerbot.safebox_paid";
+	const DWORD PLAYERBOT_SAFEBOX_LOAD_WAIT_MS = 8000;
+	const int PLAYERBOT_SAFEBOX_BOOK_KEEP = 12;
+	// Two stacks of one thing in two cells is what a partial purchase, a
+	// partial sale and a pick-up into a full stack all leave behind, and the
+	// engine only merges when a hand drags one onto the other - which a bot
+	// has none of. Every five minutes a bot pours its split stacks together
+	// (the engine's own rule: same vnum, same sockets, two hundred to a
+	// stack); at a counter it does the opposite, and puts a few single units
+	// of the goods a player buys one at a time - scrolls, soul stones - on
+	// lines of their own, because a private shop sells a line whole.
+	const DWORD PLAYERBOT_STACK_MERGE_INTERVAL = 300000;
+	// How long a bot may stand waiting for the engine's equip window before
+	// the wait is abandoned. Twelve archers stood at arrival points for
+	// twenty minutes, reset by the watchdog every ninety seconds, ticked and
+	// silent: the tick left through the "core slot empty and an equip
+	// pending" pause, and an archer's shield slot is empty for life.
+	const DWORD PLAYERBOT_EQUIP_PENDING_MAX_MS = 5000;
+	// After a pause that never got its window, how long before the next one.
+	// Without this the pass came back a second later and a bot in a fight
+	// that never ends stuttered for five seconds out of every six.
+	const DWORD PLAYERBOT_EQUIP_PENDING_RETRY_MS = 60000;
+	// A weapon's percent lines multiply the damage the weapon makes, so they
+	// are scored against that damage and not as a flat sum: a +47% average
+	// line on a bow of 151-244 is worth 47% of that bow, and nothing on a
+	// dagger of 10-12. How much of each line a build feels - a skill build
+	// lives on skill damage and still swings between casts, a normal-hit
+	// build the other way round.
+	const int PLAYERBOT_WEAPON_OWN_LINE_PERCENT = 100;
+	const int PLAYERBOT_WEAPON_OTHER_LINE_PERCENT = 35;
+	// A skill line this high on a weapon is a prize line too (the bonus pass
+	// keeps an average line from PLAYERBOT_BONUS_KEEP_AVERAGE).
+	const long PLAYERBOT_WEAPON_PRIZE_SKILL_PERCENT = 15;
+	// A stone is not spent on a piece under this refine: the piece is going
+	// to be refined first, and a burn on the way there takes the lines with
+	// it. And a piece carrying this many lines is finished in the only sense
+	// that matters at the anvil - it is refined under a scroll or not at all.
+	const BYTE PLAYERBOT_BONUS_MIN_REFINE = 4;
+	const int PLAYERBOT_PRIZE_LINES = 5;
+	const int PLAYERBOT_STACK_MERGES_PER_PASS = 4;
+	const int PLAYERBOT_STACK_MAX = 200;
+	const int PLAYERBOT_SHOP_SINGLE_UNITS = 4;
+	const int PLAYERBOT_SHOP_SPLIT_KEEP_FREE_CELLS = 3;
+	// A material goes on the counter in packs, not as the whole stack: sixteen
+	// fishbones on one line were sixteen or nothing ("moze dzielic na pakiety
+	// po 2 sztuki lub nawet sprzedawac detalicznie po 1"). Packs of this many,
+	// up to this many lines of one kind; the rest of the stack stays in the
+	// bag for the next opening. Pearls and the shell are singles.
+	const int PLAYERBOT_SHOP_PACK_UNITS = 2;
+	const int PLAYERBOT_SHOP_PACK_LINES = 8;
+	// How soon the bag is merged again after the counter closes: the singles
+	// and packs were split for the counter, and a bag of them is a bag with
+	// no room for loot until the five-minute clock came round.
+	const DWORD PLAYERBOT_STACK_MERGE_AFTER_SHOP_MS = 5000;
+	// At least this many surplus books opens a counter whatever the
+	// personality rolled. 21 stalls on a thousand bots,
+	// "a few KU on them", and bots flying round the stones with bags full of
+	// books: the roll picked one bot in ten and the books sat with the other
+	// nine.
+	const int PLAYERBOT_SHOP_BOOK_PRESSURE_MIN = 6;
 	const DWORD PLAYERBOT_SOUL_STONE_CHECK_INTERVAL = 10000;
 	// What UseItemEx leaves in the socket when the 30% roll fails. Defined as a
 	// file-local const in char_item.cpp, so it is repeated here.
@@ -179,6 +308,13 @@ namespace
 	// for, and short enough that nobody watching notices the world filling up.
 	const DWORD PLAYERBOT_SPAWN_WINDOW = 60000;
 	const DWORD PLAYERBOT_SPAWN_BATCH_INTERVAL = 1000;
+	// And how often the world is counted afterwards, to put back what it has
+	// lost. The queue used to be filled once at startup and never again: a bot
+	// that failed to enter the world, or left it later for any reason, was gone
+	// until the next restart. An operator reported a thousand asked for, six
+	// hundred and fifty arriving, and three hundred and fifty an hour later -
+	// and nothing in the core would have noticed any of that.
+	const DWORD PLAYERBOT_TOPUP_INTERVAL = 60000;
 	// And the same spread for a bot's own first heavy passes - the refine, the
 	// gear pass, the shopping decision - which all had timers of zero and so
 	// all ran on the bot's first tick, whichever second it logged in.
@@ -217,7 +353,64 @@ namespace
 	// a string of fights with gaps for walking and looting between them, so the
 	// window has to outlast a gap without outlasting the walk back to town.
 	const DWORD PLAYERBOT_BUFF_COMBAT_WINDOW = 60000;
-	const BYTE PLAYERBOT_PRECIOUS_REFINE = 6;
+	// How soon a bot comes back for the next buff once it has found one
+	// missing. One cast claims the tick, so five seconds between them meant a
+	// Warrior needed ten seconds for aura and berserk and a weapon Sura fifteen
+	// for its three enchantments - longer than most of the fights they were
+	// buffing for, which is why they were usually seen without them.
+	const DWORD PLAYERBOT_BUFF_RECHECK_FAST = 1200;
+	// An unfinished town errand is somebody's job until it is done.
+	//
+	// The 8 September audit traced the loop: the bot needs a merchant, the
+	// route is deferred, the inactivity watchdog fires, the visit is thrown
+	// away, and a second later the bot is casting an attack skill at whatever
+	// stands nearby - with the need it came for still unmet. The watchdog may
+	// cancel a stale route; it may not cancel the errand. These carry the
+	// errand across the reset and keep the bot out of a fresh grind while it
+	// waits for its retry.
+	const DWORD PLAYERBOT_SERVICE_RETRY_MIN = 15000;
+	const DWORD PLAYERBOT_SERVICE_RETRY_MAX = 40000;
+	// How long a service may stay unfinished before it is given up and the
+	// ordinary planner takes over again, so nothing can wedge for ever.
+	const DWORD PLAYERBOT_SERVICE_GIVE_UP = 900000;
+	// A town nobody stays in is a town nobody sees.
+	//
+	// Joan holds four hundred bots and its square holds a couple of dozen: a bot
+	// comes in for an errand and leaves the moment it is done, so the market
+	// ring the stalls stand on is empty of customers and of anything to look at.
+	// A share of the bots that finish an errand in Joan now stay a while - which
+	// is what a player does with a town, and what makes one look inhabited.
+	// Bokjung is deliberately excluded: it is crowded already, and the whole
+	// point of the M2 census work was to get level-40 bots out of it.
+	// Every bot that finishes something in Joan, not half of them: the triggers
+	// are rare enough on their own. An angler fishes for fifteen to forty
+	// minutes and then rests for three quarters of an hour to two hours, so a
+	// session ends about once a minute across the whole angler cohort - at half
+	// that is three or four bots on the square at a time, which is not a market.
+	const int PLAYERBOT_TOWN_LINGER_PERCENT = 100;
+	// Three minutes of walking the counters, not four to ten of standing.
+	//
+	// The first version parked a bot on one spot of the square and left it
+	// there, which filled Joan and made it look like a car park: a hundred
+	// people motionless for up to ten minutes. What a town needs is movement,
+	// and the market ring is what there is to walk between - so the bot strolls
+	// from counter to counter instead, picking a new one every few seconds.
+	const DWORD PLAYERBOT_TOWN_LINGER_MIN = 150000;
+	const DWORD PLAYERBOT_TOWN_LINGER_MAX = 210000;
+	// How long a bot looks at one counter before moving to the next. Long
+	// enough to read as looking at something, short enough that the square is
+	// never still.
+	const DWORD PLAYERBOT_TOWN_BROWSE_MIN = 6000;
+	const DWORD PLAYERBOT_TOWN_BROWSE_MAX = 14000;
+	// And how long after that a counter it never reached is given up on.
+	const DWORD PLAYERBOT_TOWN_BROWSE_GIVE_UP = 20000;
+	// Four, not six: a spare at +4 is what the counter lists
+	// (PLAYERBOT_SHOP_MIN_GEAR_REFINE) and what a player buys, and at six
+	// the merchant took every +4 and +5 the bot had just paid the blacksmith
+	// for - Brwisty Wachlarz+4 refined at 17:58 and vendored at 18:19, in
+	// one operator's equipment history; 12 534 pieces refined in the bag and
+	// then vendored in six hours on our own world.
+	const BYTE PLAYERBOT_PRECIOUS_REFINE = 4;
 	// The lowest refine an ordinary spare may carry and still be worth a counter
 	// slot. Below it nobody wants the thing: the market code buys medals,
 	// level-30 weapons and big bonus rolls, and a person walking the market sees
@@ -245,7 +438,37 @@ namespace
 	// stalls standing where the old rule had left thirty-four - and the seven
 	// with three lines or more were the same seven either way, so the extra
 	// strictness bought nothing except a quieter market.
-	const size_t PLAYERBOT_SHOP_MIN_ITEMS = 2;
+	// Three lines make a stall, which is what the rule beside it always said it
+	// meant while the number said two. Reported from the Discord: "it makes no
+	// sense that a bot with plenty of yang and free bag space forces a shop open
+	// with one Bear Hide or some other trinket" - and two ordinary materials is
+	// the same complaint one line further on. A stall exists to move a surplus;
+	// a keeper with money and room has no surplus to move. What still opens on
+	// its own is a genuine prize (PLAYERBOT_SHOP_PRIZE_SCORE): a level-30
+	// weapon, anything at +6, a big bonus roll, a horse medal - a material never
+	// scores that high.
+	const size_t PLAYERBOT_SHOP_MIN_ITEMS = 3;
+	// A bot that cannot afford its potions sells what it has, at a discount,
+	// with one line if that is all it has - "wystawianie sklepu przez bota
+	// jak ma malo yang", nine votes on the Discord. Below this much gold the
+	// stall gate opens for anybody, and the asking prices come down.
+	// "Too poor" is measured against what a potion trip costs at the bot's
+	// level (PLAYERBOT_POTION_TRIP_RED/BLUE at the merchant's unit prices),
+	// not a flat number: a flat thirty thousand made every bot under twenty
+	// a keeper, and thirty-six of them stood at the Joan ring at level
+	// seventeen on the first pass - which is what "too many bots wandering
+	// at the safe zone and not levelling" looks like from a player's chair.
+	// Under twenty a bot earns faster by levelling than by selling, and of
+	// the poor only a share is at the ring in any hour, by pid.
+	const BYTE PLAYERBOT_SHOP_POOR_MIN_LEVEL = 20;
+	const DWORD PLAYERBOT_SHOP_POOR_ROTATION_MS = 3600000;
+	const DWORD PLAYERBOT_SHOP_POOR_ROTATION_SHARE = 4;
+	const int PLAYERBOT_SHOP_POOR_DISCOUNT_PERCENT = 70;
+	// A Biologist specimen the bot no longer needs - its mission is handed in
+	// - is goods for the counter, priced like a book. The Orc Tooth is also a
+	// refine material and goes through the material rules and the ledger,
+	// which is the market, not the Biologist's doorstep.
+	const int PLAYERBOT_SHOP_SPECIMEN_SCORE = 350;
 	// Unless that one line is the reason somebody would cross the market: a
 	// level-30 weapon, a horse medal, a big bonus roll, anything at +6 or better.
 	// This is the score at which a single item carries a stall on its own.
@@ -353,10 +576,39 @@ namespace
 	// an item has to know it, and reading it from the engine header would tie a
 	// tuning constant to a build detail.
 	const int PLAYERBOT_BONUS_MAX_LINES = 5;
+	// What the lines rolled on a piece add to what a stall asks for it.
+	//
+	// A counter wanted the same 150 000 for boots +7 carrying five bonus lines
+	// as for boots +7 carrying none, which is not a market: everything that set
+	// the price - the merchant's table, the sale memory, the step limiter - is
+	// keyed by vnum and refine, and that pair cannot tell the two apart.
+	//
+	// Two things carry it. How many lines there are, with a step at four
+	// because that is where a piece stops being a drop and starts being
+	// somebody's work; and whether any of them is a roll a player stops on -
+	// two thousand health, ten percent critical, immunity to stun. The cap is
+	// there because the buyers are bots with an hour's hunting in their pocket.
+	const int PLAYERBOT_SHOP_BONUS_PER_LINE = 25;
+	const int PLAYERBOT_SHOP_BONUS_FOUR_PLUS = 100;
+	const int PLAYERBOT_SHOP_BONUS_TOP_LINE = 80;
+	const int PLAYERBOT_SHOP_BONUS_MAX_PERCENT = 600;
+	// The two lines that make a level-30 weapon the one everybody is looking
+	// for, and the step they add on top of the ordinary line premium. Proposed
+	// from the Discord in exactly these numbers - "average damage at least 24%,
+	// or skill damage 15%+" - and they match what this world actually rolls:
+	// average damage goes to 46 and skill damage to 18, so 24 and 15 are the
+	// upper half of each. Only on the level-30 set; on other gear a good line
+	// is still just a top line.
+	const int PLAYERBOT_PRIZE_AVERAGE_DAMAGE = 24;
+	const int PLAYERBOT_PRIZE_SKILL_DAMAGE = 15;
+	const int PLAYERBOT_SHOP_BONUS_PRIZE_LINE = 300;
 	// The rolls that finish an item for its slot. Thirty percent average damage
 	// on a level-30 weapon, fifteen hundred health on armour or jewellery, five
 	// percent critical on jewellery - the numbers a player stops rerolling at.
-	const long PLAYERBOT_BONUS_KEEP_AVERAGE = 30;
+	// Twenty, not thirty: "jesli maja srednie nizsze niz 20% to niech mixuja
+	// az im sie uda" - and thirty is a roll most weapons never see, so the
+	// rerolling never stopped where a player would have stopped it.
+	const long PLAYERBOT_BONUS_KEEP_AVERAGE = 20;
 	const long PLAYERBOT_BONUS_KEEP_HP = 1500;
 	const long PLAYERBOT_BONUS_KEEP_CRIT = 5;
 	const int PLAYERBOT_BONUS_STONES_PER_VISIT = 3;
@@ -371,6 +623,73 @@ namespace
 	const int PLAYERBOT_PARTY_DESIRED_MAX = 6;
 	const int PLAYERBOT_PARTY_COHESION_RADIUS = 2800;
 	const int PLAYERBOT_ARCHER_LURE_MIN_PARTY_MEMBERS = 5;
+	// The Archer's luring course, as a party role rather than an extra shot.
+	//
+	// A course is: walk out, tag a pack with one ordinary arrow, read whether it
+	// actually came, and bring what came back to the people who can kill it.
+	// Every number below bounds a real failure - an Archer that gathers for
+	// ever, one that runs further than monsters will follow, one that arrives at
+	// a party which has moved on - and none of them is a measured optimum yet.
+	//
+	// How far a receiver may be from the gathering point and still count as
+	// ready. Wider than this and the party is not standing together at all.
+	const int PLAYERBOT_LURE_ANCHOR_RADIUS = 2200;
+	// Close enough to the receivers to call the monsters delivered.
+	const int PLAYERBOT_LURE_HANDOFF_RANGE = 450;
+	// How far a course may take the Archer from the gathering point. Beyond it
+	// the monsters break off and walk home, which is a sprint for nothing.
+	const int PLAYERBOT_LURE_MAX_COURSE_RANGE = 4500;
+	// A bow's reach is the one the ordinary attack uses, less a margin for the
+	// step the bot takes while the shot is being sent. A second definition of
+	// range is how a lure comes to fire from where a fight could not.
+	const int PLAYERBOT_LURE_SHOT_RANGE = 760;
+	const int PLAYERBOT_LURE_START_HP_PERCENT = 90;
+	const int PLAYERBOT_LURE_BREAK_HP_PERCENT = 70;
+	const int PLAYERBOT_LURE_MAX_HP_LOSS_PERCENT = 12;
+	// Gathering has a deadline, and so has the walk back: a course that stopped
+	// making progress must end as a course, not as a bot standing in a field.
+	const DWORD PLAYERBOT_LURE_GATHER_TIME = 12000;
+	const DWORD PLAYERBOT_LURE_RETURN_TIME = 25000;
+	// After the arrow: long enough for a pack to turn round, short enough that
+	// one that is not coming does not cost the whole course.
+	const DWORD PLAYERBOT_LURE_CONFIRM_DELAY = 1200;
+	const DWORD PLAYERBOT_LURE_CONFIRM_TIMEOUT = 4500;
+	// How long the Archer stands with the party before the handover is judged.
+	const DWORD PLAYERBOT_LURE_HANDOFF_WAIT = 7000;
+	// A session that outlives this is abandoned whatever stage it is in, so no
+	// party is ever held by a lurer that stopped answering.
+	const DWORD PLAYERBOT_LURE_SESSION_TTL = 75000;
+	const DWORD PLAYERBOT_LURE_COOLDOWN_MIN = 20000;
+	const DWORD PLAYERBOT_LURE_COOLDOWN_MAX = 50000;
+	// Groups and monsters per course: what a first course asks for, and the
+	// ceiling a party earns by finishing courses without losing anybody.
+	const int PLAYERBOT_LURE_FIRST_GROUPS = 2;
+	const int PLAYERBOT_LURE_MAX_GROUPS = 4;
+	const int PLAYERBOT_LURE_FIRST_BUDGET = 7;
+	const int PLAYERBOT_LURE_MAX_BUDGET = 14;
+	// Courses in a row without a death or a failed handover before the plan
+	// grows by one group.
+	const int PLAYERBOT_LURE_GROWTH_STREAK = 3;
+	// What still counts as "the party is busy": a new course does not start
+	// while this many delivered monsters are still on the receivers.
+	const int PLAYERBOT_LURE_BUSY_MONSTERS = 3;
+	// How often an Archer that cannot start a course asks again. The busy
+	// count is a sector scan, and one per tick per Archer is a real cost
+	// for an answer that does not change that fast.
+	const DWORD PLAYERBOT_LURE_READY_RECHECK = 2000;
+	// Where a pack worth pulling stands. Not the multi-pull's band, which looks
+	// for whatever is at a solo bot's feet: a lure is for the packs the party
+	// has not reached, so it starts beyond bow range and beyond the ground the
+	// party is already fighting over, and it never takes a monster somebody
+	// else has claimed.
+	const int PLAYERBOT_LURE_MIN_PACK_DISTANCE = 1100;
+	const int PLAYERBOT_LURE_MAX_PACK_DISTANCE = 3000;
+	const int PLAYERBOT_LURE_ANCHOR_CLEARANCE = 900;
+	const int PLAYERBOT_LURE_GROUP_SEPARATION = 700;
+	// Above this over the Archer's own level a pack is not brought home, it is
+	// an escort of things that kill the Archer on the way.
+	const int PLAYERBOT_LURE_MAX_LEVEL_OVER = 3;
+
 	const int PLAYERBOT_PARTY_CHALLENGE_MIN_MEMBERS = 3;
 	const int PLAYERBOT_PARTY_CHALLENGE_RADIUS = 3000;
 	const int PLAYERBOT_PARTY_READY_HP_PERCENT = 55;
@@ -412,6 +731,12 @@ namespace
 	const long PLAYERBOT_BIOLOGIST_Y = 182100;
 	const long PLAYERBOT_STABLE_BOY_X = 54900;
 	const long PLAYERBOT_STABLE_BOY_Y = 163400;
+	// How close to the stable keeper's approach point the walk has to end, and
+	// the goal snap that stays inside it: a snap wider than the arrival test
+	// is a bot that walks its route, arrives at nothing and plans the same
+	// route again - the town leg and the portal walk both sprang this.
+	const int PLAYERBOT_STABLE_ARRIVE_DISTANCE = 650;
+	const int PLAYERBOT_STABLE_SNAP_CELLS = PLAYERBOT_STABLE_ARRIVE_DISTANCE / 100;
 	// Verified against locale/english/map/{index,Setting.txt,npc.txt,Town.txt} and
 	// share/conf/mob_names.txt. Chunjo uses the empire-specific easy monkey
 	// dungeon (map 25); map 107 is a different global dungeon whose coordinates
@@ -441,6 +766,8 @@ namespace
 	const long PLAYERBOT_MAP_CHUNJO_M2 = 23;
 	const long PLAYERBOT_MAP_CHUNJO_M3 = 24;
 	const long PLAYERBOT_MAP_MONKEY_EASY = 25;
+	const long PLAYERBOT_MAP_MONKEY_MEDIUM = 108;
+	const long PLAYERBOT_MAP_MONKEY_HARD = 109;
 	const long PLAYERBOT_M1_TO_M2_PORTAL_X = 87600;
 	const long PLAYERBOT_M1_TO_M2_PORTAL_Y = 215100;
 	const long PLAYERBOT_M2_ARRIVAL_X = 111800;
@@ -497,6 +824,75 @@ namespace
 	const DWORD PLAYERBOT_MARKET_GEAR_WALLET_PERMILLE_PER_REFINE = 15;
 	const DWORD PLAYERBOT_MARKET_OTHER_WALLET_PERMILLE = 10;
 	const DWORD PLAYERBOT_MARKET_STACK_WALLET_PERCENT = 30;
+	// What the merchant pays for a shellfish, and the yardstick for the wallet
+	// floor below.
+	//
+	// The wallet says what the market can afford in total; on its own it cannot
+	// tell two materials apart, and with a median wallet of 2.6 million every
+	// material landed on the same ~38 000. That is why a shellfish the merchant
+	// values at 3 000 and a white pearl he values at 12 000 stood on the
+	// counters at the same price. The floor is now scaled by what the merchant
+	// pays for this particular thing against this yardstick, in hundredths so a
+	// material worth a fifth of a shellfish is not rounded to nothing, and only
+	// upwards: nothing gets cheaper, and what is genuinely worth more costs
+	// more. The cap keeps one expensive material from pricing itself out of
+	// every buyer's reach.
+	// Opening prices for the goods whose merchant value says nothing about what
+	// they are worth here. A skill book costs the merchant a thousand yang
+	// whichever skill it teaches, and a pearl's proto price was set for a world
+	// with different wallets - the median bot here carries over a million and a
+	// half. These are a starting calibration to be corrected by what actually
+	// sells, not equilibrium prices: the market memory blends them away as
+	// transactions accumulate.
+	const DWORD PLAYERBOT_PRIOR_BOOK_AURA = 250000;        // Aura Miecza (4)
+	const DWORD PLAYERBOT_PRIOR_BOOK_ENCHANTED_BLADE = 220000; // Czarowane Ostrze (63)
+	// A weapon from the level-30 set, whatever its refine. It is the prize the
+	// whole market exists for - ScorePlayerBotShopStock puts it above every
+	// other line - and it was being priced as scrap: an unrefined one fell into
+	// the "under +4" branch and asked the merchant's price times two, fifteen
+	// thousand, while a Tiger Fur beside it asked sixty because materials get
+	// a share of the median wallet. Reported from the Discord with a proposal
+	// of fifteen to twenty times that, and the proposal is right about the
+	// order of magnitude: between a +7 (150 000) and a +8 (400 000) of
+	// ordinary gear, because a bot of thirty-seven holding six million will
+	// pay it and a bot of twenty-two will not, which is as it should be.
+	const DWORD PLAYERBOT_PRIOR_LEVEL30_WEAPON = 250000;
+	const DWORD PLAYERBOT_PRIOR_BOOK_STRONG_BODY = 180000; // Silne Cialo (19)
+	const DWORD PLAYERBOT_PRIOR_BOOK_KEY = 140000;         // inne kluczowe dla buildu
+	const DWORD PLAYERBOT_PRIOR_BOOK_ORDINARY = 45000;
+	const DWORD PLAYERBOT_PRIOR_PEARL_WHITE = 2000000;
+	const DWORD PLAYERBOT_PRIOR_PEARL_BLUE = 3000000;
+	const DWORD PLAYERBOT_PRIOR_PEARL_RED = 6000000;
+	// And the shell the pearls come out of. It had no prior at all, so it
+	// asked the merchant's three thousand times three - "malze wystawione po
+	// 7k" - beside pearls asking millions, when what a shell is is a bet on
+	// those pearls: half a Stone Piece, a twentieth a white pearl, a twentieth
+	// a blue, a hundredth a blood one (char_item.cpp, English locale table).
+	// Reported with "should be a hundred thousand at least"; a hundred
+	// thousand is about a tenth of the expected pearl value inside and leaves
+	// the buyer the better side of the bet, which is what makes it sell.
+	const DWORD PLAYERBOT_PRIOR_SHELLFISH = 100000;
+	// A horse medal, and everything else the merchant will not buy.
+	//
+	// item_proto gives 50050 a shop price of zero, so GetPlayerBotNpcSellUnitPrice
+	// returns nothing, the markup multiplies nothing, and the counter asked
+	// max(1, 0) - one yang - for the one item in this world a bot cannot farm on
+	// demand and needs twenty-one of. The Discord watched bots of fifteen to
+	// twenty-five put them out at that price. Every chest and casket is in the
+	// same position: 50011, 50192 and 50193 all carry a zero price.
+	const DWORD PLAYERBOT_PRIOR_HORSE_MEDAL = 400000;
+	const DWORD PLAYERBOT_PRIOR_NO_MERCHANT_PRICE = 30000;
+	// Under this a number on a counter is not a price, it is an accident - and
+	// the accident used to be permanent, see LimitPlayerBotAskStep.
+	const DWORD PLAYERBOT_MARKET_ASK_FLOOR = 100;
+	const DWORD PLAYERBOT_MARKET_WALLET_REFERENCE_PRICE = 600;
+	const DWORD PLAYERBOT_MARKET_WALLET_WORTH_MIN_PERCENT = 100;
+	const DWORD PLAYERBOT_MARKET_WALLET_WORTH_MAX_PERCENT = 800;
+	// A piece off a counter has to beat what the bot wears, and any spare in
+	// its bag for the slot, by this much. Two armours of one vnum and refine
+	// differ by their bonus rolls, and "better than worn" bought the second
+	// four seconds after the first; a sideways step is not worth the yang.
+	const long long PLAYERBOT_MARKET_GEAR_MARGIN_PERCENT = 15;
 	const DWORD PLAYERBOT_SALE_RECENT = 600000;
 	const DWORD PLAYERBOT_SALE_STALE = 3600000;
 
@@ -522,7 +918,10 @@ namespace
 	const DWORD PLAYERBOT_MARKET_REGULATOR_Q0 = 5;
 	const double PLAYERBOT_MARKET_REGULATOR_EXPONENT = 0.2;
 	const double PLAYERBOT_MARKET_REGULATOR_MIN = 0.75;
-	const double PLAYERBOT_MARKET_REGULATOR_MAX = 1.35;
+	// The ceiling on the shortage premium. At 1.35 a material five hundred bots
+	// were short of and no counter carried could ask a third more than one
+	// nobody wanted, which is not a market answering a shortage.
+	const double PLAYERBOT_MARKET_REGULATOR_MAX = 2.0;
 	// How fast the market's ask for a thing may drift: this much per interval
 	// since it last moved, up to this many intervals at once; and how long an
 	// ask is remembered after the last counter carried the thing.
@@ -535,9 +934,23 @@ namespace
 	// What counts as having moved. Below this the bot is standing still, whether
 	// the navigation deferred the plan, backed off, or quietly reported success.
 	const int PLAYERBOT_PORTAL_WALK_PROGRESS = 150;
+	// And the walk has to have been attempted, not merely awaited. The clock
+	// above is wall time and runs while the bot is doing something else
+	// entirely - fighting, looting, standing at a merchant - so the first travel
+	// tick after a busy twenty seconds declared a stall on a bot that had been
+	// given exactly one chance to walk. Caught in the act: one tick, a full
+	// route, and eighty-eight kilometres still to go.
+	const WORD PLAYERBOT_PORTAL_WALK_MIN_TICKS = 8;
 
 	const long PLAYERBOT_M2_TO_M1_PORTAL_X = 113000;
 	const long PLAYERBOT_M2_TO_M1_PORTAL_Y = 213600;
+	// This share of the bots (by pid, for life) goes home to Joan for its
+	// services instead of Bokjung. Every frontier return went to Bokjung, so
+	// past thirty the first town saw nobody but anglers and the Biologist's
+	// callers ("M1 przy 1000 botow wyglada jak Balmora, a M2 jak Baerim").
+	// Joan has every service Bokjung has; the price is the walk back through
+	// Bokjung to the Teleporter, which is why it is a share and not a coin.
+	const int PLAYERBOT_JOAN_HOME_PER_MILLE = 300;
 	const long PLAYERBOT_M1_RETURN_X = 87600;
 	const long PLAYERBOT_M1_RETURN_Y = 213100;
 	const long PLAYERBOT_M2_MONKEY_PORTAL_X = 161700;
@@ -582,6 +995,14 @@ namespace
 	// are the Chunjo entries of Town.txt, the exits are the Teleporter (NPC 9012)
 	// each map carries, and departure reuses Bokjung's own Teleporter.
 	// Joan's own Teleporter (NPC 9012 in metin2_map_b1/npc.txt).
+	// The Teleporter (9012) is a quest, map_warp.quest: it refuses a
+	// character of ten or under and charges floor(level / 5) * 1000 yang, a
+	// thousand at least, for a warp to Orc Valley, the desert, Sohan or the
+	// Demon Tower gate. A bot that leaves through him pays the same.
+	const BYTE PLAYERBOT_TELEPORTER_MIN_LEVEL = 11;
+	const int PLAYERBOT_TELEPORTER_FEE_PER_FIVE_LEVELS = 1000;
+	// How long a gate found on the map is remembered per map and destination.
+	const DWORD PLAYERBOT_WARP_NPC_CACHE_MS = 600000;
 	const long PLAYERBOT_M1_TELEPORTER_X = 51900;
 	const long PLAYERBOT_M1_TELEPORTER_Y = 153600;
 	const long PLAYERBOT_MAP_DESERT = 63;
@@ -652,6 +1073,40 @@ namespace
 	// (10015) at (88,82) - so a bot never crosses the map to leave.
 	const long PLAYERBOT_MAP_SOHAN = 61;
 	const long PLAYERBOT_MAP_SPIDER_V1 = 104;
+	// The second Spider Dungeon (metin2_map_spiderdungeon_02): poison spiders
+	// of 60-68 that never attack first, no stones, a Chuk-Sal at the end of V1
+	// who wants a pass to let anyone through, and Pung-Ho at (385,274) to send
+	// them back. A bot does not hold the pass and does not talk to Chuk-Sal:
+	// like V1 it is reached across the desert to the Kuahlo gate and entered
+	// server-side from there, and left the same way. The Elite Spider Queen
+	// (2093, level 97, 2.5 million health) stands by the V3 warp every hour
+	// and is nobody's raid at these levels - no boss hub.
+	const long PLAYERBOT_MAP_SPIDER_V2 = 71;
+	// The Hwang Temple, metin2_map_milgyo, base (537600,51200), 102400 square.
+	//
+	// Read out of the server's own spawn files rather than off a wiki, with
+	// tools/analyse_map_spawns.py: 5088 spawn points over nineteen kinds, levels
+	// 52 to 61, the median at 56. The west half is the Elite Esoterics of 52-55
+	// and is where the map is entered; the east half is the Tree Turtle Soldier
+	// (57, 612 points), the Bogey (58) and the Esoteric Tormentor (56). Two boss
+	// points every two hours roll among the Esoteric Summoner (54), the Frog
+	// General (61) and the Yellow Tiger Spectre (75) - no boss hub here, because
+	// a hub needs one named race and that roll has three.
+	//
+	// It has no Metin stones. What its stone.txt carries is sixteen ore veins -
+	// ebony, crystal, amethyst, diamond, white gold, shells, heaven's tears -
+	// which is what the wiki says too and is the one thing worth checking twice,
+	// since every other frontier's stone.txt means stones.
+	//
+	// The reason to add it is not the level band, which Sohan and V1 already
+	// cover from 48. It is the drops: the Frog Tongue (30060), the Frog Legs
+	// (30061), the Leaf (30040), the Unknown Talisman+ (30079) and the Curse
+	// Book+ (30080) appear in eighteen refine recipes and on no map this world
+	// hosts for bots, and the market ledger has been asking for the first of
+	// them with a supply of exactly zero. Nothing had to be taught about them:
+	// GetPlayerBotRefineMaterialVnums reads the engine's own recipe table, so
+	// they became goods the moment a bot could stand where they drop.
+	const long PLAYERBOT_MAP_HWANG = 65;
 	// The Spider Dungeon is entered from the desert, the way the game has it:
 	// NPC 10016 "Kuahlo Dong" in the desert's bottom-right corner (cell 1425,
 	// 1477 of metin2_map_n_desert_01) sends a character to (600, 4960) in V1,
@@ -665,6 +1120,58 @@ namespace
 	const long PLAYERBOT_DESERT_FROM_V1_X = 346700;
 	const long PLAYERBOT_DESERT_FROM_V1_Y = 632900;
 	const int PLAYERBOT_CROSSING_STONE_RANGE = 2500;
+	// An episode of self-defence, so that "it hit me first" cannot become a
+	// permanent licence to grind. The clock starts when the bot accepts an
+	// attacker as a target and is not renewed by another hit from the same one;
+	// the leash is measured from where the episode started. Both are tuning
+	// values - measure before trusting them.
+	const DWORD PLAYERBOT_DEFENCE_EPISODE_TIME = 10000;
+	const int PLAYERBOT_DEFENCE_LEASH = 1000;
+	// How far away a party member may be and still be worth defending.
+	const int PLAYERBOT_PARTY_DEFENCE_RANGE = 1500;
+	// An episode ends for good only when the fighting has actually stopped.
+	// Without this a second attacker starts a fresh episode the moment the
+	// first one's runs out, and two monsters taking turns are an endless
+	// licence to grind - which is exactly what a bound is supposed to prevent.
+	const DWORD PLAYERBOT_DEFENCE_QUIET_TIME = 15000;
+	// A drop obeys the same level difference as experience: PERCENT_LVDELTA
+	// multiplies both. Fifteen levels above a monster leaves one percent of the
+	// chance, so "I need this material" must not justify farming something that
+	// will effectively never yield it. Lower than the experience floor on
+	// purpose - a material is worth more detours than experience is.
+	const int PLAYERBOT_MATERIAL_MIN_DROP_PERCENT = 10;
+	// The share of a monster's base experience left after the level difference,
+	// below which an ordinary monster is not worth a bot's time. A starting
+	// heuristic from the audit, not a measurement of experience per hour, and
+	// not a rule of the game: quest, material and equipment errands are allowed
+	// through it, and self-defence comes before it.
+	const int PLAYERBOT_COMBAT_MIN_EXP_PERCENT = 20;
+	// How often the monster a bot is already fighting is asked again whether
+	// it is still worth fighting. Not every tick: the answer needs the bot's
+	// material shortages, which cost a walk of the bag.
+	const DWORD PLAYERBOT_COMBAT_RECHECK_INTERVAL = 3000;
+	// How close to a world portal a bot walks before its map change is made
+	// server-side. See MovePlayerBotToWorldPortal and patch 0008: the engine
+	// no longer grabs a bot at the portal, so this only has to cover one
+	// tick of running rather than the nine metres it used to.
+	const int PLAYERBOT_PORTAL_SWITCH_DISTANCE = 200;
+	// The ways a walk step can end, as the portal diagnostic reports them.
+	enum EPlayerBotNavOutcome
+	{
+		PLAYERBOT_NAV_OUT_NONE = 0,
+		PLAYERBOT_NAV_OUT_MOVED = 1,        // a waypoint was issued
+		PLAYERBOT_NAV_OUT_ARRIVED = 2,      // the route ran out under the bot
+		PLAYERBOT_NAV_OUT_BACKOFF = 3,      // waiting out a planning back-off
+		PLAYERBOT_NAV_OUT_DEFERRED = 4,     // the tick's planning budget was spent
+		PLAYERBOT_NAV_OUT_UNREACHABLE = 5,  // the planner says there is no way
+		PLAYERBOT_NAV_OUT_NO_PROGRESS = 6,  // a waypoint that would not come closer
+		PLAYERBOT_NAV_OUT_SEGMENT = 7,      // the live world refused the next step
+		PLAYERBOT_NAV_OUT_ALIGNED = 8,      // stepped to the cell centre to clear a corner
+		PLAYERBOT_NAV_OUT_CORNERED = 9,     // skipped a grazed corner waypoint
+		PLAYERBOT_NAV_OUT_ESCAPED = 10,     // stepped off ground nothing can leave
+		PLAYERBOT_NAV_OUT_REFUSED = 11,     // Goto itself would not take the order
+		PLAYERBOT_NAV_OUT_FORCED = 12       // walked a segment the live world called blocked
+	};
 	const DWORD PLAYERBOT_CROSSING_STONE_CHECK_INTERVAL = 3000;
 	// map_n_snowm_01, base (358400,153600), 153600 square; the town spawn from
 	// its Town.txt (cell 768,768). 43 was the second Jinno village and carried
@@ -678,12 +1185,34 @@ namespace
 	const long PLAYERBOT_SPIDER_ARRIVAL_Y = 496600;
 	const long PLAYERBOT_SPIDER_EXIT_X = 60000;
 	const long PLAYERBOT_SPIDER_EXIT_Y = 494600;
+	// V2: the map's own Town.txt cell (384,273) on open ground - 81 of 81 free
+	// cells within 200 units - and the exit five hundred south of it, on the
+	// same ground; the whole map is one connected component.
+	const long PLAYERBOT_SPIDER_V2_ARRIVAL_X = 704050;
+	const long PLAYERBOT_SPIDER_V2_ARRIVAL_Y = 462550;
+	const long PLAYERBOT_SPIDER_V2_EXIT_X = 704050;
+	const long PLAYERBOT_SPIDER_V2_EXIT_Y = 463050;
+	// Fifty-four is the operator's number: the weakest spider is sixty and
+	// none of them attacks first, so a bot six under is hunting, not hunted.
+	const BYTE PLAYERBOT_SPIDER_V2_MIN_LEVEL = 54;
 	const BYTE PLAYERBOT_SOHAN_MIN_LEVEL = 48;
 	const BYTE PLAYERBOT_SOHAN_MAX_LEVEL = 75;
 	// The ice creatures of the north (62-66) are for bots that have outgrown
 	// the Infected.
 	const BYTE PLAYERBOT_SOHAN_ICE_MIN_LEVEL = 58;
 	const BYTE PLAYERBOT_SPIDER_MIN_LEVEL = 48;
+	// The arrival is the temple's own Town.txt cell (161,938); the exit is five
+	// hundred units south of it. Both were checked against milgyo's server_attr
+	// and stand on open ground - eighty-one of eighty-one free cells within two
+	// hundred units, which is the radius the portal switch tests.
+	const long PLAYERBOT_HWANG_ARRIVAL_X = 553700;
+	const long PLAYERBOT_HWANG_ARRIVAL_Y = 145000;
+	const long PLAYERBOT_HWANG_EXIT_X = 553700;
+	const long PLAYERBOT_HWANG_EXIT_Y = 145500;
+	// Fifty-two is where its weakest Elite Esoteric stands, and fifty-five where
+	// the east half begins. Nothing below the first has any business here.
+	const BYTE PLAYERBOT_HWANG_MIN_LEVEL = 52;
+	const BYTE PLAYERBOT_HWANG_EAST_MIN_LEVEL = 55;
 
 	// Where a frontier map is entered and where it is left, by map. Every
 	// place that used to choose between the valley and the desert with a
@@ -697,6 +1226,8 @@ namespace
 			case PLAYERBOT_MAP_DESERT: outX = PLAYERBOT_DESERT_ARRIVAL_X; outY = PLAYERBOT_DESERT_ARRIVAL_Y; return true;
 			case PLAYERBOT_MAP_SOHAN: outX = PLAYERBOT_SOHAN_ARRIVAL_X; outY = PLAYERBOT_SOHAN_ARRIVAL_Y; return true;
 			case PLAYERBOT_MAP_SPIDER_V1: outX = PLAYERBOT_SPIDER_ARRIVAL_X; outY = PLAYERBOT_SPIDER_ARRIVAL_Y; return true;
+			case PLAYERBOT_MAP_SPIDER_V2: outX = PLAYERBOT_SPIDER_V2_ARRIVAL_X; outY = PLAYERBOT_SPIDER_V2_ARRIVAL_Y; return true;
+			case PLAYERBOT_MAP_HWANG: outX = PLAYERBOT_HWANG_ARRIVAL_X; outY = PLAYERBOT_HWANG_ARRIVAL_Y; return true;
 			default: return false;
 		}
 	}
@@ -709,6 +1240,8 @@ namespace
 			case PLAYERBOT_MAP_DESERT: outX = PLAYERBOT_DESERT_EXIT_X; outY = PLAYERBOT_DESERT_EXIT_Y; return true;
 			case PLAYERBOT_MAP_SOHAN: outX = PLAYERBOT_SOHAN_EXIT_X; outY = PLAYERBOT_SOHAN_EXIT_Y; return true;
 			case PLAYERBOT_MAP_SPIDER_V1: outX = PLAYERBOT_SPIDER_EXIT_X; outY = PLAYERBOT_SPIDER_EXIT_Y; return true;
+			case PLAYERBOT_MAP_SPIDER_V2: outX = PLAYERBOT_SPIDER_V2_EXIT_X; outY = PLAYERBOT_SPIDER_V2_EXIT_Y; return true;
+			case PLAYERBOT_MAP_HWANG: outX = PLAYERBOT_HWANG_EXIT_X; outY = PLAYERBOT_HWANG_EXIT_Y; return true;
 			default: return false;
 		}
 	}
@@ -719,7 +1252,15 @@ namespace
 	bool IsPlayerBotFrontierMapIndex(long mapIndex)
 	{
 		return mapIndex == PLAYERBOT_MAP_ORC_VALLEY || mapIndex == PLAYERBOT_MAP_DESERT ||
-				mapIndex == PLAYERBOT_MAP_SOHAN || mapIndex == PLAYERBOT_MAP_SPIDER_V1;
+				mapIndex == PLAYERBOT_MAP_SOHAN || mapIndex == PLAYERBOT_MAP_SPIDER_V1 ||
+				mapIndex == PLAYERBOT_MAP_SPIDER_V2 || mapIndex == PLAYERBOT_MAP_HWANG;
+	}
+
+	// Both Spider Dungeons: the ones reached across the desert and entered
+	// from the Kuahlo gate, and the ones with no stones.
+	bool IsPlayerBotSpiderMap(long mapIndex)
+	{
+		return mapIndex == PLAYERBOT_MAP_SPIDER_V1 || mapIndex == PLAYERBOT_MAP_SPIDER_V2;
 	}
 
 	const char* GetPlayerBotFrontierName(long mapIndex)
@@ -730,6 +1271,8 @@ namespace
 			case PLAYERBOT_MAP_DESERT: return "desert";
 			case PLAYERBOT_MAP_SOHAN: return "sohan";
 			case PLAYERBOT_MAP_SPIDER_V1: return "spider_v1";
+			case PLAYERBOT_MAP_SPIDER_V2: return "spider_v2";
+			case PLAYERBOT_MAP_HWANG: return "hwang";
 			default: return "frontier";
 		}
 	}
@@ -740,7 +1283,18 @@ namespace
 	// which is why it belongs to the high band even though its monsters do not.
 	// Bokjung keeps everyone up to 29.
 	const BYTE PLAYERBOT_DESERT_MIN_LEVEL = 30;
-	const BYTE PLAYERBOT_DESERT_MAX_LEVEL = 36;
+	// The desert reaches as far as its own monsters do, which is much further
+	// than thirty-six.
+	//
+	// Counted out of metin2_map_n_desert_01/regen.txt: 14026 spawn points, more
+	// than any other map this world hosts and nearly twice Orc Valley's 8122.
+	// The Scorpion King at 39 alone stands in 2234 places, the Desert Flying Eye
+	// of 37 in 1242, the Poison Spider of 45 in 1548, the Scorpion Archer of 47
+	// in 876. Capping the map at thirty-six meant nobody hunted on it past that
+	// - the whole band from thirty-six to forty-seven went to Orc Valley - and
+	// the richest map in the game was a corridor people walked across on their
+	// way to the Spider Dungeon, which is exactly what the panel showed.
+	const BYTE PLAYERBOT_DESERT_MAX_LEVEL = 47;
 	// One distance decides both halves of this: how far away counts as somewhere
 	// else, and how far a forced march goes before the bot may settle again.
 	// Twelve thousand is the spacing Orc Valley's hunting hubs were generated
@@ -782,6 +1336,22 @@ namespace
 	// so one guild ends up on one camp. That is what the map looked like on the
 	// servers this world imitates.
 	const int PLAYERBOT_GUILD_PARTY_POINTS = 8;
+	// What a Shaman is worth as a partner out on the frontier maps.
+	//
+	// A Shaman already buffs everyone in its party - Blessing, Dragon Aid,
+	// Swiftness, Attack Up and a heal - and does it for nobody at all while it
+	// hunts alone, which is how most of them hunt. On the Spider Dungeon and
+	// the maps like it, where a bot is fighting monsters within a few levels of
+	// itself and a great many do not survive it, one Shaman in the pair is the
+	// difference between two characters that hold their ground and two that do
+	// not. Worth more than a guild badge, which is why it outweighs it: the
+	// guild is who a bot likes, this is who keeps it alive.
+	const int PLAYERBOT_PARTY_SHAMAN_POINTS = 14;
+	// And out there a bot is less inclined to go it alone. One in four kept to
+	// itself everywhere, frontier included; on the frontier that is now one in
+	// ten, so pairs actually form on the maps where they matter.
+	const int PLAYERBOT_PARTY_SOLO_PERCENT = 25;
+	const int PLAYERBOT_PARTY_SOLO_PERCENT_FRONTIER = 10;
 	// How far a follower may fall behind a leader who is walking to a new camp
 	// before it gives the party up. The cohesion radius is for fighting as one
 	// formation; a thirty-kilometre relocation with a deferred route in the
@@ -830,6 +1400,12 @@ namespace
 	// fight and refused by the engine while the last one still runs, so a
 	// minute between attempts costs nothing and keeps the log readable.
 	const DWORD PLAYERBOT_MOONLIGHT_CHEST_VNUM = 50011;
+	// How many of one box a bot has to be holding before the surplus is goods
+	// rather than its own supply. Suggested on the Discord: most of what drops
+	// should still be opened - that is where the potions and the boosters come
+	// from - but an unopened box is the one thing in this market a player can
+	// gamble on, and there was never one on a counter.
+	const DWORD PLAYERBOT_CHEST_STALL_MIN_STACK = 5;
 	// The Forgetting Scroll (ITEM_SKILLFORGET): one level off a skill and the
 	// point back. A skill that reached seventeen without turning Master is
 	// left there rather than pushed on - every further point is a point the
@@ -844,6 +1420,14 @@ namespace
 	// fifty to a dragon armour with seven more defence and nothing else.
 	const long long PLAYERBOT_ARMOR_OUTGROWN_PERCENT_PER_LEVEL = 5;
 	const DWORD PLAYERBOT_SKILL_FORGET_SCROLL_VNUM = 70037;
+	// No merchant in this world sells the scroll and nothing drops it, so a
+	// bot past the old woman's thirty bought it nowhere and a skill stuck at
+	// seventeen stayed there for life - 81 bots carried a skill at eighteen or
+	// nineteen from before the cap. Above PLAYERBOT_SKILL_RESET_MAX_LEVEL the
+	// bot buys one at the item shop's kind of price, straight into the bag,
+	// and reads it on the spot; below that level the old woman is cheaper.
+	const long long PLAYERBOT_SKILL_FORGET_SCROLL_PRICE = 200000;
+	const long long PLAYERBOT_SKILL_FORGET_SCROLL_GOLD_MARGIN = 300000;
 	// Scrap keepers: the share of stall keepers (percent, from the panel) that
 	// put their low refines on the counter instead of vendoring them, for the
 	// player who wants cheap fodder to burn at the blacksmith. A keeper stops
@@ -859,7 +1443,35 @@ namespace
 	// An archer pulls too, but a bow is not a shield: one group, four attackers.
 	const int PLAYERBOT_MULTI_PULL_ARCHER_MAX_AGGRESSORS = 4;
 	const BYTE PLAYERBOT_SKILL_MASTER_TRY_LEVEL = 17;
+	// How long a bot keeps farming its class's level-30 weapon before giving
+	// the map up for good. See ShouldPlayerBotVisitM3.
+	const BYTE PLAYERBOT_LEVEL30_WEAPON_HUNT_MAX_LEVEL = 40;
+	// The old woman south of Joan, and what she does.
+	//
+	// skill_reset2.quest, NPC 9006: refuses under level five and over thirty,
+	// refuses a character with no skill group, charges 10000 + level * 2000,
+	// then pc.clear_skill() and pc.set_skill_group(0) - which is exactly what
+	// the trainer visit already knows how to follow, because a group of zero is
+	// what sends a bot to the trainer in the first place. So the whole feature
+	// is one town errand and no new machinery.
+	//
+	// It is worth doing only for a bot that has run out of moves: a skill at
+	// seventeen that will not go Master and no skill points left to put
+	// anywhere. Resetting costs every skill level the character has, so a bot
+	// with points still in hand should spend those first.
+	const long PLAYERBOT_SKILL_RESET_NPC_X = 58800;   // npc.txt cell 588,633 on
+	const long PLAYERBOT_SKILL_RESET_NPC_Y = 165700;  // map 21, base (0,102400)
+	const BYTE PLAYERBOT_SKILL_RESET_MIN_LEVEL = 5;
+	const BYTE PLAYERBOT_SKILL_RESET_MAX_LEVEL = 30;
+	const long long PLAYERBOT_SKILL_RESET_BASE_COST = 10000;
+	const long long PLAYERBOT_SKILL_RESET_LEVEL_COST = 2000;
+	// A wallet cushion, so a reset never leaves a bot unable to buy potions.
+	const long long PLAYERBOT_SKILL_RESET_GOLD_MARGIN = 100000;
+	const DWORD PLAYERBOT_SKILL_RESET_COOLDOWN = 1800000;   // 30 min between tries
 	const DWORD PLAYERBOT_CHEST_INTERVAL = 8000;
+	// How long a box the engine has refused is left alone. A refusal can be
+	// a bag that happened to be full, so it is a wait rather than a verdict.
+	const DWORD PLAYERBOT_CHEST_REFUSED_RETRY = 600000;
 	const DWORD PLAYERBOT_BOOSTER_INTERVAL = 60000;
 	// The chest's two boosters, and the two grilled fish that work the same
 	// way: a Carp for twenty movement speed, a Rudd for ten dexterity, ten
@@ -894,10 +1506,22 @@ namespace
 	// a blue or a blood pearl. Thousandths. Once the population has opened
 	// enough of them, its own count replaces the table.
 	const DWORD PLAYERBOT_STONE_PIECE_VNUM = 27990;
+	// What a shell actually holds, read out of the engine rather than guessed.
+	//
+	// char_item.cpp case 27987 rolls 1..100: at or under 50 a Stone Piece, and
+	// the rest goes through one of two tables chosen by g_iUseLocale -
+	// {80,90,97} when it is false and {95,97,99} when it is true. This world's
+	// common.locale says "english", and __LocaleService_Init_English sets
+	// g_iUseLocale = TRUE, so the second table is the live one: 45% nothing,
+	// 2% white, 2% blue, 1% blood. The numbers here said 10/7/3 - the other
+	// table - which made opening a shell look four times more rewarding than it
+	// is, and every decision built on that estimate was wrong in the same
+	// direction. A server that changes locale changes this; check the flag
+	// before trusting the constants.
 	const int PLAYERBOT_SHELLFISH_STONE_PERMILLE = 500;
-	const int PLAYERBOT_SHELLFISH_WHITE_PERMILLE = 100;
-	const int PLAYERBOT_SHELLFISH_BLUE_PERMILLE = 70;
-	const int PLAYERBOT_SHELLFISH_RED_PERMILLE = 30;
+	const int PLAYERBOT_SHELLFISH_WHITE_PERMILLE = 20;
+	const int PLAYERBOT_SHELLFISH_BLUE_PERMILLE = 20;
+	const int PLAYERBOT_SHELLFISH_RED_PERMILLE = 10;
 	const DWORD PLAYERBOT_SHELLFISH_LEARN_SAMPLES = 50;
 	// The Blessing Scroll (CHUKBOK_SCROLL to the engine): a refine that fails
 	// under it drops the item one level instead of destroying it, at the
@@ -905,6 +1529,14 @@ namespace
 	// failure - 1584 pieces in one afternoon. Scrolls come from the chest and
 	// are scarce, so they are spent where a failure costs most: from +6 up.
 	const DWORD PLAYERBOT_BLESSING_SCROLL_VNUM = 25040;
+	// Zwoj Boga Smokow (YONGSIN_SCROLL, value0 = 2): three vnums carry it in
+	// this world. The operator wants it used ahead of the Blessing Scroll
+	// from this plus up. For the record, the engine's table for it
+	// (char_item.cpp, hyuniron_prob) is 25% at +7 and 20% at +8 against the
+	// blacksmith's 40 and 30, which the Blessing Scroll keeps; both hand the
+	// piece back a level down on failure. Measured, not assumed.
+	const DWORD PLAYERBOT_DRAGON_GOD_SCROLL_VNUMS[] = { 39022, 71032, 76009 };
+	const BYTE PLAYERBOT_DRAGON_GOD_SCROLL_MIN_PLUS = 7;
 	const BYTE PLAYERBOT_SCROLL_REFINE_MIN_PLUS = 6;
 	const DWORD PLAYERBOT_SCROLL_REFINE_INTERVAL = 45000;
 	// Neither map sells anything, so a visit is bounded and ends in Bokjung.
@@ -945,6 +1577,43 @@ namespace
 	// roomy and stopped working: stalls at opposite ends were out of each other's
 	// reach and nobody bought anything at all. The ceiling belongs to the engine,
 	// not to us.
+	// How many counters Bokjung's ring may hold before a keeper takes its goods
+	// to Joan instead. Bokjung is where the bots are, so left alone every stall
+	// opens there and the other town's market never happens; a cap is what
+	// pushes the overflow somewhere it is worth walking to.
+	const int PLAYERBOT_SHOP_M2_MAX_STALLS = 7;
+	// ...and that cap is a floor, not the number. Seven for a thousand bots
+	// was the whole reason the market emptied: after a restart every keeper
+	// opened in the same tick (the count lags a minute), then each expired
+	// stand was refused a reopening at "Bokjung full" - 229 refusals a
+	// minute - and walked to Joan, where the planner sent it shopping
+	// instead. Ninety stalls fell to twenty-eight in an hour and a half with
+	// the reopening already in place. The ring takes this share of the
+	// living population, never under the floor: eighty for a thousand bots,
+	// twenty-eight for three hundred and fifty.
+	const int PLAYERBOT_SHOP_M2_STALLS_PER_MILLE = 80;
+	// After the Teleporter refuses a bot for want of yang, how long before
+	// it asks again. It asked on every tick before: one bot of fifty-eight
+	// with 799 yang against an 11 000 fee was refused 24 000 times a minute,
+	// and its status said "Ide na Gore Sohan" all the while. The wait is
+	// what lets the town visit and the stall run and earn the fee.
+	const DWORD PLAYERBOT_TELEPORTER_RETRY_MS = 300000;
+	// How long a keeper that found Bokjung's ring full waits before asking
+	// again. Only a merchant or a dropper carries its goods to Joan when the
+	// ring is full; with every bot holding six surplus books a keeper, that
+	// walk pre-empted the world travel of hundreds of bots - "a bot that
+	// wants Sohan heads for the portal to M1, turns back, circles M2 and
+	// tries again" - on the tick before their own travel could run.
+	const DWORD PLAYERBOT_SHOP_RING_FULL_RETRY = 600000;
+	// How long Bokjung's counters are worth a look after Joan had nothing. Long
+	// enough that a bot which crossed for nothing is not sent straight back,
+	// short enough that Joan stays the first stop.
+	const DWORD PLAYERBOT_MARKET_M2_FALLBACK = 600000;
+	// Counters standing in Bokjung right now. Recounted by the market ledger
+	// once a minute and incremented the moment one opens, so a burst of
+	// keepers in the same minute cannot walk past the cap together. A stale
+	// count can only be too high, which errs towards sending a keeper to Joan.
+	int s_iPlayerBotStallsInM2 = 0;
 	const int PLAYERBOT_SHOP_RING_MIN = 400;
 	const int PLAYERBOT_SHOP_RING_RADIUS = 1700;
 	// The shop bundle (item 50200) carries LIMIT_NONE in item_proto, so the game
@@ -972,10 +1641,10 @@ namespace
 	// ten for an adventurer and every visit for a merchant: it hunts for a
 	// living and sells what the hunt brought, not the other way round.
 	const int PLAYERBOT_DROPPER_SHOP_ROLL = 333;
-	// The chance, rolled again for every stall a bot puts up, that it chooses Joan
-	// over Bokjung. Joan is where the players are - three quarters of the live
-	// bots stand on map 21 at any moment - so that is where the stalls belong.
-	const DWORD PLAYERBOT_SHOP_M1_SHARE = 90;
+	// A bot with every slot filled and nothing on its ladder left to buy has
+	// spares and no use for the yang; three in ten of those keep a stall
+	// against one in ten of everyone else.
+	const int PLAYERBOT_FULL_GEAR_SHOP_ROLL = 300;
 	// A stall stands for a while and then the bot goes back to playing. An hour
 	// was long enough that a player watching the market never saw one come down,
 	// which read as "the shops never close" even before the tick-ordering bug
@@ -986,6 +1655,16 @@ namespace
 	const DWORD PLAYERBOT_SHOP_BUNDLE_PRICE = 2000;
 	const DWORD PLAYERBOT_SHOP_REST_MIN = 1800000;
 	const DWORD PLAYERBOT_SHOP_REST_MAX = 5400000;
+	// A stand that ran out is followed by another on the same pitch, up to
+	// this many in a row, before the rest above. A stall of ten to twenty-five
+	// minutes against a rest of thirty to ninety, and a reopening that needed
+	// the next town visit to end, meant a fifth of the keepers open at any
+	// time: ninety stalls in the minutes after a restart, when every keeper
+	// stands where its last stall was, and eleven an hour later ("boty nudza
+	// sie handlem"). Two dry stands in a row end the row early - nobody is
+	// buying, so the bot goes back to playing.
+	const int PLAYERBOT_SHOP_STANDS_IN_ROW = 3;
+	const DWORD PLAYERBOT_SHOP_REOPEN_MS = 3000;
 	const DWORD PLAYERBOT_HORSE_MEDAL_VNUM = 50050;
 	const BYTE PLAYERBOT_HORSE_REQUIRED_LEVEL = 25;
 	const char* PLAYERBOT_HORSE_MEDALS_FLAG = "playerbot.horse_medals_delivered";
@@ -1002,7 +1681,43 @@ namespace
 	// What a shell can hold: Biala / Niebieska / Krwawa Perla.
 	const DWORD PLAYERBOT_PEARL_FIRST_VNUM = 27992;
 	const DWORD PLAYERBOT_PEARL_LAST_VNUM = 27994;
+	// How many shells a bot keeps whole. Prying one open is a bet against the
+	// shell's own worth: twenty-six recipes consume a shellfish as it is, and
+	// that is what it sells for. So the first few are never gambled with and
+	// only the surplus is opened.
+	const int PLAYERBOT_SHELLFISH_KEEP = 4;
+	// Hair dye, the engine's own range: 70201 washes the colour out, 70202 to
+	// 70206 set PART_HAIR to vnum-70201. char_item.cpp takes it straight from
+	// UseItem with no client involved, and the colour is permanent - which is
+	// the point of letting a bot use one.
+	const DWORD PLAYERBOT_HAIR_DYE_FIRST_VNUM = 70201;
+	const DWORD PLAYERBOT_HAIR_DYE_LAST_VNUM = 70206;
+	// The item-shop dyes. The engine's switch does not answer for these, so a
+	// bot never tries to use one: they are goods and nothing else.
+	const DWORD PLAYERBOT_HAIR_DYE_SHOP_FIRST_VNUM = 71075;
+	const DWORD PLAYERBOT_HAIR_DYE_SHOP_LAST_VNUM = 71079;
+
+	// A hair dye of either kind - one a bot could use, or one it can only sell.
+	// Both are worth money to somebody and neither is scrap.
+	bool IsPlayerBotHairDye(DWORD vnum)
+	{
+		return (vnum >= PLAYERBOT_HAIR_DYE_FIRST_VNUM &&
+					vnum <= PLAYERBOT_HAIR_DYE_LAST_VNUM) ||
+				(vnum >= PLAYERBOT_HAIR_DYE_SHOP_FIRST_VNUM &&
+					vnum <= PLAYERBOT_HAIR_DYE_SHOP_LAST_VNUM);
+	}
 	const int PLAYERBOT_FISHING_BAIT_BUNDLE = 20;
+	// What a partial purchase leaves behind, as a share and not as a sum.
+	//
+	// Buying what the purse reaches was right - a bot with 556 yang and none of
+	// the 800 a bundle costs used to stand at the Rybak buying nothing - but it
+	// went too far the other way the moment it worked: the same bot went 556 to
+	// 601 to one yang, spending its last coin on worms with nothing left for a
+	// potion. A flat reserve cannot fix that, because any reserve large enough
+	// to matter is larger than what the bots this helps actually own, and it
+	// would refuse the very purchase it was written for. A share always leaves
+	// something and never blocks the poor case.
+	const int PLAYERBOT_FISHING_TACKLE_SPEND_PERCENT = 90;
 	const int PLAYERBOT_FISHING_BAIT_RESTOCK = 5;
 	// The Rybak (9009) himself, from map_b1 npc.txt cell (675,539) against
 	// BasePosition (0,102400). Tackle is bought here.
@@ -1013,11 +1728,147 @@ namespace
 	// along Y and all face +X. This band -- x 67250..67450, y 156900..157350 --
 	// was read out of map_b1's server_attr: every cell in it is standable, and
 	// open water starts a little east of it (tools/decode_server_attr.py).
-	const long PLAYERBOT_FISHING_BANK_X = 67250;
-	const long PLAYERBOT_FISHING_BANK_Y = 156900;
+	// Where the anglers stand, measured along the river rather than laid out on
+	// a grid.
+	//
+	// A rectangle was the first attempt and it put half of them on the grass:
+	// this river bends, its bank running from x 69900 in the north through
+	// 67200 in the middle to 67800 in the south, so any rectangle wide enough
+	// to hold fifty people reaches inland to where there is no water at all.
+	// A photograph from the Discord showed exactly that - a crowd on the lawn
+	// with rods, several metres from the bank.
+	//
+	// So the stands are a table, the way hunting hubs are a table. Every
+	// candidate cell along the river was taken out of map_b1's server_attr,
+	// sorted by its distance to open water, and kept only if no already-kept
+	// stand was within 150 units: 162 places, each one standable, each
+	// within 350 units of water, and none closer to another than a metre and a
+	// half. Against a live angler population near sixty that is a bank with
+	// room to spare, and the first ones taken are the ones at the water's edge.
+	//
+	// Every coordinate sits on a navigation cell centre - base + n*50 + 25 -
+	// because that is the point CPlayerBotNavigation samples when it decides
+	// whether a cell may be stood on. Stands generated on the multiples of
+	// fifty instead sat on cell corners, so the grid judged them by a
+	// neighbouring sample: some were called blocked, the walk snapped them to
+	// the nearest cell it did accept, and two anglers ended up eight units
+	// apart on the same one.
+	//
+	// The last two numbers are a point in the water in front of the stand. A
+	// bot used to be turned to face due east, which is right for a north-south
+	// bank and wrong everywhere this river turns.
+	struct TPlayerBotFishingStandPoint { long x; long y; long waterX; long waterY; };
+	const TPlayerBotFishingStandPoint PLAYERBOT_FISHING_STANDS[] = {
+		{  69775, 155625,  70825, 156675 }, {  69575, 155675,  70625, 156725 },
+		{  70175, 155675,  70625, 156125 }, {  70375, 155675,  70525, 155825 },
+		{  69925, 155725,  70525, 156325 }, {  69275, 155775,  70325, 156825 },
+		{  69425, 155775,  70475, 156825 }, {  69725, 155825,  70325, 156425 },
+		{  70275, 155825,  70425, 155825 }, {  68775, 155875,  69825, 156925 },
+		{  68925, 155875,  69975, 156925 }, {  69075, 155875,  70125, 156925 },
+		{  70075, 155875,  70225, 156025 }, {  69425, 155925,  70025, 156525 },
+		{  69575, 155925,  70175, 156525 }, {  68575, 155975,  69625, 157025 },
+		{  69875, 155975,  70025, 156125 }, {  70225, 155975,  70375, 155975 },
+		{  70375, 155975,  70525, 155975 }, {  68925, 156025,  69525, 156625 },
+		{  69075, 156025,  69675, 156625 }, {  69225, 156025,  69225, 156625 },
+		{  68275, 156075,  69325, 157125 }, {  68425, 156075,  69475, 157125 },
+		{  69575, 156075,  69725, 156225 }, {  69725, 156075,  69725, 156225 },
+		{  68725, 156125,  69325, 156725 }, {  68125, 156175,  69175, 157225 },
+		{  69075, 156175,  69225, 156325 }, {  69225, 156175,  69225, 156325 },
+		{  69375, 156175,  69375, 156325 }, {  68425, 156225,  69025, 156825 },
+		{  68575, 156225,  69175, 156825 }, {  69525, 156225,  69675, 156225 },
+		{  67975, 156275,  68725, 157025 }, {  68875, 156275,  69025, 156425 },
+		{  68225, 156325,  68225, 156925 }, {  69025, 156325,  69175, 156325 },
+		{  69175, 156325,  69325, 156325 }, {  69325, 156325,  69475, 156325 },
+		{  67575, 156375,  68625, 157425 }, {  67775, 156375,  68525, 157125 },
+		{  68575, 156375,  68725, 156525 }, {  68725, 156375,  68725, 156525 },
+		{  69475, 156375,  69625, 156375 }, {  68875, 156425,  69025, 156425 },
+		{  68325, 156475,  68325, 156625 }, {  69025, 156475,  69175, 156475 },
+		{  69175, 156475,  69325, 156475 }, {  67525, 156525,  68425, 157425 },
+		{  67675, 156525,  68425, 157275 }, {  68475, 156525,  68625, 156525 },
+		{  68625, 156525,  68775, 156525 }, {  68775, 156575,  68925, 156575 },
+		{  67325, 156625,  68225, 157525 }, {  67175, 156775,  68225, 157825 },
+		{  67325, 156775,  68225, 157675 }, {  67475, 156775,  67925, 157225 },
+		{  67175, 156925,  68225, 157975 }, {  67325, 156925,  67925, 157525 },
+		{  67575, 156925,  67725, 156925 }, {  67075, 157075,  68125, 158125 },
+		{  67325, 157075,  67925, 157675 }, {  67475, 157075,  67625, 157225 },
+		{  67075, 157225,  68125, 158275 }, {  67225, 157225,  67825, 157825 },
+		{  67475, 157225,  67625, 157225 }, {  67225, 157375,  67825, 157975 },
+		{  67375, 157375,  67525, 157525 }, {  67075, 157425,  68125, 157425 },
+		{  67225, 157525,  67825, 157525 }, {  67375, 157525,  67525, 157525 },
+		{  67075, 157575,  68125, 157575 }, {  67225, 157675,  67825, 157675 },
+		{  67375, 157675,  67525, 157675 }, {  67125, 157825,  68025, 156925 },
+		{  67275, 157825,  67725, 157375 }, {  67475, 157925,  67625, 157925 },
+		{  67125, 157975,  68025, 157075 }, {  67325, 157975,  67925, 157975 },
+		{  67475, 158075,  67625, 158075 }, {  67175, 158125,  68225, 158125 },
+		{  67325, 158125,  67925, 158125 }, {  67475, 158225,  67625, 158225 },
+		{  67625, 158225,  67775, 158225 }, {  67775, 158225,  67925, 158225 },
+		{  68725, 158225,  68875, 158225 }, {  68875, 158225,  69025, 158225 },
+		{  69025, 158225,  69175, 158225 }, {  69175, 158225,  69025, 158225 },
+		{  69325, 158225,  69325, 158075 }, {  69475, 158225,  69475, 158075 },
+		{  69625, 158225,  69625, 158075 }, {  69775, 158225,  69775, 158075 },
+		{  69925, 158225,  69925, 158075 }, {  70075, 158225,  70225, 158225 },
+		{  67275, 158275,  68025, 158275 }, {  67925, 158325,  68075, 158325 },
+		{  68075, 158325,  68225, 158325 }, {  68225, 158325,  68375, 158325 },
+		{  68375, 158325,  68525, 158325 }, {  68525, 158325,  68675, 158325 },
+		{  70225, 158325,  70225, 158175 }, {  67425, 158375,  67725, 158075 },
+		{  67675, 158375,  67825, 158375 }, {  68675, 158375,  68825, 158375 },
+		{  68825, 158375,  68975, 158375 }, {  68975, 158375,  68675, 158375 },
+		{  69125, 158375,  69125, 158075 }, {  69275, 158375,  68975, 158075 },
+		{  69425, 158375,  69425, 157775 }, {  69575, 158375,  69575, 157775 },
+		{  69725, 158375,  69725, 157775 }, {  69925, 158375,  70225, 158075 },
+		{  70075, 158375,  70075, 158075 }, {  67275, 158425,  68025, 157675 },
+		{  70375, 158425,  70375, 158275 }, {  67825, 158475,  67975, 158475 },
+		{  67975, 158475,  67825, 158475 }, {  68125, 158475,  68125, 158175 },
+		{  68275, 158475,  68275, 158175 }, {  68425, 158475,  68425, 158175 },
+		{  70225, 158475,  70525, 158175 }, {  67425, 158525,  68175, 157775 },
+		{  67575, 158525,  68025, 158075 }, {  68575, 158525,  68575, 158075 },
+		{  68725, 158525,  68725, 158075 }, {  68875, 158525,  68875, 158075 },
+		{  69025, 158525,  68575, 158075 }, {  69175, 158525,  69175, 157775 },
+		{  69325, 158525,  68575, 157775 }, {  69475, 158525,  68575, 157625 },
+		{  69625, 158525,  69625, 157475 }, {  69775, 158525,  70525, 157775 },
+		{  69925, 158525,  70675, 157775 }, {  70075, 158525,  70075, 157775 },
+		{  67225, 158575,  68125, 157675 }, {  70375, 158575,  70825, 158125 },
+		{  67725, 158625,  68175, 158175 }, {  67875, 158625,  67875, 158175 },
+		{  68025, 158625,  67575, 158175 }, {  68175, 158625,  67575, 158025 },
+		{  68325, 158625,  68325, 157875 }, {  70225, 158625,  70975, 157875 },
+		{  67425, 158675,  68325, 157775 }, {  67575, 158675,  68325, 157925 },
+		{  68475, 158675,  68475, 157775 }, {  68625, 158675,  68625, 157775 },
+		{  68775, 158675,  68775, 157775 }, {  68925, 158675,  68025, 157775 },
+		{  69075, 158675,  68175, 157775 }, {  69225, 158675,  68175, 157625 },
+		{  70025, 158675,  70925, 157775 }, {  70375, 158725,  71125, 157975 },
+		{  67825, 158775,  67825, 157875 }, {  67975, 158775,  67975, 157875 },
+		{  68125, 158775,  67225, 157875 }, {  68275, 158775,  67375, 157875 },
+		{  70225, 158775,  71125, 157875 }, {  67475, 158825,  68525, 157775 },
+		{  67625, 158825,  68675, 157775 }, {  70375, 158875,  71425, 157825 }
+	};
+	const size_t PLAYERBOT_FISHING_STAND_COUNT =
+			sizeof(PLAYERBOT_FISHING_STANDS) / sizeof(PLAYERBOT_FISHING_STANDS[0]);
+	// The middle of that table and a radius that covers all of it. Only the
+	// status line uses these, for the one question it asks about an angler: is
+	// it at the river yet, or still on its way. The stands themselves span
+	// x 67050..70400 and y 155600..158850, so nothing smaller reaches the ends.
+	const long PLAYERBOT_FISHING_BANK_X = 68725;
+	const long PLAYERBOT_FISHING_BANK_Y = 157225;
+	const int PLAYERBOT_FISHING_BANK_RADIUS = 2600;
+	const DWORD PLAYERBOT_FISHING_STAND_CLAIM = 120000;
 	// A point well inside the river, used only to turn the bot to face the water.
 	const long PLAYERBOT_FISHING_WATER_X = 68000;
-	const int PLAYERBOT_FISHING_ARRIVE = 200;
+	// Where an angler counts as arrived - and it may never be tighter than
+	// PLAYERBOT_NAV_ARRIVAL_DISTANCE, which is where the walk itself stops.
+	//
+	// This was cut to twenty-five to keep anglers a metre apart and that made a
+	// dead zone: MovePlayerBot reports success and stops moving at a hundred
+	// units from the goal, the fishing pass kept asking for another step, and
+	// the bot stood between the two numbers for ever with stuck=0 and nothing in
+	// any log. Measured on the live server at seventy-one and seventy-six units
+	// from a destination neither bot ever reached.
+	//
+	// The consequence is honest and worth stating: with stands a hundred and
+	// fifty apart and a hundred units of tolerance at each end, two anglers can
+	// still end up close. Spacing them further is a separate change to the stand
+	// table, not a number to shave here. The static_assert in
+	// playerbot_activities.h keeps this from being lowered again.
+	const int PLAYERBOT_FISHING_ARRIVE = 100;
 	// Independently planned route failures before the bank is written off. Six
 	// matches the town-service rescue; anything larger is indistinguishable from
 	// never giving up at all.
@@ -1031,6 +1882,15 @@ namespace
 	// A cast that never reports a bite (the engine waits 10-40 s) is abandoned so
 	// one wedged event cannot park a bot at the water forever.
 	const DWORD PLAYERBOT_FISHING_CAST_TIMEOUT = 60000;
+	// And a bot that reaches the water and never casts at all.
+	//
+	// The cast timeout above covers a line that goes in and never bites. Nothing
+	// covered the step before it: an angler standing on its bank with bait in
+	// the bag and no rod on its back had no clock of any kind, and one was
+	// reported standing there for two hours. A session that has not managed a
+	// single cast in this long is over; the ordinary rest interval then keeps
+	// the bot away from the water until something has changed.
+	const DWORD PLAYERBOT_FISHING_NO_CAST_GIVE_UP = 120000;
 	const DWORD PLAYERBOT_FISHING_SESSION_MIN = 900000;    // 15 min
 	const DWORD PLAYERBOT_FISHING_SESSION_MAX = 2400000;   // 40 min
 	const DWORD PLAYERBOT_FISHING_REST_MIN = 2700000;      // 45 min
@@ -1060,16 +1920,119 @@ namespace
 	const DWORD PLAYERBOT_REMOTE_REFINE_RETURN_MIN_DELAY = 720000;
 	const DWORD PLAYERBOT_REMOTE_REFINE_RETURN_MAX_DELAY = 1500000;
 	const DWORD PLAYERBOT_MONKEY_MAX_VISIT_TIME = 1800000;
-	// Who the Easy Monkey Dungeon is worth a trip for. Below this a bot dies to
-	// the rooms it has to cross; above it the medals are pocket change against
-	// what the same half hour buys on the frontier, and the dungeon was filling
-	// up with characters that had nothing left to gain there.
+	// Which Monkey Dungeon a level is sent to. The medal is a "kill" drop group
+	// (mob_drop_item.txt: one medal per 550 soldiers, 500 fighters, 200 generals)
+	// and CreateDropItem scales every kill-group roll by aiPercentByDeltaLev -
+	// 1% of the rate once the killer stands fifteen levels above the monster.
+	// So a level-45 bot in the easy dungeon (monkeys of 22-29) needed fifty
+	// thousand kills for a medal: 140 trips an hour brought back one. The
+	// medium dungeon holds monkeys of 35-42 and the hard one 45-54; the bands
+	// keep a bot within ten levels of the room it fights in.
 	const BYTE PLAYERBOT_MONKEY_MIN_LEVEL = 18;
-	const BYTE PLAYERBOT_MONKEY_MAX_LEVEL = 26;
+	const BYTE PLAYERBOT_MONKEY_MEDIUM_MIN_LEVEL = 33;
+	const BYTE PLAYERBOT_MONKEY_HARD_MIN_LEVEL = 46;
 	const DWORD PLAYERBOT_M3_MAX_VISIT_TIME = 1200000;
 	const DWORD PLAYERBOT_MONKEY_REVERSE_PORTAL_BLOCK_TIME = 10000;
+	// The third hand. Worn in a unique slot it makes CHARACTER::RewardGold hand
+	// a kill's yang straight to the killer instead of scattering coin piles on
+	// the ground, which is a bot's whole reason for wanting one: the walk to
+	// each pile costs a route plan and the piles it never reaches rot where
+	// they fell. The engine asks IsEquipUniqueGroup(UNIQUE_GROUP_AUTOLOOT), and
+	// what that group holds on this server is 72016..72018 - not the 71010 the
+	// item shop sells, which belongs to no group at all and would do nothing.
+	//
+	// It is a shop item with a wear clock: ITEM_MANAGER::CreateItem seeds
+	// ITEM_SOCKET_UNIQUE_REMAIN_TIME from VALUE0 and unique_expire_event counts
+	// it down one minute at a time while the item is worn, so 72018 is three
+	// hours of hunting and then nothing. A bot has no item shop to go back to,
+	// so its copy is wound back up instead of re-bought - the same answer
+	// ManagePlayerBotSkillBooks gives to a book's eighteen-hour wait.
+	const DWORD PLAYERBOT_THIRD_HAND_VNUM = 72018;
+	const long PLAYERBOT_THIRD_HAND_MINUTES = 525600;
+	const long PLAYERBOT_THIRD_HAND_REWIND_BELOW = 10080;
+	const DWORD PLAYERBOT_THIRD_HAND_INTERVAL = 300000;
+	// How long a bot works one chamber before walking to the portal that leads
+	// to the next. Four minutes is two respawns of a room's dozen monsters; the
+	// thirty-minute visit therefore covers six or seven of the eleven chambers.
+	const DWORD PLAYERBOT_MONKEY_CHAMBER_DWELL = 240000;
 	const long PLAYERBOT_MONKEY_EASY_BASE_X = 844800;
 	const long PLAYERBOT_MONKEY_EASY_BASE_Y = 435200;
+	// The three dungeons are one maze: metin2_map_monkey_dungeon2 and _3 carry
+	// the same server_attr, the same regen cells and the same GOTO portals as
+	// _12, at another base position. Everything placed in the easy dungeon is
+	// therefore a local offset, and a dungeon is its base.
+	const long PLAYERBOT_MONKEY_MEDIUM_BASE_X = 128000;
+	const long PLAYERBOT_MONKEY_MEDIUM_BASE_Y = 640000;
+	const long PLAYERBOT_MONKEY_HARD_BASE_X = 128000;
+	const long PLAYERBOT_MONKEY_HARD_BASE_Y = 716800;
+	// Six cells south of the exit NPC (10070/10073/10075, cell 72,119 and
+	// 72,114 - the arrival is where the easy one always was, the portal is
+	// the NPC itself).
+	const long PLAYERBOT_MONKEY_ARRIVAL_LOCAL_X = 7200;
+	const long PLAYERBOT_MONKEY_ARRIVAL_LOCAL_Y = 12500;
+	const long PLAYERBOT_MONKEY_RETURN_LOCAL_X = 7200;
+	const long PLAYERBOT_MONKEY_RETURN_LOCAL_Y = 11900;
+
+	bool IsPlayerBotMonkeyMap(long mapIndex)
+	{
+		return mapIndex == PLAYERBOT_MAP_MONKEY_EASY ||
+				mapIndex == PLAYERBOT_MAP_MONKEY_MEDIUM ||
+				mapIndex == PLAYERBOT_MAP_MONKEY_HARD;
+	}
+
+	bool GetPlayerBotMonkeyBase(long mapIndex, long& outX, long& outY)
+	{
+		switch (mapIndex)
+		{
+			case PLAYERBOT_MAP_MONKEY_EASY: outX = PLAYERBOT_MONKEY_EASY_BASE_X; outY = PLAYERBOT_MONKEY_EASY_BASE_Y; return true;
+			case PLAYERBOT_MAP_MONKEY_MEDIUM: outX = PLAYERBOT_MONKEY_MEDIUM_BASE_X; outY = PLAYERBOT_MONKEY_MEDIUM_BASE_Y; return true;
+			case PLAYERBOT_MAP_MONKEY_HARD: outX = PLAYERBOT_MONKEY_HARD_BASE_X; outY = PLAYERBOT_MONKEY_HARD_BASE_Y; return true;
+			default: return false;
+		}
+	}
+
+	bool GetPlayerBotMonkeyArrival(long mapIndex, long& outX, long& outY)
+	{
+		long baseX = 0, baseY = 0;
+		if (!GetPlayerBotMonkeyBase(mapIndex, baseX, baseY))
+			return false;
+		outX = baseX + PLAYERBOT_MONKEY_ARRIVAL_LOCAL_X;
+		outY = baseY + PLAYERBOT_MONKEY_ARRIVAL_LOCAL_Y;
+		return true;
+	}
+
+	bool GetPlayerBotMonkeyReturnPortal(long mapIndex, long& outX, long& outY)
+	{
+		long baseX = 0, baseY = 0;
+		if (!GetPlayerBotMonkeyBase(mapIndex, baseX, baseY))
+			return false;
+		outX = baseX + PLAYERBOT_MONKEY_RETURN_LOCAL_X;
+		outY = baseY + PLAYERBOT_MONKEY_RETURN_LOCAL_Y;
+		return true;
+	}
+
+	// The dungeon a bot of this level earns medals in, or 0 below the band.
+	long GetPlayerBotMonkeyMapForLevel(BYTE level)
+	{
+		if (level < PLAYERBOT_MONKEY_MIN_LEVEL)
+			return 0;
+		if (level < PLAYERBOT_MONKEY_MEDIUM_MIN_LEVEL)
+			return PLAYERBOT_MAP_MONKEY_EASY;
+		if (level < PLAYERBOT_MONKEY_HARD_MIN_LEVEL)
+			return PLAYERBOT_MAP_MONKEY_MEDIUM;
+		return PLAYERBOT_MAP_MONKEY_HARD;
+	}
+
+	const char* GetPlayerBotMonkeyName(long mapIndex)
+	{
+		switch (mapIndex)
+		{
+			case PLAYERBOT_MAP_MONKEY_EASY: return "easy";
+			case PLAYERBOT_MAP_MONKEY_MEDIUM: return "medium";
+			case PLAYERBOT_MAP_MONKEY_HARD: return "hard";
+			default: return "monkey";
+		}
+	}
 	const long MAP21_BASE_X = 921600;
 	const long MAP21_BASE_Y = 204800;
 
@@ -1100,6 +2063,10 @@ namespace
 		// own cell and never merges - and matching by vnum found that second
 		// stack and walked a buyer over to a sold slot.
 		DWORD dwItemID;
+		// Whether the sale of this line has been written to log.log. The engine
+		// logs the buyer's side (SHOP_BUY) and nothing for the keeper, and the
+		// keeper is the one whose history a player reads.
+		bool bSoldLogged;
 		// Where the line sits in the engine's shop, which is what CShopManager::Buy
 		// indexes by. Not the line's index in the table: a private shop is a grid
 		// of five columns and eight rows, a weapon is three cells tall and an
@@ -1143,6 +2110,23 @@ namespace
 	};
 	const size_t PLAYERBOT_BIOLOGIST_ORC_TOOTH_INDEX = 6;
 	const DWORD PLAYERBOT_ORC_TOOTH_VNUM = 30006;
+	// How many specimens are worth a walk to Joan.
+	//
+	// The hand-in was gated on carrying the whole remaining count - ten Orc
+	// Teeth in one bag - and almost nobody ever got there: 700 bots held 2219
+	// teeth between them, three apiece, and exactly three had ten. Meanwhile the
+	// Biologist's counter stood at 0/10 for the entire world. The hand-in itself
+	// has always been one specimen at a time with a 60% accept roll, so a
+	// partial load was never a problem for the quest - only for the gate in
+	// front of it.
+	const int PLAYERBOT_BIOLOGIST_MIN_HANDIN = 4;
+	// A herb row this far below the bot is one it will never do: the monsters
+	// that carry the early specimens stand in Joan and Bokjung, and a bot of
+	// forty lives in the valley. The chain is not one quest but seven, so a row
+	// can be stepped over rather than blocking every row behind it - which is
+	// what the Discord saw: a Sura of forty-two with "Korzen Gango 0/5" as its
+	// stated goal, hitting Orcs, for ever.
+	const int PLAYERBOT_BIOLOGIST_OUTGROWN_LEVELS = 10;
 	const DWORD PLAYERBOT_JINUNGGYI_STONE_VNUM = 30220;
 	const DWORD PLAYERBOT_ELITE_ORC_VNUM = 631;
 	const DWORD PLAYERBOT_ORC_TOOTH_REWARD_BOX_VNUM = 50109;
@@ -1258,7 +2242,41 @@ namespace
 	// boss scores: above any camp, so the crowd (the Orc Chief) or the party
 	// (the Spider Queen) goes.
 	const DWORD PLAYERBOT_RAID_BOSS_CHECK_INTERVAL = 30000;
+	// The Bestial Captain (591, level 42, boss) of Bokjung: metin2_map_b3's
+	// boss.txt cell (787,688) on base (102400,204800), every hour, ten cells
+	// of spread. Bokjung's wandering has no hub table - it rotates spawn
+	// clusters - so the Captain is a detour taken while he stands, by anybody
+	// of the band. Nine Tails (1901, level 72, boss) is a Sohan hub row.
+	const long PLAYERBOT_M2_CAPTAIN_X = 181100;
+	const long PLAYERBOT_M2_CAPTAIN_Y = 273600;
+	const BYTE PLAYERBOT_M2_CAPTAIN_MIN_LEVEL = 35;
+	const long PLAYERBOT_SOHAN_NINE_TAILS_X = 433300;
+	const long PLAYERBOT_SOHAN_NINE_TAILS_Y = 216500;
 	const int PLAYERBOT_RAID_WORTH = 100000;
+	// How many bots one boss is worth calling out. A boss needs a raid, not a
+	// province: past this many already on him the hub is scored like any other
+	// ground, so the rest of the band goes on hunting instead of queueing.
+	const int PLAYERBOT_RAID_CROWD = 12;
+	// A raid of twelve was a ceiling, not a floor. On a map carrying forty
+	// bots it left the Spider Queen - level 60, 193 408 hit points - with six
+	// of them (a raid nobody called takes half the crowd), while the other
+	// thirty-four hunted soldiers within sight of her. "If there are that many
+	// of them, all of them should go for her; weak alone, together they can
+	// take her." So the room on a boss hub scales with the map: at least the
+	// old twelve, or this share of every bot on the map, whichever is more.
+	const int PLAYERBOT_RAID_MAP_SHARE_CALLED_PERCENT = 60;
+	const int PLAYERBOT_RAID_MAP_SHARE_UNCALLED_PERCENT = 35;
+	// And once that many have set out, a bot in reach of the boss puts her
+	// above the trash round her. A level-60 boss against a level-48 bot sits
+	// at delta twelve, the lowest scoring bucket there is - ten thousand
+	// against a soldier's three hundred thousand - so a raider that arrived
+	// fought soldiers beside her until she killed it. See the target scorer.
+	const int PLAYERBOT_RAID_SWARM_MIN = 3;
+	const int PLAYERBOT_RAID_SWARM_TARGET_BONUS = 1500000;
+	// How long a guild's call stands. Long enough to walk across a frontier
+	// map, short enough that a boss killed five minutes ago stops summoning
+	// anybody.
+	const DWORD PLAYERBOT_RAID_CALL_TIME = 180000;
 	// Exact world coordinates of the two rare M2 enemies from
 	// metin2_map_b3/boss.txt (map base 102400,204800). They are the classic
 	// level-30 weapon hunt: Bestial Archer (533) and Specialist (534).
@@ -1303,7 +2321,13 @@ namespace
 		BOT_TOWN_PHASE_BLACKSMITH,
 		BOT_TOWN_PHASE_BLACKSMITH_WAIT,
 		BOT_TOWN_PHASE_GATE_OUT,
-		BOT_TOWN_PHASE_GATE_CROSS_OUT
+		BOT_TOWN_PHASE_GATE_CROSS_OUT,
+		// Appended, never inserted: the panel's status file carries this value
+		// as a number and inserting one shifts every phase after it.
+		BOT_TOWN_PHASE_SKILL_RESET,
+		BOT_TOWN_PHASE_SKILL_RESET_WAIT,
+		BOT_TOWN_PHASE_SAFEBOX,
+		BOT_TOWN_PHASE_SAFEBOX_WAIT
 	};
 
 	enum EPlayerBotLongTermGoal
@@ -1347,7 +2371,29 @@ namespace
 		// Walking the stall ring looking for something to buy. Distinct from
 		// BOT_ACTION_SHOP, which is the NPC merchant round, and from
 		// BOT_ACTION_STALL, which is standing behind a counter of one's own.
-		BOT_ACTION_MARKET
+		BOT_ACTION_MARKET,
+		// Bringing monsters to the party. Distinct from BOT_ACTION_FIGHT on
+		// purpose: the Archer is not fighting, it tags and runs.
+		BOT_ACTION_LURE,
+		// Standing about in town with nothing to do. Distinct from
+		// BOT_ACTION_RECOVER, which is a bot getting its health back, and from
+		// BOT_ACTION_STALL, which is a bot behind a counter. Appended, never
+		// inserted - the id goes into the status file the panel reads.
+		BOT_ACTION_TOWN_REST
+	};
+
+	// Where an Archer is in its course. WAIT_READY is the absence of a session
+	// rather than a stage of one, so it is LURE_STAGE_NONE.
+	enum EPlayerBotLureStage
+	{
+		LURE_STAGE_NONE = 0,
+		LURE_STAGE_PLAN,
+		LURE_STAGE_APPROACH,
+		LURE_STAGE_TAG,
+		LURE_STAGE_CONFIRM,
+		LURE_STAGE_RETURN,
+		LURE_STAGE_HANDOFF,
+		LURE_STAGE_RECOVER
 	};
 
 	enum EPlayerBotPersonality
@@ -1435,6 +2481,7 @@ namespace
 			dwNextSkillCheckTime(0),
 			dwNextSkillBookTime(0),
 			dwNextSoulStoneTime(0),
+			dwNextThirdHandTime(0),
 			dwNextProgressionChestCheckTime(0),
 			dwNextBuffCheckTime(0),
 			dwNextSkillCastTime(0),
@@ -1459,6 +2506,7 @@ namespace
 			dwNextFishingCheckTime(0),
 			dwNextFishingActionTime(0),
 			dwFishingCastTime(0),
+			dwFishingIdleSince(0),
 			dwFishingSessionEndTime(0),
 			dwNextFishingProgressLogTime(0),
 			dwBakeUntil(0),
@@ -1470,6 +2518,8 @@ namespace
 			dwFrontierEnteredTime(0),
 			dwShopOpenedTime(0),
 			dwShopCloseTime(0),
+			bShopStandsInRow(0),
+			bShopLastStandSold(false),
 			dwNextShopKeepTime(0),
 			dwNextShoppingTime(0),
 			dwMarketTripUntil(0),
@@ -1477,6 +2527,7 @@ namespace
 			dwMarketStallVID(0),
 			dwNextShopDebugTime(0),
 			dwMonkeyReversePortalBlockUntil(0),
+			dwMonkeyChamberTime(0),
 			dwNextLootPickupTime(0),
 			dwNextLootSearchTime(0),
 			dwNextLootThreatCheckTime(0),
@@ -1492,6 +2543,9 @@ namespace
 			dwNextMultiPullActionTime(0),
 			dwMultiPullTargetVID(0),
 			dwNextShopCheckTime(0),
+			dwNextSkillResetTime(0),
+			dwNextStackMergeTime(0),
+			dwEquipPendingSince(0),
 			dwEmergencyScavengeUntil(0),
 			dwTownWaitUntil(0),
 			dwStoneFightStartTime(0),
@@ -1534,6 +2588,8 @@ namespace
 			bTownNeedArmorMerchant(false),
 			bTownNeedBlacksmith(false),
 			bTownNeedTrainer(false),
+			bTownNeedSkillReset(false),
+			bTownNeedSafebox(false),
 			bVisitingBiologist(false),
 			bVisitingStable(false),
 			bFishingSession(false),
@@ -1542,6 +2598,8 @@ namespace
 			bComboMotion(MOTION_COMBO_ATTACK_1),
 			bStuckCounter(0),
 			lLastX(0),
+			lDefenceAnchorX(0),
+			lDefenceAnchorY(0),
 			lLastY(0),
 			uRouteIndex(0),
 			lRouteDestX(0),
@@ -1563,6 +2621,9 @@ namespace
 			bPersonality(BOT_PERSONALITY_STEADY_ADVENTURER),
 			bAmbition(BOT_AMBITION_LEVEL),
 			uMetinHotspotIndex(0),
+			bMonkeyChamber(255),
+			bMonkeyPrevChamber(255),
+			bMonkeySpot(0),
 			bLongTermGoal(BOT_GOAL_LEVEL_UP),
 			bCurrentAction(BOT_ACTION_IDLE),
 			bLastStatusAction(255),
@@ -1575,10 +2636,18 @@ namespace
 			dwNextMaterialScanTime(0),
 			dwMaterialHuntVnum(0),
 			dwShopSignClearUntil(0),
+			dwStallWalkUntil(0),
 			dwNextShopSignClearTime(0),
 			dwPortalWalkSince(0),
 			iPortalWalkBest(0),
+			wPortalWalkTicks(0),
+			wPortalWalkRouteIndex(0),
+			bLastNavOutcome(0),
 			dwFightProgressVID(0),
+			dwDefenceTargetVID(0),
+			dwDefenceEpisodeStart(0),
+			dwNextCombatRecheckTime(0),
+			dwErrandDoneTime(0),
 			dwFightStartTime(0),
 			dwFightLastProgressTime(0),
 			iLastFightHP(0),
@@ -1587,7 +2656,37 @@ namespace
 			dwCampSince(0),
 			dwRelocateSince(0),
 			wHuntingHub(0xffff),
-			dwHubChosenTime(0)
+			dwHubChosenTime(0),
+			dwTownLingerUntil(0),
+			dwTownBrowseUntil(0),
+			lTownBrowseX(0),
+			lTownBrowseY(0),
+			dwFirstNavDeferTime(0),
+			dwMarketM2AllowedUntil(0),
+			dwServiceRetryAt(0),
+			dwServiceSince(0),
+			dwDepartureSince(0),
+			lDepartureMap(0),
+			bServicePending(false),
+			bLastCombatReason(0),
+			dwLureSessionId(0),
+			dwLureStageTime(0),
+			dwLureCourseTime(0),
+			dwLureShotTime(0),
+			dwLureNextTime(0),
+			dwLureTargetVID(0),
+			dwLureReceiverPID(0),
+			lLureAnchorX(0),
+			lLureAnchorY(0),
+			iLureStartHPPercent(0),
+			iLureDelivered(0),
+			iLureChasing(0),
+			bLureStage(LURE_STAGE_NONE),
+			bLureGroupsPlanned(0),
+			bLureGroupsTagged(0),
+			bLureBudget(0),
+			bLureTagAttempts(0),
+			bLureGoodCourses(0)
 		{
 		}
 
@@ -1614,6 +2713,7 @@ namespace
 		DWORD dwNextSkillCheckTime;
 		DWORD dwNextSkillBookTime;
 		DWORD dwNextSoulStoneTime;
+		DWORD dwNextThirdHandTime;
 		DWORD dwNextProgressionChestCheckTime;
 		DWORD dwNextBuffCheckTime;
 		DWORD dwNextSkillCastTime;
@@ -1640,6 +2740,8 @@ namespace
 		// When the current line went into the water, so a cast that never reports
 		// a bite can be given up on instead of parking the bot at the bank.
 		DWORD dwFishingCastTime;
+		// When this angler was last ready to fish and did not. Cleared by a cast.
+		DWORD dwFishingIdleSince;
 		DWORD dwFishingSessionEndTime;
 		// A stuck angler used to be invisible: bFishingSession exempts it from the
 		// inactivity watchdog, so nothing complained while it stood still for the
@@ -1656,6 +2758,10 @@ namespace
 		DWORD dwFrontierEnteredTime;
 		DWORD dwShopOpenedTime;
 		DWORD dwShopCloseTime;
+		// Stands on this pitch since the last rest, and whether the previous
+		// one sold anything - see PLAYERBOT_SHOP_STANDS_IN_ROW.
+		BYTE bShopStandsInRow;
+		bool bShopLastStandSold;
 		DWORD dwNextShopKeepTime;
 		DWORD dwNextShoppingTime;
 		// The shopping trip: when it must be over, when the counters may be read
@@ -1672,6 +2778,8 @@ namespace
 		std::vector<TPlayerBotShopOffer> vecShopOffers;
 		DWORD dwNextShopDebugTime;
 		DWORD dwMonkeyReversePortalBlockUntil;
+		// Since when this bot has been working its current Monkey Dungeon chamber.
+		DWORD dwMonkeyChamberTime;
 		DWORD dwNextLootPickupTime;
 		DWORD dwNextLootSearchTime;
 		DWORD dwNextLootThreatCheckTime;
@@ -1687,6 +2795,10 @@ namespace
 		DWORD dwNextMultiPullActionTime;
 		DWORD dwMultiPullTargetVID;
 		DWORD dwNextShopCheckTime;
+		// When this bot may next pay the old woman to forget its skills.
+		DWORD dwNextSkillResetTime;
+		DWORD dwNextStackMergeTime;
+		DWORD dwEquipPendingSince;
 		DWORD dwEmergencyScavengeUntil;
 		DWORD dwTownWaitUntil;
 		DWORD dwStoneFightStartTime;
@@ -1706,7 +2818,6 @@ namespace
 		long lDesertCrossingY;
 		DWORD dwNextCrossingStoneCheck;
 		// When this bot last read a book of each skill, for the BOOKS switch.
-		std::map<DWORD, DWORD> mapBookReadTime;
 		DWORD dwStoneLastProgressTime;
 		DWORD dwNextStoneProgressCheckTime;
 		DWORD dwNextNavPlanTime;
@@ -1738,6 +2849,8 @@ namespace
 		bool bTownNeedArmorMerchant;
 		bool bTownNeedBlacksmith;
 		bool bTownNeedTrainer;
+		bool bTownNeedSkillReset;
+		bool bTownNeedSafebox;
 		bool bVisitingBiologist;
 		bool bVisitingStable;
 		// The bot has committed to a fishing trip: it carries a rod in the weapon
@@ -1749,6 +2862,8 @@ namespace
 		BYTE bComboMotion;
 		BYTE bStuckCounter;
 		long lLastX;
+		long lDefenceAnchorX;
+		long lDefenceAnchorY;
 		long lLastY;
 		std::vector<PIXEL_POSITION> vecRoute;
 		size_t uRouteIndex;
@@ -1776,6 +2891,13 @@ namespace
 		BYTE bPersonality;
 		BYTE bAmbition;
 		BYTE uMetinHotspotIndex;
+		// The Monkey Dungeon chamber this bot is working, the one it came from
+		// (so it walks on rather than back through the portal it arrived by), and
+		// which of that chamber's spawn points it is walking to. 255 is "none":
+		// a bot outside the dungeon has no chamber.
+		BYTE bMonkeyChamber;
+		BYTE bMonkeyPrevChamber;
+		BYTE bMonkeySpot;
 		BYTE bLongTermGoal;
 		BYTE bCurrentAction;
 		BYTE bLastStatusAction;
@@ -1816,10 +2938,35 @@ namespace
 		DWORD dwNextMaterialScanTime;
 		DWORD dwMaterialHuntVnum;
 		DWORD dwShopSignClearUntil;
+		// While set, the bot is carrying its goods to the other town's ring
+		// because this one is full - the status says so instead of the goal.
+		DWORD dwStallWalkUntil;
 		DWORD dwNextShopSignClearTime;
 		DWORD dwPortalWalkSince;
 		int iPortalWalkBest;
+		// How many times the portal walk has been asked to make progress since
+		// the clock started. The clock is wall time, so a stall says nothing
+		// about whether the bot was ever given a tick to walk in.
+		WORD wPortalWalkTicks;
+		// The route position the portal walk last saw. Walking round a
+		// building is progress even while the straight line to the portal
+		// does not shorten, and only the route knows that.
+		WORD wPortalWalkRouteIndex;
+		// Why the last walk step came to nothing. Every way MovePlayerBot can
+		// decline is throttled or silent, and three of them look identical from
+		// outside: no route, no movement, nothing in any log. Recording which
+		// one it was costs a byte and is the difference between a diagnosis and
+		// a guess.
+		BYTE bLastNavOutcome;
 		DWORD dwFightProgressVID;
+		// The attacker this bot is currently defending itself against, since when,
+		// and from where. See PLAYERBOT_DEFENCE_EPISODE_TIME.
+		DWORD dwDefenceTargetVID;
+		DWORD dwDefenceEpisodeStart;
+		DWORD dwNextCombatRecheckTime;
+		// When this bot last finished a town errand, so the time it then takes
+		// to leave the map can be measured rather than guessed at.
+		DWORD dwErrandDoneTime;
 		DWORD dwFightStartTime;
 		DWORD dwFightLastProgressTime;
 		int iLastFightHP;
@@ -1831,6 +2978,65 @@ namespace
 		// logged when it changes rather than on every decision.
 		WORD wHuntingHub;
 		DWORD dwHubChosenTime;
+
+		// Until when this bot is spending time in town rather than leaving the
+		// moment its errand is done.
+		DWORD dwTownLingerUntil;
+		// The next counter this bot strolls to, and when to choose another.
+		DWORD dwTownBrowseUntil;
+		long lTownBrowseX;
+		long lTownBrowseY;
+		// When this bot first had a route refused for want of planning budget.
+		// The audit asked for the queue age: a deferral that has stood for a
+		// minute is a different thing from one that has stood for a second.
+		DWORD dwFirstNavDeferTime;
+		// Until when this bot may look for goods in Bokjung. Zero means "look in
+		// Joan first": a shopper crosses to the quieter market, and only after
+		// finding nothing there is Bokjung worth the walk for a while.
+		DWORD dwMarketM2AllowedUntil;
+		// A town errand that has not finished. Set when the watchdog or a failed
+		// visit gives up on the attempt, cleared when a visit completes or the
+		// need goes away. While it stands the bot is a customer, not a hunter.
+		DWORD dwServiceRetryAt;
+		DWORD dwServiceSince;
+		// Where this bot means to go once the town is done with it, and since
+		// when. Survives the visit and the watchdog: the audit's point was that
+		// a reset may drop a stale route but not the intent behind it.
+		DWORD dwDepartureSince;
+		long lDepartureMap;
+		bool bServicePending;
+		// Why the monster this bot is fighting was allowed - the combat policy's
+		// own Reason, kept so the line over the bot's head can say what it is
+		// doing *for*, which is the whole point of the audit's status section.
+		// Zero until the three-second re-check has run once.
+		BYTE bLastCombatReason;
+
+		// The luring course. The session id is what a log line is followed by
+		// and what tells one course from the next; the party's own record of who
+		// is luring for it lives in playerbot_lure.h, keyed by leader, because a
+		// party may only have one lurer and a bot cannot see the other bots'
+		// state from here.
+		DWORD dwLureSessionId;
+		DWORD dwLureStageTime;
+		DWORD dwLureCourseTime;
+		DWORD dwLureShotTime;
+		DWORD dwLureNextTime;
+		DWORD dwLureTargetVID;
+		DWORD dwLureReceiverPID;
+		// Where the party was standing when the course began. Everything is
+		// measured from here: how far the Archer may go, and where it comes back
+		// to - not the receiver's position, which moves during the fight.
+		long lLureAnchorX;
+		long lLureAnchorY;
+		int iLureStartHPPercent;
+		int iLureDelivered;
+		int iLureChasing;
+		BYTE bLureStage;
+		BYTE bLureGroupsPlanned;
+		BYTE bLureGroupsTagged;
+		BYTE bLureBudget;
+		BYTE bLureTagAttempts;
+		BYTE bLureGoodCourses;
 	};
 
 	typedef std::map<DWORD, TPlayerBotAIState> TPlayerBotAIStateMap;
@@ -1840,6 +3046,45 @@ namespace
 	// rather than in the manager because the subsystems read it too - refining
 	// asks a bot for its personality long before the tick reaches it.
 	TPlayerBotAIStateMap s_mapPlayerBotAIStates;
+	// How many bots stand on each map, rebuilt by the tick before it visits
+	// them. The raid cap is the first thing to ask; a hub chooser cannot walk
+	// the character manager for the answer on every decision.
+	std::map<long, int> s_mapPlayerBotsOnMap;
+	int GetPlayerBotsOnMap(long lMapIndex)
+	{
+		std::map<long, int>::const_iterator it = s_mapPlayerBotsOnMap.find(lMapIndex);
+		return it == s_mapPlayerBotsOnMap.end() ? 0 : it->second;
+	}
+
+	int GetPlayerBotsAlive()
+	{
+		int total = 0;
+		for (std::map<long, int>::const_iterator it = s_mapPlayerBotsOnMap.begin();
+				it != s_mapPlayerBotsOnMap.end(); ++it)
+			total += it->second;
+		return total;
+	}
+
+	// How much of the population the level-30 weapon farm may hold at once.
+	// "Everyone past thirty-five without the weapon" was the right rule for a
+	// world whose bots are mostly fifty; on a world whose bots are mostly
+	// thirty-six it was "sixty percent of the server in M3" with a map to
+	// prove it. A share of the living population, never under the minimum,
+	// gates the way in; a bot already there stays until the crowd is half
+	// again over the share, so the door does not flap.
+	const int PLAYERBOT_M3_CROWD_SHARE_PERCENT = 15;
+	const int PLAYERBOT_M3_CROWD_MIN = 30;
+	const int PLAYERBOT_M3_CROWD_STAY_PERCENT = 150;
+
+	// Whether a hosted map spawns Metin stones at all. The three Monkey
+	// Dungeons and the Spider Dungeon ship no stone.txt; every other hosted
+	// map carries between six and thirty-seven stone spawns. A bot sent out
+	// for stones must not be sent here - "Ide do Lochu Pajakow (cel: Metiny)"
+	// was a real status line.
+	bool PlayerBotMapHasMetinStones(long mapIndex)
+	{
+		return !IsPlayerBotSpiderMap(mapIndex) && !IsPlayerBotMonkeyMap(mapIndex);
+	}
 
 	// Hunting stones right now: by role for life, or by expedition for half an
 	// hour. Every rule that used to ask for the role asks this instead.

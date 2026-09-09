@@ -132,6 +132,119 @@ function Get-LauncherConfig {
     Get-M2LauncherConfig -ServerRoot $root -ConfigPath $configPath
 }
 
+# Every word this window shows, in both languages.
+#
+# The Discord has more and more English speakers and a launcher they cannot read
+# is a launcher they run wrongly - the difference between "ZATRZYMAJ I ZAPISZ"
+# and "wipe everything" is not guessable. Only the interface is translated here;
+# the two web panels are separate applications with their own thousand-odd
+# strings and are not covered by this switch.
+$script:Strings = @{
+    pl = @{
+        formTitle    = 'Metin2 Singleplayer Playerbots - All in One'
+        title        = 'METIN2 SINGLEPLAYER - PLAYERBOTS'
+        subtitle     = 'Prosty launcher: Docker, serwer, klient, aktualizacje i diagnostyka w jednym miejscu.'
+        install      = '1. ZAINSTALUJ / PRZYGOTUJ'
+        play         = '2. GRAJ (SERWER + KLIENT)'
+        docker       = 'URUCHOM DOCKER'
+        stop         = 'ZATRZYMAJ I ZAPISZ'
+        panel        = 'OTWORZ PANEL WWW'
+        client       = 'WYBIERZ KLIENTA'
+        update       = 'SPRAWDZ AKTUALIZACJE'
+        bundle       = 'ZBIERZ / WYSLIJ LOGI'
+        diagnostics  = 'DIAGNOSTYKA'
+        openLog      = 'OTWORZ LOG'
+        logFolder    = 'FOLDER LOGOW'
+        botCount     = 'LICZBA BOTOW (0-1500)'
+        importDb     = 'IMPORTUJ BAZE'
+        repairDb     = 'NAPRAW DOSTEP DO BAZY'
+        dbAccess     = 'DANE DO BAZY (NAVICAT)'
+        gmPanel      = 'PANEL GM F9 (TEST)'
+        dbAccessTitle = 'Dane do polaczenia z baza'
+        dbAccessHint = 'Wpisz te dane w Navicat, HeidiSQL albo DBeaver (typ MySQL/MariaDB, polaczenie TCP). Konto root widzi wszystko, konto gry tylko bazy gry. Baza slucha wylacznie na tym komputerze. Jesli baza odrzuca haslo, kliknij NAPRAW DOSTEP DO BAZY - ustawia oba konta na hasla z pliku .env. Nie wklejaj tych hasel na Discordzie.'
+        dbAccessOpenEnv = 'OTWORZ PLIK .ENV'
+        dbAccessNoEnv = 'Brak pliku linux-port\docker\.env - uruchom najpierw serwer (GRAJ), launcher go utworzy.'
+        language     = 'JEZYK: POLSKI'
+        ready        = 'Gotowy.'
+        footer       = '"Zatrzymaj i zapisz" nie usuwa postaci ani postepu botow. Nigdy nie uzywa docker compose down -v.'
+        botDialog    = 'Liczba grajacych botow'
+        apply        = 'Zastosuj'
+        cancel       = 'Anuluj'
+        panelDialog  = 'Ktory panel otworzyc?'
+        panelInfo    = 'Oba panele pokazuja ten sam swiat i dzialaja jednoczesnie.'
+        panelClassic = "Oryginalny panel`r`nmapa i sterowanie"
+        panelSeban   = "Zaawansowany panel seban latino`r`nprofile, rankingi, gospodarka, obciazenie"
+        importDialog = 'Importuj baze z innej instalacji'
+        importInfo   = 'Wybierz zrodlowa instalacje. Jej swiat (postacie, poziomy, ekwipunek) zostanie skopiowany do biezacej instalacji.'
+        importOk     = 'Importuj'
+        langSwitched = 'Jezyk zmieniony. Uruchom launcher ponownie, zeby zobaczyc zmiane.'
+    }
+    en = @{
+        formTitle    = 'Metin2 Singleplayer Playerbots - All in One'
+        title        = 'METIN2 SINGLEPLAYER - PLAYERBOTS'
+        subtitle     = 'One launcher: Docker, the server, the client, updates and diagnostics in one place.'
+        install      = '1. INSTALL / PREPARE'
+        play         = '2. PLAY (SERVER + CLIENT)'
+        docker       = 'START DOCKER'
+        stop         = 'STOP AND SAVE'
+        panel        = 'OPEN WEB PANEL'
+        client       = 'CHOOSE CLIENT'
+        update       = 'CHECK FOR UPDATES'
+        bundle       = 'COLLECT / SEND LOGS'
+        diagnostics  = 'DIAGNOSTICS'
+        openLog      = 'OPEN LOG'
+        logFolder    = 'LOG FOLDER'
+        botCount     = 'BOT COUNT (0-1500)'
+        importDb     = 'IMPORT DATABASE'
+        repairDb     = 'REPAIR DATABASE ACCESS'
+        dbAccess     = 'DATABASE LOGIN (NAVICAT)'
+        gmPanel      = 'GM PANEL F9 (BETA)'
+        dbAccessTitle = 'Database connection details'
+        dbAccessHint = 'Enter these in Navicat, HeidiSQL or DBeaver (MySQL/MariaDB, TCP connection). root sees everything, the game account only the game databases. The database listens on this computer only. If it rejects the password, click REPAIR DATABASE ACCESS - it sets both accounts to the passwords in .env. Never paste these passwords on Discord.'
+        dbAccessOpenEnv = 'OPEN .ENV FILE'
+        dbAccessNoEnv = 'No linux-port\docker\.env yet - start the server (PLAY) once, the launcher creates it.'
+        language     = 'LANGUAGE: ENGLISH'
+        ready        = 'Ready.'
+        footer       = '"Stop and save" never deletes characters or bot progress. It never uses docker compose down -v.'
+        botDialog    = 'Number of playing bots'
+        apply        = 'Apply'
+        cancel       = 'Cancel'
+        panelDialog  = 'Which panel should open?'
+        panelInfo    = 'Both panels show the same world and run at the same time.'
+        panelClassic = "Original panel`r`nmap and controls"
+        panelSeban   = "Advanced panel by seban latino`r`nprofiles, rankings, economy, load"
+        importDialog = 'Import a database from another installation'
+        importInfo   = 'Pick the source installation. Its world - characters, levels, equipment - is copied into this one.'
+        importOk     = 'Import'
+        langSwitched = 'Language changed. Restart the launcher to see it.'
+    }
+}
+
+$script:Lang = 'pl'
+try {
+    $storedLang = (Get-LauncherConfig).language
+    if ($storedLang -eq 'en') { $script:Lang = 'en' }
+}
+catch { }
+
+function T {
+    param([Parameter(Mandatory = $true)][string]$Key)
+    $table = $script:Strings[$script:Lang]
+    if ($table -and $table.ContainsKey($Key)) { return [string]$table[$Key] }
+    return [string]$script:Strings['pl'][$Key]
+}
+
+function Switch-LauncherLanguage {
+    $config = Get-LauncherConfig
+    $config.language = if ($script:Lang -eq 'en') { 'pl' } else { 'en' }
+    Save-M2LauncherConfig -Config $config -ConfigPath $configPath
+    $script:Lang = $config.language
+    Write-LocalLog ("Language: {0}" -f $config.language)
+    [Windows.Forms.MessageBox]::Show((T 'langSwitched'), (T 'formTitle'),
+        [Windows.Forms.MessageBoxButtons]::OK,
+        [Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+}
+
 function Save-ClientExecutable {
     param([Parameter(Mandatory = $true)][string]$Executable)
     $config = Get-LauncherConfig
@@ -503,7 +616,7 @@ function Show-BotCountDialog {
     # can actually spawn depends on its registry, which is often smaller.
     param([int]$Current = 350)
     $dialog = [Windows.Forms.Form]::new()
-    $dialog.Text = 'Liczba grających botów'
+    $dialog.Text = (T 'botDialog')
     $dialog.Size = [Drawing.Size]::new(480, 260)
     $dialog.StartPosition = 'CenterParent'
     $dialog.FormBorderStyle = 'FixedDialog'
@@ -545,14 +658,14 @@ function Show-BotCountDialog {
         })
 
     $okButton = [Windows.Forms.Button]::new()
-    $okButton.Text = 'Zastosuj'
+    $okButton.Text = (T 'apply')
     $okButton.Location = [Drawing.Point]::new(252, 168)
     $okButton.Size = [Drawing.Size]::new(100, 32)
     $okButton.DialogResult = [Windows.Forms.DialogResult]::OK
     $dialog.Controls.Add($okButton)
 
     $cancelButton = [Windows.Forms.Button]::new()
-    $cancelButton.Text = 'Anuluj'
+    $cancelButton.Text = (T 'cancel')
     $cancelButton.Location = [Drawing.Point]::new(358, 168)
     $cancelButton.Size = [Drawing.Size]::new(96, 32)
     $cancelButton.DialogResult = [Windows.Forms.DialogResult]::Cancel
@@ -633,8 +746,12 @@ function Start-LauncherAction {
 }
 
 function Install-Or-Prepare {
-    $missing = @($cliLauncher, $composeFile, $modulePath) | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }
-    if ($missing.Count) {
+    # @(...) round the whole pipeline, not only its input: Where-Object hands
+    # back a bare string when one file is missing, and under Set-StrictMode a
+    # string has no .Count - the button threw "The property 'Count' cannot be
+    # found" at exactly the player whose package was incomplete.
+    $missing = @(@($cliLauncher, $composeFile, $modulePath) | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+    if ($missing.Count -gt 0) {
         [Windows.Forms.MessageBox]::Show('Paczka jest niekompletna. Rozpakuj ponownie całe archiwum RAR.', 'Brak plików', 'OK', 'Error') | Out-Null
         return
     }
@@ -660,6 +777,45 @@ function Install-Or-Prepare {
         return
     }
 
+    # This button prepares a package whose game sources are already on disk;
+    # it never fetches them, because they are the operator's own r40250 files
+    # and only installer\install.ps1 knows how to take them from that package.
+    # Until now it said "Paczka jest gotowa" regardless - and a player whose
+    # sources were missing pressed it, was told the package was ready, pressed
+    # GRAJ and got fifteen Docker errors. Reported from the Discord: "re-running
+    # the installer through Install in GUI did not restore the sources" - it
+    # could not have, this is not the installer. Say which it is.
+    $gameContext = Join-Path $root 'linux-port\docker\game\src'
+    $requiredContext = @(
+        'build-deps-40250.sh', 'extern',
+        'server\common', 'server\db', 'server\game', 'server\libgame',
+        'server\liblua', 'server\libpoly', 'server\libserverkey',
+        'server\libsql', 'server\libthecore',
+        'serverfiles\share\conf', 'serverfiles\share\data',
+        'serverfiles\share\locale', 'serverfiles\share\package',
+        'serverfiles\mark-default'
+    )
+    $missingContext = @($requiredContext | Where-Object { -not (Test-Path -LiteralPath (Join-Path $gameContext $_)) })
+    # The database dumps are the other half of what the installer takes out
+    # of the package, and the half nobody saw missing until MariaDB came up
+    # empty: name them here with the sources.
+    $missingContext += @(Get-M2MissingSqlDumps -ServerRoot $root | ForEach-Object { 'mariadb\initdb.d\dumps\' + $_ })
+    if ($missingContext.Count -gt 0) {
+        $installerPath = Join-Path $root 'installer\install.ps1'
+        Write-LocalLog ("Brak zrodel gry w " + $gameContext + ": " + ($missingContext -join ', '))
+        [Windows.Forms.MessageBox]::Show(
+            ("Ten przycisk przygotowuje paczke, ktora ma juz na dysku zrodla gry - a tu ich nie ma." + [Environment]::NewLine +
+             "Brakuje: " + ($missingContext -join ', ') + [Environment]::NewLine + [Environment]::NewLine +
+             "Zrodla pochodza z Twojej wlasnej paczki serwera r40250 i zaden przycisk launchera ani zadna aktualizacja ich nie pobiera - " +
+             "robi to wylacznie instalator, ktory wyciaga z tej paczki to, czego trzeba." + [Environment]::NewLine + [Environment]::NewLine +
+             "Uruchom w PowerShell jako administrator:" + [Environment]::NewLine +
+             "  `$env:M2_SRC_ARCHIVE = 'C:\sciezka\do\paczki-r40250.zip'" + [Environment]::NewLine +
+             "  & '" + $installerPath + "'" + [Environment]::NewLine + [Environment]::NewLine +
+             "Baza, postacie i ustawienia zostaja nietkniete."),
+            'Brak zrodel gry - potrzebny instalator', 'OK', 'Warning') | Out-Null
+        return
+    }
+
     if (-not (Find-ClientExecutable)) { [void](Select-ClientExecutable) }
     try {
         $desktop = [Environment]::GetFolderPath('Desktop')
@@ -681,8 +837,8 @@ function Install-Or-Prepare {
 $script:launcherFingerprint = Get-LauncherFingerprint
 
 $script:form = [Windows.Forms.Form]::new()
-$script:form.Text = 'Metin2 Singleplayer Playerbots — All in One'
-$script:form.Size = [Drawing.Size]::new(780, 764)
+$script:form.Text = (T 'formTitle')
+$script:form.Size = [Drawing.Size]::new(780, 806)
 $script:form.MinimumSize = [Drawing.Size]::new(780, 764)
 $script:form.StartPosition = 'CenterScreen'
 $script:form.BackColor = [Drawing.Color]::FromArgb(24, 25, 29)
@@ -690,7 +846,7 @@ $script:form.ForeColor = [Drawing.Color]::White
 $script:form.Font = [Drawing.Font]::new('Segoe UI', 9)
 
 $title = [Windows.Forms.Label]::new()
-$title.Text = 'METIN2 SINGLEPLAYER — PLAYERBOTS'
+$title.Text = (T 'title')
 $title.Font = [Drawing.Font]::new('Segoe UI Semibold', 19)
 $title.ForeColor = [Drawing.Color]::FromArgb(247, 194, 66)
 $title.Location = [Drawing.Point]::new(24, 18)
@@ -698,7 +854,7 @@ $title.Size = [Drawing.Size]::new(710, 38)
 $script:form.Controls.Add($title)
 
 $subtitle = [Windows.Forms.Label]::new()
-$subtitle.Text = 'Prosty launcher: Docker, serwer, klient, aktualizacje i diagnostyka w jednym miejscu.'
+$subtitle.Text = (T 'subtitle')
 $subtitle.Location = [Drawing.Point]::new(27, 58)
 $subtitle.Size = [Drawing.Size]::new(700, 24)
 $subtitle.ForeColor = [Drawing.Color]::Silver
@@ -716,40 +872,50 @@ $script:serverStatus.Size = [Drawing.Size]::new(300, 25)
 $script:serverStatus.Font = [Drawing.Font]::new('Segoe UI Semibold', 10)
 $script:form.Controls.Add($script:serverStatus)
 
-$installButton = New-Button '1. ZAINSTALUJ / PRZYGOTUJ' 28 128 338 58 ([Drawing.Color]::FromArgb(88, 82, 160))
-$playButton = New-Button '2. GRAJ (SERWER + KLIENT)' 388 128 338 58 ([Drawing.Color]::FromArgb(27, 150, 88))
-$dockerButton = New-Button 'URUCHOM DOCKER' 28 202 218 50
-$stopButton = New-Button 'ZATRZYMAJ I ZAPISZ' 268 202 218 50 ([Drawing.Color]::FromArgb(180, 75, 55))
-$panelButton = New-Button 'OTWÓRZ PANEL WWW' 508 202 218 50 ([Drawing.Color]::FromArgb(180, 125, 35))
-$clientButton = New-Button 'WYBIERZ KLIENTA' 28 266 218 48 ([Drawing.Color]::FromArgb(75, 90, 120))
-$updateButton = New-Button 'SPRAWDŹ AKTUALIZACJE' 268 266 218 48 ([Drawing.Color]::FromArgb(75, 90, 120))
-$bundleButton = New-Button 'ZBIERZ / WYŚLIJ LOGI' 508 266 218 48 ([Drawing.Color]::FromArgb(75, 90, 120))
-$diagnosticsButton = New-Button 'DIAGNOSTYKA' 28 328 218 45 ([Drawing.Color]::FromArgb(45, 110, 190))
-$openLogButton = New-Button 'OTWÓRZ LOG' 262 328 218 45 ([Drawing.Color]::FromArgb(58, 62, 72))
-$folderButton = New-Button 'FOLDER LOGÓW' 496 328 230 45 ([Drawing.Color]::FromArgb(58, 62, 72))
-$botCountButton = New-Button 'LICZBA BOTÓW (0–1500)' 28 380 218 32 ([Drawing.Color]::FromArgb(120, 95, 40))
-$importDbButton = New-Button 'IMPORTUJ BAZĘ' 262 380 218 32 ([Drawing.Color]::FromArgb(70, 120, 90))
-$repairDbButton = New-Button 'NAPRAW DOSTĘP DO BAZY' 496 380 230 32 ([Drawing.Color]::FromArgb(150, 90, 55))
+$installButton = New-Button (T 'install') 28 128 338 58 ([Drawing.Color]::FromArgb(88, 82, 160))
+$playButton = New-Button (T 'play') 388 128 338 58 ([Drawing.Color]::FromArgb(27, 150, 88))
+$dockerButton = New-Button (T 'docker') 28 202 218 50
+$stopButton = New-Button (T 'stop') 268 202 218 50 ([Drawing.Color]::FromArgb(180, 75, 55))
+$panelButton = New-Button (T 'panel') 508 202 218 50 ([Drawing.Color]::FromArgb(180, 125, 35))
+$clientButton = New-Button (T 'client') 28 266 218 48 ([Drawing.Color]::FromArgb(75, 90, 120))
+$updateButton = New-Button (T 'update') 268 266 218 48 ([Drawing.Color]::FromArgb(75, 90, 120))
+$bundleButton = New-Button (T 'bundle') 508 266 218 48 ([Drawing.Color]::FromArgb(75, 90, 120))
+$diagnosticsButton = New-Button (T 'diagnostics') 28 328 218 45 ([Drawing.Color]::FromArgb(45, 110, 190))
+$openLogButton = New-Button (T 'openLog') 262 328 218 45 ([Drawing.Color]::FromArgb(58, 62, 72))
+$folderButton = New-Button (T 'logFolder') 496 328 230 45 ([Drawing.Color]::FromArgb(58, 62, 72))
+$botCountButton = New-Button (T 'botCount') 28 380 218 32 ([Drawing.Color]::FromArgb(120, 95, 40))
+$importDbButton = New-Button (T 'importDb') 262 380 218 32 ([Drawing.Color]::FromArgb(70, 120, 90))
+$repairDbButton = New-Button (T 'repairDb') 496 380 230 32 ([Drawing.Color]::FromArgb(150, 90, 55))
+$dbAccessButton = New-Button (T 'dbAccess') 28 418 218 32 ([Drawing.Color]::FromArgb(70, 100, 130))
+# The optional, experimental client half of the GM panel (F9): the server half
+# rides in every update, this button fetches the client package from the
+# manifest's `client` component and swaps pack/root.eix + root.epk.
+$gmPanelButton = New-Button (T 'gmPanel') 262 418 218 32 ([Drawing.Color]::FromArgb(120, 70, 130))
 
-foreach ($button in @($installButton, $playButton, $dockerButton, $stopButton, $panelButton, $clientButton, $updateButton, $bundleButton, $diagnosticsButton, $openLogButton, $folderButton, $botCountButton, $importDbButton, $repairDbButton)) {
+# The language switch sits with the other small buttons rather than in a menu:
+# somebody who cannot read the window needs to find it without reading anything.
+$languageButton = New-Button (T 'language') 508 702 218 28 ([Drawing.Color]::FromArgb(60, 70, 95))
+$languageButton.Add_Click({ Switch-LauncherLanguage })
+
+foreach ($button in @($installButton, $playButton, $dockerButton, $stopButton, $panelButton, $clientButton, $updateButton, $bundleButton, $diagnosticsButton, $openLogButton, $folderButton, $botCountButton, $importDbButton, $repairDbButton, $dbAccessButton, $gmPanelButton, $languageButton)) {
     $script:form.Controls.Add($button)
 }
 
 $script:actionStatus = [Windows.Forms.Label]::new()
-$script:actionStatus.Text = 'Gotowy.'
-$script:actionStatus.Location = [Drawing.Point]::new(28, 434)
+$script:actionStatus.Text = (T 'ready')
+$script:actionStatus.Location = [Drawing.Point]::new(28, 462)
 $script:actionStatus.Size = [Drawing.Size]::new(690, 24)
 $script:actionStatus.Font = [Drawing.Font]::new('Segoe UI Semibold', 9)
 $script:form.Controls.Add($script:actionStatus)
 
 $script:progress = [Windows.Forms.ProgressBar]::new()
-$script:progress.Location = [Drawing.Point]::new(28, 462)
+$script:progress.Location = [Drawing.Point]::new(28, 490)
 $script:progress.Size = [Drawing.Size]::new(698, 12)
 $script:form.Controls.Add($script:progress)
 
 $script:logBox = [Windows.Forms.TextBox]::new()
-$script:logBox.Location = [Drawing.Point]::new(28, 490)
-$script:logBox.Size = [Drawing.Size]::new(698, 150)
+$script:logBox.Location = [Drawing.Point]::new(28, 518)
+$script:logBox.Size = [Drawing.Size]::new(698, 122)
 $script:logBox.Multiline = $true
 $script:logBox.ReadOnly = $true
 $script:logBox.ScrollBars = 'Vertical'
@@ -759,7 +925,7 @@ $script:logBox.Font = [Drawing.Font]::new('Consolas', 8.5)
 $script:form.Controls.Add($script:logBox)
 
 $footer = [Windows.Forms.Label]::new()
-$footer.Text = '„Zatrzymaj i zapisz” nie usuwa postaci ani postępu botów. Nigdy nie używa docker compose down -v.'
+$footer.Text = (T 'footer')
 $footer.Location = [Drawing.Point]::new(28, 650)
 $footer.Size = [Drawing.Size]::new(700, 25)
 $footer.ForeColor = [Drawing.Color]::DarkGray
@@ -823,7 +989,90 @@ $stopButton.Add_Click({
         'Bezpieczne zatrzymanie', 'YesNo', 'Question')
     if ($answer -eq [Windows.Forms.DialogResult]::Yes) { Start-LauncherAction -Action 'StopAll' }
 })
-$panelButton.Add_Click({ Start-Process 'http://127.0.0.1:7788/map' })
+function Get-M2PanelAddresses {
+    # Both web panels of the same world, at whatever ports this installation
+    # actually publishes them on. The defaults match the compose file; a world
+    # whose .env moves a port is followed rather than guessed at.
+    param([Parameter(Mandatory = $true)][string]$ServerRoot)
+
+    $classic = 7788
+    $seban = 7790
+    $envPath = Join-Path $ServerRoot 'linux-port\docker\.env'
+    if (Test-Path -LiteralPath $envPath -PathType Leaf) {
+        $match = Select-String -LiteralPath $envPath -Pattern '^M2_PANEL_PUBLIC_PORT=(\d+)$' | Select-Object -First 1
+        if ($match) { $classic = [int]$match.Matches[0].Groups[1].Value }
+        $match = Select-String -LiteralPath $envPath -Pattern '^M2_SEBAN_PANEL_PORT=(\d+)$' | Select-Object -First 1
+        if ($match) { $seban = [int]$match.Matches[0].Groups[1].Value }
+    }
+    return [pscustomobject]@{
+        ClassicUrl = "http://127.0.0.1:$classic/map"
+        SebanUrl   = "http://127.0.0.1:$seban/"
+        ClassicPort = $classic
+        SebanPort   = $seban
+    }
+}
+
+function Show-PanelChoiceDialog {
+    # Two panels look at the same world and neither replaces the other, so the
+    # button asks instead of deciding: the classic one is the map and the
+    # controls this launcher has always opened, seban latino's is the wider
+    # view - profiles, rankings, the economy's history, the host's load.
+    param([Parameter(Mandatory = $true)]$Addresses)
+
+    $dialog = [Windows.Forms.Form]::new()
+    $dialog.Text = (T 'panelDialog')
+    $dialog.Size = [Drawing.Size]::new(520, 250)
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+
+    $info = [Windows.Forms.Label]::new()
+    $info.Text = (T 'panelInfo')
+    $info.Location = [Drawing.Point]::new(16, 14)
+    $info.Size = [Drawing.Size]::new(480, 22)
+    $dialog.Controls.Add($info)
+
+    $classicButton = [Windows.Forms.Button]::new()
+    $classicButton.Text = ("{0}  -  port {1}" -f (T 'panelClassic'), $Addresses.ClassicPort)
+    $classicButton.Location = [Drawing.Point]::new(16, 46)
+    $classicButton.Size = [Drawing.Size]::new(480, 56)
+    $classicButton.DialogResult = [Windows.Forms.DialogResult]::Yes
+    $dialog.Controls.Add($classicButton)
+
+    $sebanButton = [Windows.Forms.Button]::new()
+    $sebanButton.Text = ("{0}  -  port {1}" -f (T 'panelSeban'), $Addresses.SebanPort)
+    $sebanButton.Location = [Drawing.Point]::new(16, 110)
+    $sebanButton.Size = [Drawing.Size]::new(480, 56)
+    $sebanButton.DialogResult = [Windows.Forms.DialogResult]::No
+    $dialog.Controls.Add($sebanButton)
+
+    $cancelButton = [Windows.Forms.Button]::new()
+    $cancelButton.Text = (T 'cancel')
+    $cancelButton.Location = [Drawing.Point]::new(396, 174)
+    $cancelButton.Size = [Drawing.Size]::new(100, 30)
+    $cancelButton.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $dialog.Controls.Add($cancelButton)
+    $dialog.AcceptButton = $classicButton
+    $dialog.CancelButton = $cancelButton
+
+    $answer = $dialog.ShowDialog()
+    $dialog.Dispose()
+    switch ($answer) {
+        ([Windows.Forms.DialogResult]::Yes) { return $Addresses.ClassicUrl }
+        ([Windows.Forms.DialogResult]::No)  { return $Addresses.SebanUrl }
+        default { return $null }
+    }
+}
+
+$panelButton.Add_Click({
+    $addresses = Get-M2PanelAddresses -ServerRoot $root
+    $url = Show-PanelChoiceDialog -Addresses $addresses
+    if ($url) {
+        Write-LocalLog "Otwieram panel: $url"
+        Start-Process $url
+    }
+})
 $clientButton.Add_Click({ [void](Select-ClientExecutable) })
 $updateButton.Add_Click({
     # One button for the whole flow: check in-process, and only offer to install
@@ -869,7 +1118,21 @@ $updateButton.Add_Click({
         Write-LocalLog 'Aktualizacja odłożona na później.'
         return
     }
-    Start-LauncherAction -Action 'UpdateAll' -Yes
+    # The server only. The client half of the GM panel is experimental and
+    # goes in through its own button below, never with the ordinary update.
+    Start-LauncherAction -Action 'UpdateServer' -Yes
+})
+$gmPanelButton.Add_Click({
+    $config = Get-M2LauncherConfig -ServerRoot $root -ConfigPath $configPath
+    if (-not [string]$config.clientRoot) {
+        [Windows.Forms.MessageBox]::Show('Najpierw wskaż folder klienta przyciskiem WYBIERZ KLIENTA.', 'Brak klienta', 'OK', 'Information') | Out-Null
+        return
+    }
+    $answer = [Windows.Forms.MessageBox]::Show(
+        "Panel GM na F9 (autor: OskarPWA) to funkcja MOCNO EKSPERYMENTALNA.`r`n`r`nInstalacja podmienia w kliencie dwa pliki: packoot.eix i packoot.epk (skrypty gry). Poprzednie wersje trafiają do kopii zapasowej w folderze serwera (backups\client), więc da się wrócić.`r`n`r`nPanel otwiera tylko postać z uprawnieniami GM klawiszem F9. Jeśli po instalacji gra nie wczytuje się do końca, przywróć pliki z kopii i zgłoś to na Discordzie.`r`n`r`nZainstalować teraz?",
+        'Panel GM F9 - wersja testowa', 'YesNo', 'Warning')
+    if ($answer -ne [Windows.Forms.DialogResult]::Yes) { return }
+    Start-LauncherAction -Action 'UpdateClient' -Yes
 })
 $diagnosticsButton.Add_Click({ Start-LauncherAction -Action 'Diagnose' })
 $bundleButton.Add_Click({
@@ -927,14 +1190,14 @@ $importDbButton.Add_Click({
         return
     }
     $dlg = [Windows.Forms.Form]::new()
-    $dlg.Text = 'Importuj bazę z innej instalacji'
+    $dlg.Text = (T 'importDialog')
     $dlg.Size = [Drawing.Size]::new(470, 320)
     $dlg.StartPosition = 'CenterParent'
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox = $false
     $dlg.MinimizeBox = $false
     $lbl = [Windows.Forms.Label]::new()
-    $lbl.Text = 'Wybierz źródłową instalację. Jej świat (postacie, poziomy, ekwipunek) zostanie skopiowany do bieżącej instalacji.'
+    $lbl.Text = (T 'importInfo')
     $lbl.Location = [Drawing.Point]::new(12, 10)
     $lbl.Size = [Drawing.Size]::new(430, 44)
     $dlg.Controls.Add($lbl)
@@ -951,13 +1214,13 @@ $importDbButton.Add_Click({
     $list.SelectedIndex = 0
     $dlg.Controls.Add($list)
     $okButton = [Windows.Forms.Button]::new()
-    $okButton.Text = 'Importuj'
+    $okButton.Text = (T 'importOk')
     $okButton.Location = [Drawing.Point]::new(246, 240)
     $okButton.Size = [Drawing.Size]::new(95, 32)
     $okButton.DialogResult = [Windows.Forms.DialogResult]::OK
     $dlg.Controls.Add($okButton)
     $cancelButton = [Windows.Forms.Button]::new()
-    $cancelButton.Text = 'Anuluj'
+    $cancelButton.Text = (T 'cancel')
     $cancelButton.Location = [Drawing.Point]::new(347, 240)
     $cancelButton.Size = [Drawing.Size]::new(95, 32)
     $cancelButton.DialogResult = [Windows.Forms.DialogResult]::Cancel
@@ -975,10 +1238,75 @@ $importDbButton.Add_Click({
     if ($confirm -ne [Windows.Forms.DialogResult]::Yes) { return }
     Start-LauncherAction -Action 'ImportDb' -Yes -ExtraArgs @('-ImportSource', "$picked")
 })
+$dbAccessButton.Add_Click({
+    # In-process on purpose: an action would print through the log box and the
+    # launcher log, and the launcher log travels in support bundles. Read-only
+    # text boxes so the values can be selected and copied.
+    $envPath = Join-Path $root 'linux-port\docker\.env'
+    if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
+        [Windows.Forms.MessageBox]::Show((T 'dbAccessNoEnv'), (T 'dbAccessTitle'), 'OK', 'Warning') | Out-Null
+        return
+    }
+    $envText = [IO.File]::ReadAllText($envPath)
+    $read = {
+        param($name, $default)
+        $m = [Regex]::Match($envText, "(?m)^$name=(.*?)\s*$")
+        if ($m.Success -and $m.Groups[1].Value) { $m.Groups[1].Value } else { $default }
+    }
+    $rows = @(
+        @('Host', '127.0.0.1'),
+        @('Port', (& $read 'M2_DB_PUBLISH_PORT' '3306')),
+        @('root', (& $read 'M2_DB_ROOT_PASSWORD' '')),
+        @((& $read 'M2_DB_USER' 'metin2'), (& $read 'M2_DB_PASSWORD' ''))
+    )
+    $dlg = [Windows.Forms.Form]::new()
+    $dlg.Text = (T 'dbAccessTitle')
+    $dlg.Size = [Drawing.Size]::new(560, 372)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $y = 18
+    foreach ($row in $rows) {
+        $label = [Windows.Forms.Label]::new()
+        $label.Text = $row[0]
+        $label.Location = [Drawing.Point]::new(18, $y + 4)
+        $label.Size = [Drawing.Size]::new(110, 22)
+        $dlg.Controls.Add($label)
+        $box = [Windows.Forms.TextBox]::new()
+        $box.Text = $row[1]
+        $box.ReadOnly = $true
+        $box.Location = [Drawing.Point]::new(132, $y)
+        $box.Size = [Drawing.Size]::new(396, 24)
+        $box.Font = [Drawing.Font]::new('Consolas', 9)
+        $dlg.Controls.Add($box)
+        $y += 34
+    }
+    $hint = [Windows.Forms.Label]::new()
+    $hint.Text = (T 'dbAccessHint')
+    $hint.Location = [Drawing.Point]::new(18, $y + 8)
+    $hint.Size = [Drawing.Size]::new(510, 120)
+    $dlg.Controls.Add($hint)
+    $openButton = [Windows.Forms.Button]::new()
+    $openButton.Text = (T 'dbAccessOpenEnv')
+    $openButton.Location = [Drawing.Point]::new(18, 290)
+    $openButton.Size = [Drawing.Size]::new(170, 32)
+    $openButton.Add_Click({ Start-Process notepad.exe -ArgumentList ('"' + $envPath + '"') }.GetNewClosure())
+    $dlg.Controls.Add($openButton)
+    $okButton = [Windows.Forms.Button]::new()
+    $okButton.Text = 'OK'
+    $okButton.Location = [Drawing.Point]::new(433, 290)
+    $okButton.Size = [Drawing.Size]::new(95, 32)
+    $okButton.DialogResult = [Windows.Forms.DialogResult]::OK
+    $dlg.Controls.Add($okButton)
+    $dlg.AcceptButton = $okButton
+    $dlg.ShowDialog() | Out-Null
+    $dlg.Dispose()
+})
 $repairDbButton.Add_Click({
     if (-not (Confirm-DockerReady)) { return }
     $answer = [Windows.Forms.MessageBox]::Show(
-        "Naprawić dostęp do bazy?`r`n`r`nUżyj tego, gdy po imporcie serwer nie startuje (playerbot-migrate kończy się błędem). Odtwarza tylko techniczne konto bazy — postacie, przedmioty i boty pozostają BEZ ZMIAN. Serwer zostanie zatrzymany na czas naprawy.",
+        "Naprawić dostęp do bazy?`r`n`r`nUżyj tego, gdy po imporcie serwer nie startuje (playerbot-migrate kończy się błędem) albo gdy Navicat/HeidiSQL odrzuca hasło z pliku .env. Odtwarza tylko techniczne konta bazy (gry i root) — postacie, przedmioty i boty pozostają BEZ ZMIAN. Serwer zostanie zatrzymany na czas naprawy.",
         'Napraw dostęp do bazy', 'YesNo', 'Question')
     if ($answer -ne [Windows.Forms.DialogResult]::Yes) { return }
     Start-LauncherAction -Action 'RepairDb'

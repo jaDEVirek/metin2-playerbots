@@ -6,7 +6,7 @@
   const filters = document.querySelector('.live-filters');
   const mode = document.createElement('select');
   mode.id = 'live-mode';
-  mode.innerHTML = '<option value="live">Pozycje botów na żywo</option><option value="deaths">Mapa cieplna: zgony botów</option><option value="metins">Mapa cieplna: rozbite Metiny</option>';
+  mode.innerHTML = '<option value="live">Pozycje botów na żywo</option><option value="deaths">Mapa cieplna: zgony botów</option><option value="metins">Mapa cieplna: rozbite Metiny</option><option value="bosses">Mapa cieplna: zabite bossy</option>';
   filters.insertBefore(mode, search);
   const autoplay = document.createElement('label');
   autoplay.className = 'map-autoplay';
@@ -16,7 +16,7 @@
   restartInfo.id = 'last-restart';
   document.querySelector('.live-shell header > div').appendChild(restartInfo);
   [...document.querySelectorAll('.live-shell footer span')].filter(node => node.textContent.includes('Podkład graficzny')).forEach(node => node.remove());
-  const mapLabels = {21:'Chunjo M1 — Joan',23:'Chunjo M2 — Bokjung',24:'Chunjo M3 — Waryong',25:'Łatwy Loch Małp',64:'Dolina Orków',63:'Pustynia Yongbi'};
+  const mapLabels = {21:'Chunjo M1 — Joan',23:'Chunjo M2 — Bokjung',24:'Chunjo M3 — Waryong',25:'Łatwy Loch Małp',61:'Góra Sohan',64:'Dolina Orków',63:'Pustynia Yongbi',104:'Loch Pająków V1',108:'Loch Małp Normalny',109:'Loch Małp Trudny'};
   Object.entries(mapLabels).forEach(([id,label]) => {
     const option = select.querySelector(`option[value="${id}"]`);
     if (option) option.textContent = label;
@@ -31,12 +31,13 @@
   }
   function renderOverviewMaps() {
     if (!overviewMaps) return;
-    const counts = snapshot.reduce((all, bot) => { all[bot.map_index] = (all[bot.map_index] || 0) + 1; return all; }, {});
+    const counts = snapshot.reduce((all, bot) => { all[bot.map_index] = (all[bot.map_index] || 0) + 1; return all; }, Object.fromEntries(Object.keys(mapLabels).map(id => [id, 0])));
     const entries = Object.entries(counts).sort((a,b)=>b[1]-a[1]);
     overviewMaps.innerHTML = '<h4>🗺 Boty na mapach</h4>' + (entries.map(([id,count]) => `<div><span>${escape(mapLabels[id] || `Mapa #${id}`)}</span><b>${count}</b></div>`).join('') || '<div class="muted">Brak botów online.</div>');
   }
   const levelOK = (level) => currentLevel === 'all' || (currentLevel === '16+' ? level >= 16 : (() => { const [a,b] = currentLevel.split('-').map(Number); return level >= a && level <= b; })());
   const escape = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const portrait = job => { const files = ["warrior_m.bmp","assassin_w.bmp","sura_m.bmp","shaman_w.bmp","warrior_w.bmp","assassin_m.bmp","sura_w.bmp","shaman_m.bmp"]; const index = Number.isInteger(Number(job)) && Number(job) >= 0 && Number(job) < files.length ? Number(job) : 0; return `/static/class-portraits/${files[index]}`; };
   function activityGroup(bot) {
     const status = String(bot.action_label || '').toLowerCase();
     if (/łow|low|ryb|fishing|branie/.test(status)) return 'Łowi ryby';
@@ -71,7 +72,7 @@
     $('stat-visible').textContent = bots.length; $('stat-pt').textContent = bots.filter(b=>b.in_party).length; $('stat-avg').textContent = average; $('stat-max').textContent = bots.length ? Math.max(...bots.map(b=>b.level)) : '—';
     $('live-count').textContent = `${bots.length} botów na mapie`;
     $('map-caption').textContent = select.options[select.selectedIndex].text;
-    $('live-ranking').innerHTML = bots.sort((a,b)=>b.level-a.level||a.name.localeCompare(b.name)).slice(0,10).map((b,i)=>`<a class="${b.id === globalTopId ? 'is-global-leader' : ''}" href="/player/${b.id}"><b>#${i+1}</b> ${escape(b.name)}${b.in_party?'<mark class="pt-mark">PT</mark>':''}${b.stuck?'<mark class="stuck-mark">⚠</mark>':''} <span>Lv ${b.level}</span></a>`).join('') || '<p class="muted">Brak botów spełniających filtr.</p>';
+$('live-ranking').innerHTML = bots.sort((a,b)=>b.level-a.level||a.name.localeCompare(b.name)).slice(0,10).map((b,i)=>`<a class="${b.id === globalTopId ? 'is-global-leader' : ''}" href="/player/${b.id}"><b>#${i+1}</b><img class="class-portrait class-portrait--live" src="${portrait(b.job)}" alt=""> ${escape(b.name)}${b.in_party?'<mark class="pt-mark">PT</mark>':''}${b.stuck?'<mark class="stuck-mark">⚠</mark>':''} <span>Lv ${b.level}</span></a>`).join('') || '<p class="muted">Brak botów spełniających filtr.</p>';
     renderActivities(bots);
   }
   async function load() {
@@ -97,7 +98,7 @@
       map.dataset.mapIndex = String(mapId);
       map.querySelectorAll('.bot-point,.heat-point').forEach(node => node.remove());
       events.forEach(event => { const dot=document.createElement('i'); dot.className='heat-point'; dot.style.left=`${Math.max(1,Math.min(99,(event.x-bound[0])/bound[2]*100))}%`; dot.style.top=`${Math.max(1,Math.min(99,(event.y-bound[1])/bound[3]*100))}%`; dot.title=`${event.name||'Zdarzenie'} · ${event.time}`; map.appendChild(dot); });
-      const label = mode.value === 'deaths' ? 'zgonów botów' : 'rozbitych Metinów';
+    const label = ({deaths:'zgonów botów',metins:'rozbitych Metinów',bosses:'zabitych bossów'})[mode.value] || 'zdarzeń';
       $('live-count').textContent = `${events.length} ${label} / 24 h`;
       $('map-caption').textContent = `${select.options[select.selectedIndex].text} · ${label}`;
       $('stat-visible').textContent = events.length; $('stat-pt').textContent = '—'; $('stat-avg').textContent = '24 h'; $('stat-max').textContent = '●';

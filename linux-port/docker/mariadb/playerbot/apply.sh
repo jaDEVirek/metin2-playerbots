@@ -87,10 +87,47 @@ while :; do
         exit 1
     fi
     if [ $((attempt % 30)) -eq 0 ]; then
-        echo "[playerbot-migrate] still waiting for the database ($((attempt * 2))s) - a large world can take a while to recover"
+        # Three different waits look the same from outside; say which this is.
+        # "answering, with none of the eight tables" is not a slow import - it
+        # is a MariaDB that initialised without the dumps, and no amount of
+        # waiting changes it. One operator watched this for thirty minutes.
+        if [ ! -s "$probe_err" ] && [ "${ready:-0}" = "0" ] && [ "$attempt" -ge 90 ]; then
+            echo "[playerbot-migrate] MariaDB is answering but holds NONE of the r40250 tables ($((attempt * 2))s)." >&2
+            echo "[playerbot-migrate] The database initialised without the SQL dumps: mariadb/initdb.d/dumps" >&2
+            echo "[playerbot-migrate] was missing or empty on the very first start, and initdb.d never runs again." >&2
+            echo "[playerbot-migrate] Waiting will not fix this. Stage the five dumps (the launcher and the" >&2
+            echo "[playerbot-migrate] installer now check for them) and re-create the database volume." >&2
+        elif [ ! -s "$probe_err" ] && [ "${ready:-0}" != "0" ]; then
+            echo "[playerbot-migrate] still waiting for the schema ($((attempt * 2))s): ${ready}/8 tables so far - the first-run import is in progress"
+        else
+            echo "[playerbot-migrate] still waiting for the database ($((attempt * 2))s) - a large world can take a while to recover"
+        fi
     fi
     sleep 2
 done
+
+# The ItemShop's own database, and the item_award table its purchases are
+# delivered through. Created as root because the metin2 user cannot create a
+# database, and only when the root password is in the environment (it is,
+# from .env, on every install the launcher made); a world without it keeps
+# running - the shop then answers with an empty page, not the game with an
+# error. Idempotent: CREATE IF NOT EXISTS, and the seed only fills an empty
+# shop, so an operator's own catalogue survives every restart.
+itemshop_schema=/opt/playerbot/itemshop_schema.sql
+if [ -s "$itemshop_schema" ]; then
+    if [ -n "${M2_DB_ROOT_PASSWORD:-}" ]; then
+        if MYSQL_PWD="$M2_DB_ROOT_PASSWORD" mariadb --protocol=tcp --host="$M2_DB_HOST" \
+                --port="$M2_DB_PORT" --user=root --default-character-set=utf8mb4 \
+                < "$itemshop_schema" 2>/tmp/itemshop.err; then
+            echo "[playerbot-migrate] itemshop schema applied"
+        else
+            echo "[playerbot-migrate] WARNING: itemshop schema failed:" >&2
+            head -3 /tmp/itemshop.err >&2
+        fi
+    else
+        echo "[playerbot-migrate] WARNING: M2_DB_ROOT_PASSWORD not set; itemshop schema skipped" >&2
+    fi
+fi
 
 # A developer may keep more persistent bots than the public 350-row seed. When
 # that world matters, make its minimum size explicit in .env. This catches the
@@ -121,7 +158,7 @@ stranded=$(db -e "
       FROM player.player p
       JOIN account.account a ON a.id = p.account_id
      WHERE LEFT(a.login, 10) = 'playerbot_'
-       AND p.map_index NOT IN (21, 23, 24, 25, 61, 63, 64, 104);
+       AND p.map_index NOT IN (21, 23, 24, 25, 108, 109, 61, 63, 64, 104, 65, 71);
 ")
 if [ -n "$stranded" ] && [ "$stranded" -gt 0 ] 2>/dev/null; then
     db -e "
@@ -129,7 +166,7 @@ if [ -n "$stranded" ] && [ "$stranded" -gt 0 ] 2>/dev/null; then
           JOIN account.account a ON a.id = p.account_id
            SET p.map_index = 23, p.x = 145500, p.y = 240000
          WHERE LEFT(a.login, 10) = 'playerbot_'
-           AND p.map_index NOT IN (21, 23, 24, 25, 61, 63, 64, 104);
+           AND p.map_index NOT IN (21, 23, 24, 25, 108, 109, 61, 63, 64, 104, 65, 71);
     "
     echo "[playerbot-migrate] moved $stranded bot(s) back to Bokjung"
 fi

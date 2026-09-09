@@ -1,10 +1,14 @@
 import json
 import os
+import hmac
 import socket
 import time
 import re
+import uuid
 from pathlib import Path
 from urllib.parse import quote
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -14,35 +18,48 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SEBAN_SESSION_SECRET", "change-this-before-public-use")
-
-
-def playerbots_version():
-    """The suite's VERSION, staged next to this file by the launcher and by
-    prepare-context.sh the way the classic panel gets its copy; the
-    environment overrides it, and neither means "unknown"."""
-    env = os.environ.get("PLAYERBOTS_VERSION", "").strip()
-    if env:
-        return env
-    try:
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as fh:
-            value = fh.read().strip()
-            return value or "unknown"
-    except OSError:
-        return "unknown"
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+    # Cookies are scoped to the host, not the port. A dedicated name prevents
+    # the classic Tieru panel on :7788 from overwriting this panel on :7789.
+    SESSION_COOKIE_NAME=os.environ.get("SEBAN_SESSION_COOKIE_NAME", "seban_panel_session"),
+    PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+)
 
 MAP_NAMES = {
     1: "Shinsoo M1", 3: "Shinsoo M2", 21: "Chunjo M1", 23: "Chunjo M2",
     24: "Chunjo M3", 25: "Łatwy Loch Małp", 41: "Jinno M1", 43: "Jinno M2",
-    63: "Pustynia Yongbi", 64: "Dolina Orków",
+    61: "Góra Sohan", 63: "Pustynia Yongbi", 64: "Dolina Orków", 104: "Loch Pająków V1",
+    65: "Świątynia Hwang", 71: "Loch Pająków V2",
+    108: "Loch Małp Normalny", 109: "Loch Małp Trudny",
 }
 MAP_BOUNDS = {
     21: (0, 102400, 102400, 128000), 23: (102400, 204800, 102400, 102400),
     24: (179200, 0, 51200, 51200), 25: (844800, 435200, 76800, 76800),
-    63: (204800, 486400, 153600, 153600), 64: (256000, 665600, 153600, 153600),
+    61: (358400, 153600, 153600, 153600), 63: (204800, 486400, 153600, 153600),
+    64: (256000, 665600, 153600, 153600), 104: (51200, 486400, 76800, 76800),
+    65: (537600, 51200, 102400, 102400), 71: (665600, 435200, 102400, 102400),
+    108: (128000, 640000, 76800, 76800), 109: (128000, 716800, 76800, 76800),
 }
+TRACKED_MAP_OPTIONS = tuple((index, MAP_NAMES[index]) for index in MAP_BOUNDS)
+MAP_RESPAWN_OPTIONS = (
+    (1, "Shinsoo M1 — Yongan"), (3, "Shinsoo M2"), (21, "Chunjo M1 — Joan"),
+    (23, "Chunjo M2"), (41, "Jinno M1"), (43, "Jinno M2"),
+    (25, "Łatwy Loch Małp"), (61, "Góra Sohan"), (63, "Pustynia Yongbi"), (64, "Dolina Orków"),
+    (104, "Loch Pająków V1"), (71, "Loch Pająków V2"), (108, "Loch Małp Normalny"), (109, "Loch Małp Trudny"),
+)
+# Monkey Dungeons and Spider Dungeon V1 ship no stone.txt, so only their mob
+# respawns can be configured. The explicit allowlist also protects the helper.
+MAP_STONE_RESPAWN_IDS = frozenset(index for index, _name in MAP_RESPAWN_OPTIONS if index not in {25, 104, 71, 108, 109})
 STATUS_GLOBS = (os.environ.get("PLAYERBOTS_STATUS_GLOB", "/opt/metin2/var/channel1/*/playerbot_status.tsv"),)
 RATES_SPOOL = Path("/opt/m2spool")
+UPDATE_SPOOL = Path("/opt/m2update")
+UPDATE_WATCHER_MAX_AGE_SECONDS = 90
+PLAYERBOTS_RELEASE_URL = "https://api.github.com/repos/TieruYT/metin2-playerbots/releases/latest"
+PLAYERBOTS_RELEASE_CACHE_SECONDS = 900
+_playerbots_release_cache = {"checked_at": 0.0, "latest": None, "error": None}
+SERVER_SETTINGS_READY_MAX_AGE_SECONDS = 20
+SERVER_SETTINGS_STALE_SECONDS = 600
 GAME_HOST = os.environ.get("PLAYERBOTS_GAME_HOST", "metin2-game")
 GAME_LOGIN_PORT = int(os.environ.get("PLAYERBOTS_LOGIN_PORT", "11000"))
 GAME_WORLD_PORT = int(os.environ.get("PLAYERBOTS_WORLD_PORT", "13000"))
@@ -57,11 +74,49 @@ AI_WEIGHT_KEYS = (
     ("TRADE", "Stragany", "🏪"),
 )
 AI_WEIGHT_MIN, AI_WEIGHT_MAX, AI_WEIGHT_NEUTRAL = 25, 250, 100
-# These two values share the live weight file with goal weights, but the game
-# treats them as switches rather than 25–250% weights (Tieru 1.29.8/1.29.9).
-AI_LIVE_DEFAULTS = {"CHAT": 1, "SCRAP": 0}
+# These values share the live weight file with goal weights, but the core treats
+# them as switches or direct settings rather than 25–250% goal weights.
+AI_LIVE_DEFAULTS = {"CHAT": 1, "BOOKS": 1, "NIGHT": 1, "SCRAP": 0, "CHEST": None, "CHEST_STONE": None}
+AI_SPECIAL_WEIGHT_KEYS = frozenset(AI_LIVE_DEFAULTS)
 BIOLOGIST_COMPLETE_STATE = 557528158
-BIOLOGIST_MISSIONS = ("make_herb_lv4", "make_herb_lv7", "make_herb_lv10", "make_herb_lv15", "make_herb_lv20", "make_herb_lv25")
+# Tieru 1.29.10 adds the Orc Tooth task after the six classic Biologist
+# missions. The database lookup below also discovers future missions as soon
+# as the game has created their quest rows, while this list keeps the complete
+# progress scale correct before anyone has started a new task.
+BIOLOGIST_FALLBACK_MISSIONS = (
+    "make_herb_lv4", "make_herb_lv7", "make_herb_lv10", "make_herb_lv15",
+    "make_herb_lv20", "make_herb_lv25", "collect_quest_lv30",
+)
+PANEL_VERSION_FILE = Path(__file__).parent / "VERSION"
+GM_JOB_OPTIONS = ((0, "Wojownik"), (1, "Ninja"), (2, "Sura"), (3, "Szaman"))
+# Race IDs are stored in player.job.  0–3 retain the classic class/gender
+# pair; IDs 4–7 are the alternate client portraits and character models.
+GM_GENDER_OPTIONS = (("classic", "Klasyczna dla klasy"), ("male", "Mężczyzna"), ("female", "Kobieta"))
+GM_RACE_BY_CLASS_GENDER = {
+    (0, "classic"): 0, (1, "classic"): 1, (2, "classic"): 2, (3, "classic"): 3,
+    (0, "male"): 0, (0, "female"): 4,
+    (1, "male"): 5, (1, "female"): 1,
+    (2, "male"): 2, (2, "female"): 6,
+    (3, "male"): 7, (3, "female"): 3,
+}
+CLASS_PROFILES = {
+    0: {"name": "Wojownik", "gender": "Mężczyzna", "portrait": "warrior_m.bmp"},
+    4: {"name": "Wojownik", "gender": "Kobieta", "portrait": "warrior_w.bmp"},
+    1: {"name": "Ninja", "gender": "Kobieta", "portrait": "assassin_w.bmp"},
+    5: {"name": "Ninja", "gender": "Mężczyzna", "portrait": "assassin_m.bmp"},
+    2: {"name": "Sura", "gender": "Mężczyzna", "portrait": "sura_m.bmp"},
+    6: {"name": "Sura", "gender": "Kobieta", "portrait": "sura_w.bmp"},
+    3: {"name": "Szaman", "gender": "Kobieta", "portrait": "shaman_w.bmp"},
+    7: {"name": "Szaman", "gender": "Mężczyzna", "portrait": "shaman_m.bmp"},
+}
+GM_JOB_STARTS = {0: (6, 4, 3, 3, 600, 200), 1: (4, 3, 6, 3, 650, 200), 2: (5, 3, 3, 6, 650, 200), 3: (3, 5, 3, 5, 700, 200)}
+GM_EMPIRE_STARTS = {1: (469300, 964200, 1), 2: (55700, 157900, 21), 3: (969600, 278400, 41)}
+GM_NAME_PATTERN = r"(?:[A-Za-z0-9_]{2,24}|\[[A-Za-z0-9_]{1,6}\][A-Za-z0-9_]{2,16})"
+EMPIRES = {1: {"name": "Shinsoo", "flag": "shinsoo.png"}, 2: {"name": "Chunjo", "flag": "chunjo.png"}, 3: {"name": "Jinno", "flag": "jinno.png"}}
+try:
+    PANEL_VERSION = os.environ.get("SEBAN_PANEL_VERSION") or PANEL_VERSION_FILE.read_text(encoding="utf-8").strip()
+except OSError:
+    PANEL_VERSION = os.environ.get("SEBAN_PANEL_VERSION", "dev")
 DEFAULT_SETTINGS = {
     "panel_name": "Metin2 Singleplayer", "stuck_minutes": "5", "theme": "ocean", "monitor_mode": "vps",
     # Existing installations without this key stay usable. Fresh installations
@@ -84,19 +139,25 @@ ITEM_TYPE_NAMES = (
 )
 APPLY_LABELS = {
     1: ("Maks. PŻ", ""), 2: ("Maks. PM", ""), 3: ("Witalność", ""), 4: ("Inteligencja", ""), 5: ("Siła", ""), 6: ("Zręczność", ""), 7: ("Szybkość ataku", "%"), 8: ("Szybkość ruchu", "%"), 9: ("Szybkość zaklęcia", "%"), 10: ("Regeneracja PŻ", "%"), 11: ("Regeneracja PM", "%"), 12: ("Odporność na truciznę", "%"), 13: ("Szansa na omdlenie", "%"), 14: ("Szansa na spowolnienie", "%"), 15: ("Szansa na cios krytyczny", "%"), 16: ("Szansa na przeszywający", "%"), 17: ("Wartość ataku", ""), 18: ("Silny przeciw ludziom", "%"), 19: ("Silny przeciw zwierzętom", "%"), 20: ("Silny przeciw orkom", "%"), 21: ("Silny przeciw mistykom", "%"), 22: ("Silny przeciw nieumarłym", "%"), 23: ("Silny przeciw diabłom", "%"), 24: ("Kradzież PŻ", "%"), 25: ("Kradzież PM", "%"), 26: ("Spalenie PM", "%"), 27: ("Odzyskanie PM po obrażeniach", "%"), 28: ("Szansa na blok", "%"), 29: ("Szansa na unik strzał", "%"), 30: ("Odporność na miecze", "%"), 31: ("Odporność na broń dwuręczną", "%"), 32: ("Odporność na sztylety", "%"), 33: ("Odporność na dzwony", "%"), 34: ("Odporność na wachlarze", "%"), 35: ("Odporność na strzały", "%"), 36: ("Odporność na ogień", "%"), 37: ("Odporność na błyskawice", "%"), 38: ("Odporność na magię", "%"), 39: ("Odporność na wiatr", "%"), 40: ("Odbicie obrażeń fizycznych", "%"), 41: ("Odbicie klątwy", "%"), 42: ("Skrócenie trucia", "%"), 43: ("Odzyskanie PM po zabiciu", "%"), 44: ("Bonus doświadczenia", "%"), 45: ("Bonus Yang", "%"), 46: ("Bonus dropu przedmiotów", "%"), 47: ("Bonus mikstur", "%"), 48: ("Odzyskanie PŻ po zabiciu", "%"), 49: ("Odporność na omdlenie", ""), 50: ("Odporność na spowolnienie", ""), 51: ("Odporność na przewrócenie", ""), 52: ("Bonus umiejętności", "%"), 53: ("Zasięg łuku", "%"), 54: ("Wartość ataku", ""), 55: ("Wartość obrony", ""), 56: ("Magiczna wartość ataku", ""), 57: ("Magiczna wartość obrony", ""), 58: ("Szansa na klątwę", "%"), 59: ("Maks. wytrzymałość", ""), 60: ("Silny przeciw wojownikom", "%"), 61: ("Silny przeciw ninja", "%"), 62: ("Silny przeciw surom", "%"), 63: ("Silny przeciw szamanom", "%"), 64: ("Silny przeciw potworom", "%"), 70: ("Maks. PŻ", "%"), 71: ("Średnie obrażenia", "%"), 72: ("Obrażenia umiejętności", "%"), 73: ("Odporność na umiejętności", "%"), 74: ("Odporność na średnie obrażenia", "%"), 75: ("Bonus doświadczenia", "%"), 76: ("Bonus dropu", "%"), 77: ("Kradzież PŻ", "%"), 78: ("Odporność na wojowników", "%"), 79: ("Odporność na ninja", "%"), 80: ("Odporność na sury", "%"), 81: ("Odporność na szamanów", "%"), 82: ("Energia", "%"), 83: ("Wartość obrony", ""), 84: ("Bonus atrybutów kostiumu", "%"), 85: ("Magiczny atak", "%"), 86: ("Atak fizyczny i magiczny", "%"), 87: ("Odporność na lód", "%"), 88: ("Odporność na ziemię", "%"), 89: ("Odporność na mrok", "%"), 90: ("Odporność na cios krytyczny", "%"), 91: ("Odporność na przeszywający", "%")}
-# W tej kompilacji serwera Playerbots pola 71/72 są odwrotne względem
-# standardowego enumu klienta.  Ten override dotyczy tooltipów przedmiotów.
-APPLY_LABELS.update({71: ("Obrażenia umiejętności", "%"), 72: ("Średnie obrażenia", "%")})
+# 71 i 72 są w tablicy powyżej, we właściwej kolejności: common/length.h
+# niesie numery we własnych komentarzach - APPLY_SKILL_DAMAGE_BONUS to 71,
+# APPLY_NORMAL_HIT_DAMAGE_BONUS to 72. Stała tu wcześniej poprawka
+# nadpisująca błędną tablicę i tłumacząca ją tym, że "w tej kompilacji pola
+# są odwrotne" - nic ich nie odwraca. Uzasadnienie było nieprawdziwe, a samo
+# nadpisanie sięgało tylko opisów przedmiotów, więc ranking - który bierze
+# dane z osobnego zapytania - pokazywał je zamienione jeszcze długo potem.
 JOB_NAMES = ("Wojownik", "Ninja", "Sura", "Szaman")
 SKILLS = {
-    (0, 1): ((1, "Aura Miecza"), (2, "Berserk"), (3, "Wir Miecza"), (4, "Szybki Atak"), (5, "Trzystronne Cięcie"), (6, "Szarża")),
-    (0, 2): ((16, "Duchowe Uderzenie"), (17, "Tapnięcie"), (18, "Uderzenie Miecza"), (19, "Silne Ciało"), (20, "Walnięcie"), (21, "Uderzenie Ducha")),
-    (1, 1): ((31, "Zasadzka"), (32, "Szybki Atak"), (33, "Wirujący Sztylet"), (34, "Ukrycie"), (35, "Trująca Chmura")),
-    (1, 2): ((46, "Powtarzalny Strzał"), (47, "Deszcz Strzał"), (48, "Ognista Strzała"), (49, "Bezszeletny Krok"), (50, "Trująca Strzała")),
-    (2, 1): ((61, "Uderzenie Palcem"), (62, "Wirujący Miecz"), (63, "Zaklęte Ostrze"), (64, "Strach"), (65, "Zaklęta Zbroja"), (66, "Rozproszenie Magii")),
-    (2, 2): ((76, "Mroczne Uderzenie"), (77, "Mroczna Sfera"), (78, "Mroczny Duch"), (79, "Mroczna Ochrona"), (80, "Płomienne Uderzenie"), (81, "Mroczny Kamień")),
-    (3, 1): ((91, "Latający Talizman"), (92, "Smoczy Skowyt"), (93, "Smocza Pomoc"), (94, "Błogosławieństwo"), (95, "Odbicie"), (96, "Pomoc Smoka")),
-    (3, 2): ((106, "Rzut Błyskawicą"), (107, "Przywołanie Błyskawicy"), (108, "Szpon Błyskawicy"), (109, "Leczenie"), (110, "Szybkość"), (111, "Atak+")),
+    # Exact vnum/name pairs from Tieru's current panel. The old mapping put
+    # display names next to the wrong VNUMs, hence correct icons looked wrong.
+    (0, 1): ((1, "Trzystronne Cięcie"), (2, "Wir Miecza"), (3, "Berserk"), (4, "Aura Miecza"), (5, "Szarża")),
+    (0, 2): ((16, "Duchowe Uderzenie"), (17, "Tąpnięcie"), (18, "Uderzenie Miecza"), (19, "Silne Ciało"), (20, "Walnięcie")),
+    (1, 1): ((31, "Zasadzka"), (32, "Szybki Atak"), (33, "Wirujący Sztylet"), (34, "Krycie się"), (35, "Trująca Chmura")),
+    (1, 2): ((46, "Powtarzalny Strzał"), (47, "Deszcz Strzał"), (48, "Ognista Strzała"), (49, "Bezszelestny Chód"), (50, "Trująca Strzała")),
+    (2, 1): ((61, "Uderzenie Palcem"), (62, "Smoczy Wir"), (63, "Czarowane Ostrze"), (64, "Strach"), (65, "Czarowana Zbroja"), (66, "Rozproszenie Magii")),
+    (2, 2): ((76, "Mroczne Uderzenie"), (77, "Ogniste Uderzenie"), (78, "Ognisty Duch"), (79, "Mroczna Ochrona"), (80, "Duchowy Cios"), (81, "Mroczna Sfera")),
+    (3, 1): ((91, "Latający Talizman"), (92, "Strzelający Smok"), (93, "Smoczy Skowyt"), (94, "Błogosławieństwo"), (95, "Odbicie"), (96, "Pomoc Smoka")),
+    (3, 2): ((106, "Błyskawiczny Rzut"), (107, "Przywołanie Błyskawicy"), (108, "Burzowy Szpon"), (109, "Leczenie"), (110, "Zwinność"), (111, "Zwiększenie Ataku")),
 }
 try:
     ITEM_ICONS = json.loads((Path(__file__).parent / "static" / "item_icons.json").read_text(encoding="utf-8"))
@@ -143,10 +204,40 @@ def game_text(value):
     return value or ""
 
 
+def cp1250_hex_text(value):
+    """Decode a Polish item name without trusting the log table's charset."""
+    try:
+        return bytes.fromhex(str(value or "")).decode("cp1250")
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return ""
+
+
 def map_name(index):
     """Name only maps which this Playerbots world actually runs."""
     index = int(index or 0)
     return MAP_NAMES.get(index, f"Poza aktywnym światem (mapa #{index})")
+
+
+def changelog_entries():
+    """Read version notes from the repository file for the public in-panel log."""
+    path = Path(__file__).parent / "CHANGELOG.md"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    entries, current = [], None
+    for line in lines:
+        if line.startswith("## "):
+            if current:
+                entries.append(current)
+            heading = line[3:].strip()
+            timestamp, separator, version = heading.partition(" · ")
+            current = {"timestamp": timestamp if separator else "Wcześniejsza wersja", "version": version if separator else heading, "changes": []}
+        elif current and line.startswith("- "):
+            current["changes"].append(line[2:].strip())
+    if current:
+        entries.append(current)
+    return entries
 
 
 def settings():
@@ -261,6 +352,23 @@ def item_base_stats(vnum):
     return stats
 
 
+def empire_info(empire):
+    try:
+        return EMPIRES.get(int(empire), {"name": "—", "flag": ""})
+    except (TypeError, ValueError):
+        return {"name": "—", "flag": ""}
+
+
+def empire_flag_path(empire):
+    return empire_info(empire)["flag"]
+
+def class_profile(job):
+    try:
+        return CLASS_PROFILES.get(int(job), CLASS_PROFILES[0])
+    except (TypeError, ValueError):
+        return CLASS_PROFILES[0]
+
+
 def parse_skills(raw, job, group):
     if isinstance(raw, memoryview): raw = raw.tobytes()
     if isinstance(raw, str): raw = raw.encode("latin1", "ignore")
@@ -271,19 +379,32 @@ def parse_skills(raw, job, group):
         master, level = (raw[offset] if offset < len(raw) else 0), (raw[offset + 1] if offset + 1 < len(raw) else 0)
         rank = skill_rank(master, level)
         if level:
-            result.append({"vnum": vnum, "name": name, "level": level, "master_type": master, "rank": rank, "icon_suffix": "_p" if rank == "P" else "_m" if rank.startswith("M") else ""})
+            # Tieru's icon pack has the master artwork in *_m.png.  It is used
+            # for every mastered stage (M, G and P); there are no *_p.png files.
+            result.append({"vnum": vnum, "name": name, "level": level, "master_type": master, "rank": rank, "icon_suffix": "_m" if master >= 1 or level >= 20 else ""})
     return result
 
 
 SKILL_NAMES = {vnum: name for skill_set in SKILLS.values() for vnum, name in skill_set}
+_season_cache = {"at": 0.0, "weekly": [], "records": {}}
 
 
 def news_feed_events():
     """Curate rare achievements from the native game log with stable IDs."""
-    raw = rows("""SELECT l.time,l.how,l.hint,l.what,l.who,p.name
+    # Filter in SQL before the limit.  A busy server produces thousands of
+    # ordinary +0–+3 refines per minute; taking its newest 900 rows first made
+    # rare achievements disappear from the feed altogether.
+    raw = rows("""SELECT l.time,l.how,l.hint,l.what,l.who,p.name,
+        HEX(proto.locale_name) AS item_name_hex
       FROM log.log l JOIN player.player p ON p.id=l.who
+      LEFT JOIN player.item i ON i.id=l.what
+      LEFT JOIN player.item_proto proto ON proto.vnum=i.vnum
       WHERE l.time >= NOW() - INTERVAL 12 HOUR
-        AND l.how IN ('REFINE SUCCESS','SKILLUP','GET')
+        AND (
+          (l.how='REFINE SUCCESS' AND (l.hint LIKE '%%+7%%' OR l.hint LIKE '%%+8%%' OR l.hint LIKE '%%+9%%'))
+          OR l.how='SKILLUP'
+          OR (l.how='GET' AND LOWER(CONVERT(l.hint USING utf8mb4)) COLLATE utf8mb4_general_ci LIKE '%%małż%%')
+        )
       ORDER BY l.time DESC LIMIT 900""")
     events, seen = [], set()
     for row in raw:
@@ -295,7 +416,8 @@ def news_feed_events():
         if how == "REFINE SUCCESS":
             match = re.search(r"\+([789])(?:\s|$)", hint)
             if match:
-                message = f"{name} ulepszył {hint.strip()}"
+                item_name = cp1250_hex_text(row.get("item_name_hex")) or hint.strip()
+                message = f"{name} ulepszył {item_name}"
         elif how == "SKILLUP":
             match = re.search(r"SkillUp:\s+\S+\s+(\d+)\s+(\d+)\s+(\d+)", hint)
             if match:
@@ -307,7 +429,7 @@ def news_feed_events():
             message = f"{name} znalazł Małż podczas połowu"
         if message:
             seen.add(key)
-            events.append({"key": key, "time": row["time"].strftime("%H:%M") if hasattr(row.get("time"), "strftime") else str(row.get("time"))[11:16], "message": message})
+            events.append({"key": key, "time": row["time"].strftime("%H:%M") if hasattr(row.get("time"), "strftime") else str(row.get("time"))[11:16], "message": message, "refine_tier": int(match.group(1)) if how == "REFINE SUCCESS" and match else 0})
     return list(reversed(events[-30:]))
 
 
@@ -377,6 +499,9 @@ def live_bots():
 
 def read_rates():
     values = {name: 100 for name in RATE_NAMES}
+    status = read_rate_status()
+    if all(str(status.get(name, "")).isdigit() for name in RATE_NAMES):
+        return {name: int(status[name]) for name in RATE_NAMES}
     try:
         for row in rows("SELECT name, value FROM player.web_admin_rates"):
             if row["name"] in values:
@@ -398,6 +523,144 @@ def read_rate_status():
     return result
 
 
+def read_map_regen_status():
+    status_file = RATES_SPOOL / "map-regens.status"
+    result = {"state": "idle", "message": "Brak zapisanej zmiany", "values": {}, "stones": {}}
+    try:
+        for line in status_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, separator, value = line.partition("=")
+            if not separator:
+                continue
+            if key.startswith("map_stone_") and key[10:].isdigit():
+                result["stones"][int(key[10:])] = value
+            elif key.startswith("map_") and key[4:].isdigit():
+                result["values"][int(key[4:])] = value
+            else:
+                result[key] = value
+    except OSError:
+        pass
+    return result
+
+
+def read_spool_values(path):
+    """Read a small key=value status file written by a fixed helper."""
+    result = {}
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                result[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return result
+
+
+def update_status():
+    """State exposed by Tieru's isolated updater through its tiny spool."""
+    result = read_spool_values(UPDATE_SPOOL / "update.status")
+    try:
+        age = max(0, int(time.time() - (UPDATE_SPOOL / "watcher").stat().st_mtime))
+    except OSError:
+        age = None
+    result["watcher_age"] = age
+    result["watcher_ready"] = age is not None and age < UPDATE_WATCHER_MAX_AGE_SECONDS
+    result["state"] = result.get("state", "idle")
+    try:
+        step, steps = int(result.get("step", 0)), int(result.get("steps", 5))
+        result["percent"] = max(0, min(100, round(step * 100 / max(steps, 1))))
+    except ValueError:
+        result["percent"] = 0
+    if result["state"] == "running":
+        result["percent"] = max(5, result["percent"])
+    result["message"] = result.get("message", "Aktualizator czeka na zlecenie." if result["watcher_ready"] else "Aktualizator nie jest uruchomiony.")
+    try:
+        result["log"] = (UPDATE_SPOOL / "update.log").read_text(encoding="utf-8", errors="replace").splitlines()[-18:]
+    except OSError:
+        result["log"] = []
+    return result
+
+
+def installed_playerbots_version():
+    """Prefer the version confirmed by the updater, then the configured baseline."""
+    current = update_status()
+    if current.get("state") == "ok":
+        match = re.search(r"version ([0-9]+(?:\.[0-9]+)+)", current.get("message", ""))
+        if match:
+            return match.group(1)
+    return os.environ.get("PLAYERBOTS_VERSION", "nieustawiona")
+
+
+def version_key(value):
+    match = re.fullmatch(r"v?([0-9]+(?:\.[0-9]+)+)", str(value or "").strip(), re.I)
+    return tuple(int(part) for part in match.group(1).split(".")) if match else None
+
+
+def latest_playerbots_release():
+    """Read GitHub's latest release, cached so page loads never hammer the API."""
+    now = time.time()
+    if now - _playerbots_release_cache["checked_at"] < PLAYERBOTS_RELEASE_CACHE_SECONDS:
+        return dict(_playerbots_release_cache)
+    result = {"checked_at": now, "latest": None, "error": None}
+    try:
+        request_github = Request(PLAYERBOTS_RELEASE_URL, headers={"Accept": "application/vnd.github+json", "User-Agent": "Metin2-Singleplayer-Panel"})
+        with urlopen(request_github, timeout=3) as response:
+            payload = json.load(response)
+        tag = str(payload.get("tag_name") or "").strip()
+        if not version_key(tag):
+            raise ValueError("GitHub nie zwrócił poprawnego numeru wydania.")
+        result["latest"] = tag.lstrip("vV")
+    except (OSError, ValueError, HTTPError, URLError, json.JSONDecodeError) as exc:
+        result["error"] = str(exc)[:120] or "Nie udało się połączyć z GitHub."
+    _playerbots_release_cache.clear()
+    _playerbots_release_cache.update(result)
+    return dict(result)
+
+
+def playerbots_release_status():
+    installed = installed_playerbots_version().strip()
+    latest_info = latest_playerbots_release()
+    latest = latest_info.get("latest")
+    installed_key, latest_key = version_key(installed), version_key(latest)
+    if installed_key and latest_key:
+        behind = installed_key < latest_key
+        return {"installed": installed, "latest": latest, "behind": behind,
+                "tone": "outdated" if behind else "current",
+                "label": f"Dostępna {latest}" if behind else "Aktualna"}
+    return {"installed": installed, "latest": latest, "behind": False, "tone": "unknown",
+            "label": "Nie sprawdzono GitHub" if latest_info.get("error") else "Brak wersji lokalnej"}
+
+
+def update_csrf_token():
+    token = session.get("seban_update_csrf")
+    if not token:
+        token = uuid.uuid4().hex
+        session["seban_update_csrf"] = token
+    return token
+
+
+def queue_tieru_update():
+    """Request only the updater's fixed sequence; no command, URL or path crosses this boundary."""
+    current = update_status()
+    if not current["watcher_ready"]:
+        raise RuntimeError("Aktualizator nie jest gotowy. Administrator musi uruchomić usługę updater.")
+    if current.get("state") == "running":
+        raise RuntimeError("Aktualizacja już trwa. Poczekaj na jej zakończenie.")
+    version = installed_playerbots_version().strip()
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version):
+        version = "0"
+    request_id = "seban-" + uuid.uuid4().hex
+    UPDATE_SPOOL.mkdir(parents=True, exist_ok=True)
+    temporary = UPDATE_SPOOL / (request_id + ".new")
+    try:
+        temporary.write_text(f"id={request_id}\nversion={version}\ntime={int(time.time())}\n", encoding="utf-8")
+        temporary.chmod(0o660)
+        # replace is atomic. The worker records the id before doing work, so a
+        # completed request never runs twice after a container recreation.
+        os.replace(temporary, UPDATE_SPOOL / "request")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def read_ai_weights():
     """Read Tieru's live Playerbots goal weights; absent entries are neutral."""
     values = {key: AI_WEIGHT_NEUTRAL for key, _, _ in AI_WEIGHT_KEYS}
@@ -408,10 +671,12 @@ def read_ai_weights():
             if len(fields) >= 2 and fields[0].upper() in values:
                 try:
                     key, raw_value = fields[0].upper(), fields[1]
-                    if key == "CHAT":
+                    if key in ("CHAT", "BOOKS", "NIGHT"):
                         values[key] = 0 if raw_value.lower() in ("0", "off", "no") else 1
                     elif key == "SCRAP":
                         values[key] = max(0, min(100, int(raw_value)))
+                    elif key in ("CHEST", "CHEST_STONE"):
+                        values[key] = max(0, min(1000, int(raw_value)))
                     else:
                         values[key] = max(AI_WEIGHT_MIN, min(AI_WEIGHT_MAX, int(raw_value)))
                 except ValueError:
@@ -421,8 +686,25 @@ def read_ai_weights():
     return values
 
 
+def preserved_ai_weight_lines():
+    """Keep new core keys this panel does not know about yet on every save."""
+    known = {key for key, _, _ in AI_WEIGHT_KEYS} | AI_SPECIAL_WEIGHT_KEYS
+    preserved = []
+    try:
+        for line in AI_WEIGHTS_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            fields = line.split("#", 1)[0].split()
+            if len(fields) != 2:
+                continue
+            key, value = fields[0].upper(), fields[1]
+            if key not in known and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", key) and re.fullmatch(r"-?\d{1,10}", value):
+                preserved.append(f"{key}\t{value}")
+    except OSError:
+        pass
+    return preserved
+
+
 def write_ai_weights(values):
-    """Atomically replace the file so the core never catches a partial save."""
+    """Atomically replace known values without erasing newer-core settings."""
     RATES_SPOOL.mkdir(parents=True, exist_ok=True)
     content = [
         "# Metin2 Playerbots — wagi celów ustawione przez Seban Panel.",
@@ -431,7 +713,13 @@ def write_ai_weights(values):
     ]
     content.extend(f"{key}\t{values[key]}" for key, _, _ in AI_WEIGHT_KEYS)
     content.append(f"CHAT\t{1 if values.get('CHAT', 1) else 0}")
+    content.append(f"BOOKS\t{1 if values.get('BOOKS', 1) else 0}")
+    content.append(f"NIGHT\t{1 if values.get('NIGHT', 1) else 0}")
     content.append(f"SCRAP\t{max(0, min(100, int(values.get('SCRAP', 0))))}")
+    for key in ("CHEST", "CHEST_STONE"):
+        if values.get(key) is not None:
+            content.append(f"{key}\t{max(0, min(1000, int(values[key])))}")
+    content.extend(preserved_ai_weight_lines())
     temporary = AI_WEIGHTS_FILE.with_suffix(".tsv.new")
     temporary.write_text("\n".join(content) + "\n", encoding="utf-8")
     os.replace(temporary, AI_WEIGHTS_FILE)
@@ -446,6 +734,19 @@ def port_open(port):
 
 
 def restart_progress():
+    result = {}
+    try:
+        for line in (RATES_SPOOL / "server-settings.status").read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                result[key] = value
+        result["percent"] = max(0, min(100, int(result.get("percent", 0))))
+        result["stage"] = result.get("message", "Oczekiwanie na stan serwera")
+        if (RATES_SPOOL / "server-settings.request").exists() and result.get("state") != "running":
+            result.update(state="running", percent=5, stage="Zlecenie oczekuje na serwer")
+        return result
+    except (OSError, ValueError):
+        pass
     status = read_rate_status()
     auth, world = port_open(GAME_LOGIN_PORT), port_open(GAME_WORLD_PORT)
     state = status.get("state", "unknown")
@@ -481,6 +782,117 @@ def queue_rate_restart(values):
         (int(time.time()), values["exp"], values["drop"], values["yang"]), encoding="utf-8")
 
 
+def server_settings_status():
+    """Report whether the game-side restart helper is alive, not just queued."""
+    ready = read_spool_values(RATES_SPOOL / "server-settings.ready")
+    request = RATES_SPOOL / "server-settings.request"
+    status = read_spool_values(RATES_SPOOL / "server-settings.status")
+    try:
+        ready_age = max(0, int(time.time() - (RATES_SPOOL / "server-settings.ready").stat().st_mtime))
+    except OSError:
+        ready_age = None
+    try:
+        request_age = max(0, int(time.time() - request.stat().st_mtime))
+    except OSError:
+        request_age = None
+    worker_ready = ready.get("capability") == "server-settings" and ready_age is not None and ready_age <= SERVER_SETTINGS_READY_MAX_AGE_SECONDS
+    result = {"ready": worker_ready, "ready_age": ready_age, "pending": request.exists(), "request_age": request_age,
+              "can_clear": bool(request_age is not None and request_age >= SERVER_SETTINGS_STALE_SECONDS and not worker_ready)}
+    if worker_ready:
+        result["message"] = "Helper ustawień serwera jest gotowy."
+    elif result["pending"]:
+        result["message"] = "Zlecenie nie jest odbierane przez helper gry. Sprawdź instalację integracji; po 10 minutach można usunąć wyłącznie zaległe zlecenie."
+    else:
+        result["message"] = "Brak sygnału helpera gry. Zainstaluj integrację `m2-server-settings` i `m2-supervise` przed zmianą respawnów lub rat."
+    return result
+
+
+RESTART_STALE_SECONDS = 600
+
+
+def restart_in_flight():
+    status = read_rate_status()
+    if status.get("state") != "running":
+        return False
+    try:
+        started = int(status.get("time", "0"))
+    except (TypeError, ValueError):
+        return False
+    return 0 < time.time() - started < RESTART_STALE_SECONDS
+
+
+def queue_server_settings(action, values=None, changes=None):
+    """Publish a complete request only while the game-side helper is present."""
+    support = server_settings_status()
+    if not support["ready"]:
+        # The settings helper (integration/m2-server-settings) is not part of
+        # this image, so the map respawn half of the console has nothing to
+        # carry it out and is refused with the message above. A plain restart,
+        # and a rates-only apply, never needed it: the game container has
+        # always watched the rates spool, and that is the path both buttons
+        # took before 1.38 - refusing them here would put the dead restart
+        # button of 1.30.19 back on every install without the helper.
+        # An empty respawn field arrives as "reset", for every map, from a
+        # form nobody touched - so "no respawn change" is "nothing but resets".
+        respawn_changes = {key: value for key, value in (changes or {}).items() if value != "reset"}
+        if action == "restart" or (action == "apply" and values and not respawn_changes):
+            if restart_in_flight():
+                raise FileExistsError("a restart is already under way")
+            queue_rate_restart(values if action == "apply" else read_rates())
+            return
+        raise RuntimeError(support["message"])
+    RATES_SPOOL.mkdir(parents=True, exist_ok=True)
+    request_id = "seban-" + uuid.uuid4().hex
+    lines = [f"id={request_id}", f"action={action}", "source=panel"]
+    if action == "apply":
+        lines.extend(f"{key}={values[key]}" for key in RATE_NAMES)
+        lines.extend(f"map_{key}={value}" for key, value in (changes or {}).items())
+    temporary = RATES_SPOOL / (request_id + ".new")
+    try:
+        temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        temporary.chmod(0o660)
+        # A hard link is an atomic, exclusive publication on the shared volume.
+        os.link(temporary, RATES_SPOOL / "server-settings.request")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def queue_map_regen_changes(changes):
+    stamp = int(time.time() * 1000)
+    request_data = [f"id=seban-map-{stamp}", f"time={int(time.time())}"]
+    request_data.extend(f"map_{map_index}={value}" for map_index, value in changes.items())
+    RATES_SPOOL.mkdir(parents=True, exist_ok=True)
+    temporary = RATES_SPOOL / "map-regens.request.new"
+    temporary.write_text("\n".join(request_data) + "\n", encoding="utf-8")
+    os.replace(temporary, RATES_SPOOL / "map-regens.request")
+    (RATES_SPOOL / "map-regens.status").write_text(
+        "state=running\ntime=%s\nmessage=Zapisano zestaw zmian respawnu; rdzenie zostaną ponownie uruchomione.\n" % int(time.time()),
+        encoding="utf-8",
+    )
+
+
+def queue_map_regen_change(map_index, action, seconds=None):
+    """Backward-compatible single-map queue entry."""
+    queue_map_regen_changes({int(map_index): "reset" if action == "reset" else int(seconds)})
+
+
+def biologist_missions():
+    """Known Biologist missions plus names already emitted by the game."""
+    names = set(BIOLOGIST_FALLBACK_MISSIONS)
+    try:
+        discovered = rows("""SELECT DISTINCT szName FROM player.quest
+                           WHERE szName REGEXP '^(make_herb_lv[0-9]+|collect_quest_lv[0-9]+)$'""")
+        names.update(row["szName"] for row in discovered if row.get("szName"))
+    except pymysql.MySQLError:
+        pass
+
+    def mission_order(name):
+        match = re.search(r"([0-9]+)$", name)
+        return (int(match.group(1)) if match else 0, name)
+
+    return tuple(sorted(names, key=mission_order))
+
+
 def bot_ranking(kind, sort_by="avg"):
     base = "p.name LIKE 'bot%%'"
     if kind == "gold":
@@ -497,21 +909,20 @@ def bot_ranking(kind, sort_by="avg"):
             ORDER BY MOD(COALESCE(i.vnum,0),10) DESC,i.vnum DESC,p.level DESC LIMIT 100""")
     if kind == "weapon30":
         weapon30_order = {
-            "avg": "skill_damage DESC, avg_damage DESC, p.level DESC",
-            "skill": "avg_damage DESC, skill_damage DESC, p.level DESC",
-            "upgrade": "MOD(i.vnum,10) DESC, skill_damage DESC, avg_damage DESC, p.level DESC",
-        }.get(sort_by, "skill_damage DESC, avg_damage DESC, p.level DESC")
+            "avg": "avg_damage DESC, skill_damage DESC, p.level DESC",
+            "skill": "skill_damage DESC, avg_damage DESC, p.level DESC",
+            "upgrade": "MOD(i.vnum,10) DESC, avg_damage DESC, skill_damage DESC, p.level DESC",
+        }.get(sort_by, "avg_damage DESC, skill_damage DESC, p.level DESC")
         result = rows(f"""SELECT p.id,p.name,p.level,p.gold,i.vnum,COALESCE(ip.locale_name,CONCAT('VNUM ',i.vnum)) AS item_name,
             IF(GREATEST(CASE WHEN i.attrtype0=71 THEN i.attrvalue0 ELSE -999 END,CASE WHEN i.attrtype1=71 THEN i.attrvalue1 ELSE -999 END,CASE WHEN i.attrtype2=71 THEN i.attrvalue2 ELSE -999 END,CASE WHEN i.attrtype3=71 THEN i.attrvalue3 ELSE -999 END,CASE WHEN i.attrtype4=71 THEN i.attrvalue4 ELSE -999 END,CASE WHEN i.attrtype5=71 THEN i.attrvalue5 ELSE -999 END,CASE WHEN i.attrtype6=71 THEN i.attrvalue6 ELSE -999 END)=-999,0,GREATEST(CASE WHEN i.attrtype0=71 THEN i.attrvalue0 ELSE -999 END,CASE WHEN i.attrtype1=71 THEN i.attrvalue1 ELSE -999 END,CASE WHEN i.attrtype2=71 THEN i.attrvalue2 ELSE -999 END,CASE WHEN i.attrtype3=71 THEN i.attrvalue3 ELSE -999 END,CASE WHEN i.attrtype4=71 THEN i.attrvalue4 ELSE -999 END,CASE WHEN i.attrtype5=71 THEN i.attrvalue5 ELSE -999 END,CASE WHEN i.attrtype6=71 THEN i.attrvalue6 ELSE -999 END)) AS avg_damage,
             IF(GREATEST(CASE WHEN i.attrtype0=72 THEN i.attrvalue0 ELSE -999 END,CASE WHEN i.attrtype1=72 THEN i.attrvalue1 ELSE -999 END,CASE WHEN i.attrtype2=72 THEN i.attrvalue2 ELSE -999 END,CASE WHEN i.attrtype3=72 THEN i.attrvalue3 ELSE -999 END,CASE WHEN i.attrtype4=72 THEN i.attrvalue4 ELSE -999 END,CASE WHEN i.attrtype5=72 THEN i.attrvalue5 ELSE -999 END,CASE WHEN i.attrtype6=72 THEN i.attrvalue6 ELSE -999 END)=-999,0,GREATEST(CASE WHEN i.attrtype0=72 THEN i.attrvalue0 ELSE -999 END,CASE WHEN i.attrtype1=72 THEN i.attrvalue1 ELSE -999 END,CASE WHEN i.attrtype2=72 THEN i.attrvalue2 ELSE -999 END,CASE WHEN i.attrtype3=72 THEN i.attrvalue3 ELSE -999 END,CASE WHEN i.attrtype4=72 THEN i.attrvalue4 ELSE -999 END,CASE WHEN i.attrtype5=72 THEN i.attrvalue5 ELSE -999 END,CASE WHEN i.attrtype6=72 THEN i.attrvalue6 ELSE -999 END)) AS skill_damage
             FROM player.item i JOIN player.player p ON p.id=i.owner_id LEFT JOIN player.item_proto ip ON ip.vnum=i.vnum
             WHERE {base} AND ((i.vnum BETWEEN 290 AND 299) OR (i.vnum BETWEEN 1170 AND 1179) OR (i.vnum BETWEEN 2150 AND 2159) OR (i.vnum BETWEEN 3210 AND 3219) OR (i.vnum BETWEEN 5110 AND 5119) OR (i.vnum BETWEEN 7160 AND 7169))
             ORDER BY {weapon30_order} LIMIT 100""")
-        # The database's custom Playerbots build stores type 71 as skill
-        # damage and type 72 as average damage.  The query above remains
-        # legible; normalize the public field names here before sorting/UI.
-        for row in result:
-            row["avg_damage"], row["skill_damage"] = row["skill_damage"], row["avg_damage"]
+        # 71 is APPLY_SKILL_DAMAGE_BONUS and 72 is APPLY_NORMAL_HIT_DAMAGE_BONUS in
+        # common/length.h, and the query names them so. A swap used to live
+        # here, justified by "this build stores them the other way round" -
+        # it does not, and the ranking showed the two columns exchanged.
         return sorted(
             result,
             key=lambda row: (
@@ -523,6 +934,12 @@ def bot_ranking(kind, sort_by="avg"):
         )
     if kind == "playtime":
         return rows(f"SELECT p.id,p.name,p.level,p.gold,p.playtime AS score,CONCAT(FLOOR(p.playtime/60),' h') AS detail FROM player.player p WHERE {base} ORDER BY p.playtime DESC,p.level DESC LIMIT 100")
+    if kind == "bosses":
+        return rows(f"""SELECT p.id,p.name,p.level,p.gold,COUNT(*) AS score,
+            CONCAT(COUNT(*),' zabitych bossów · 7 dni') AS detail
+            FROM log.log l JOIN player.player p ON p.id=l.who
+            WHERE {base} AND l.how='BOSS_KILL' AND l.time >= NOW() - INTERVAL 7 DAY
+            GROUP BY p.id,p.name ORDER BY score DESC,p.level DESC,p.name LIMIT 100""")
     if kind == "items":
         return rows(f"""SELECT p.id,p.name,p.level,p.gold,COUNT(i.id) AS score,CONCAT(COUNT(i.id),' przedmiotów') AS detail
             FROM player.player p LEFT JOIN player.item i ON i.owner_id=p.id AND i.window='INVENTORY'
@@ -530,10 +947,11 @@ def bot_ranking(kind, sort_by="avg"):
     if kind == "horse":
         return rows(f"SELECT p.id,p.name,p.level,p.gold,p.horse_level AS score,CONCAT('Koń Lv ',p.horse_level) AS detail FROM player.player p WHERE {base} ORDER BY p.horse_level DESC,p.level DESC LIMIT 100")
     if kind == "biologist":
-        marks = ",".join(["%s"] * len(BIOLOGIST_MISSIONS))
-        return rows(f"""SELECT p.id,p.name,p.level,p.gold,COUNT(DISTINCT q.szName) AS score,CONCAT(COUNT(DISTINCT q.szName),' / {len(BIOLOGIST_MISSIONS)} misji') AS detail
+        missions = biologist_missions()
+        marks = ",".join(["%s"] * len(missions))
+        return rows(f"""SELECT p.id,p.name,p.level,p.gold,COUNT(DISTINCT q.szName) AS score,CONCAT(COUNT(DISTINCT q.szName),' / {len(missions)} misji') AS detail
             FROM player.player p LEFT JOIN player.quest q ON q.dwPID=p.id AND q.szName IN ({marks}) AND q.szState='__status' AND q.lValue=%s
-            WHERE {base} GROUP BY p.id ORDER BY score DESC,p.level DESC LIMIT 100""", (*BIOLOGIST_MISSIONS, BIOLOGIST_COMPLETE_STATE))
+            WHERE {base} GROUP BY p.id ORDER BY score DESC,p.level DESC LIMIT 100""", (*missions, BIOLOGIST_COMPLETE_STATE))
     if kind == "hunting":
         return rows(f"""SELECT p.id,p.name,p.level,p.gold,MAX(CASE WHEN q.szState='complete' THEN q.lValue ELSE 0 END) AS score,
             CONCAT('Ukończone do Lv ',MAX(CASE WHEN q.szState='complete' THEN q.lValue ELSE 0 END)) AS detail
@@ -586,9 +1004,14 @@ def globals_for_templates():
         icon = ITEM_ICONS.get(str(value)) or ITEM_ICONS.get(str(value - value % 10))
         return url_for("static", filename=f"icons/{quote(icon)}") if icon else None
     current_settings = settings()
-    return {"tieru_url": tieru_url, "panel_brand": current_settings.get("panel_name", "Metin2 Singleplayer"), "settings": current_settings, "map_name": map_name, "item_icon": item_icon}
-
-
+    def job_name(job):
+        return class_profile(job)["name"]
+    def class_portrait(job):
+        return url_for("static", filename=f"class-portraits/{class_profile(job)['portrait']}")
+    def empire_flag(empire):
+        flag = empire_flag_path(empire)
+        return url_for("static", filename=f"empires/{flag}") if flag else ""
+    return {"tieru_url": tieru_url, "panel_brand": current_settings.get("panel_name", "Metin2 Singleplayer"), "settings": current_settings, "map_name": map_name, "item_icon": item_icon, "job_name": job_name, "class_profile": class_profile, "class_portrait": class_portrait, "empire_info": empire_info, "empire_flag": empire_flag}
 @app.route("/login", methods=["GET", "POST"])
 def login():
     current = settings()
@@ -599,6 +1022,7 @@ def login():
         if password_hash and check_password_hash(password_hash, request.form.get("password", "")):
             session.clear()
             session["seban_admin"] = True
+            session.permanent = True
             return redirect(request.args.get("next") or url_for("dashboard"))
         flash("Nieprawidłowe hasło.", "error")
     return render_template("login.html")
@@ -644,11 +1068,17 @@ def dashboard():
           (SELECT COALESCE(SUM(gold),0) FROM player.player WHERE name NOT IN ('[SA]Admin','Test')) AS yang
     """)
     bots = one("SELECT COUNT(*) AS count FROM player.player WHERE account_id BETWEEN 4 AND 1003")
-    system = one("SELECT * FROM player.web_seban_system_snapshot ORDER BY captured_at DESC LIMIT 1")
+    # The collector creates this table with its first snapshot; before that -
+    # the first minutes of a fresh installation - the dashboard has no host
+    # metrics to show, not an error to raise.
+    try:
+        system = one("SELECT * FROM player.web_seban_system_snapshot ORDER BY captured_at DESC LIMIT 1")
+    except pymysql.MySQLError:
+        system = {}
     map_rows = live_map_counts()
     for row in map_rows:
         row["name"] = map_name(row["map_index"])
-    top = rows("SELECT id, name, level, exp, map_index, playtime FROM player.player WHERE name LIKE 'bot%%' ORDER BY level DESC, exp DESC LIMIT 10")
+    top = rows("SELECT id, name, level, exp, job, map_index, playtime FROM player.player WHERE name LIKE 'bot%%' ORDER BY level DESC, exp DESC LIMIT 10")
     global_top_id = top[0]["id"] if top else None
     live = live_statuses()
     live_roster = live_bots()
@@ -663,6 +1093,7 @@ def dashboard():
         restart_label = datetime.fromtimestamp(int(restart_time)).strftime("%d.%m.%Y, %H:%M:%S")
     except (TypeError, ValueError, OSError):
         restart_label = "Brak danych"
+    release_status = playerbots_release_status()
     world_summary = {
         "bots": len(live_roster),
         "average_level": round(sum(int(bot.get("level") or 0) for bot in live_roster) / len(live_roster), 1) if live_roster else 0,
@@ -672,7 +1103,8 @@ def dashboard():
         "horse_max": max((int(bot.get("horse_level") or 0) for bot in live_roster), default=0),
         "guilds": bot_guilds,
         "last_restart": restart_label,
-        "version": playerbots_version(),
+        "version": release_status["installed"],
+        "release": release_status,
         "rates": read_rates(),
     }
     for bot in top:
@@ -690,14 +1122,21 @@ def dashboard():
                      WHERE p.name LIKE 'bot%%' AND l.how='STONE_KILL' AND l.time >= NOW() - INTERVAL 7 DAY
                      GROUP BY p.id,p.name ORDER BY score DESC,p.name LIMIT 10""")
     quick_rankings.append({"title": "Metiny", "subtitle": "rozbite · ostatnie 7 dni", "items": [{"id": row["id"], "name": row["name"], "value": f"{int(row['score'])} szt."} for row in metins]})
+    bosses = bot_ranking("bosses")[:10]
+    quick_rankings.append({"title": "Bossy", "subtitle": "zabite · ostatnie 7 dni", "items": [{"id": row["id"], "name": row["name"], "value": f"{int(row['score'])} szt."} for row in bosses]})
     fish = rows("""SELECT p.id,p.name,COUNT(*) AS score FROM log.log l JOIN player.player p ON p.id=l.who
                    WHERE p.name LIKE 'bot%%' AND l.time >= NOW() - INTERVAL 7 DAY
                      AND (l.what LIKE '%%ryb%%' OR l.what LIKE '%%fish%%')
                    GROUP BY p.id,p.name ORDER BY score DESC,p.name LIMIT 10""")
     quick_rankings.append({"title": "Ryby", "subtitle": "wyłowione · ostatnie 7 dni", "items": [{"id": row["id"], "name": row["name"], "value": f"{int(row['score'])} szt."} for row in fish]})
-    return render_template("dashboard.html", totals=totals, bots=bots.get("count", 0), system=system, map_rows=map_rows, top=top, global_top_id=global_top_id, quick_rankings=quick_rankings, world_summary=world_summary)
-
-
+    ranking_ids = {item["id"] for ranking in quick_rankings for item in ranking["items"]}
+    if ranking_ids:
+        placeholders = ",".join(["%s"] * len(ranking_ids))
+        jobs_by_id = {row["id"]: row["job"] for row in rows("SELECT id,job FROM player.player WHERE id IN (" + placeholders + ")", list(ranking_ids))}
+        for quick_ranking in quick_rankings:
+            for item in quick_ranking["items"]:
+                item["job"] = jobs_by_id.get(item["id"], 0)
+    return render_template("dashboard.html", totals=totals, bots=bots.get("count", 0), system=system, map_rows=map_rows, top=top, global_top_id=global_top_id, quick_rankings=quick_rankings, world_summary=world_summary, panel_version=PANEL_VERSION, latest_changelog=changelog_entries()[:1])
 @app.route("/players")
 @login_required
 def players():
@@ -717,10 +1156,50 @@ def players():
     return render_template("players.html", players=roster, query=query)
 
 
+@app.route("/guilds")
+@login_required
+def guilds():
+    query = request.args.get("q", "").strip()
+    filters, args = "", []
+    if query:
+        filters = "WHERE g.name LIKE %s OR leader.name LIKE %s"
+        args = [f"%{query}%", f"%{query}%"]
+    roster = rows(f"""SELECT g.id,g.name,g.level,g.exp,g.sp,g.win,g.draw,g.loss,g.ladder_point,g.gold,
+                     leader.id AS leader_id,leader.name AS leader_name,leader.level AS leader_level,
+                     COUNT(gm.pid) AS member_count
+                     FROM player.guild g
+                     LEFT JOIN player.player leader ON leader.id=g.master
+                     LEFT JOIN player.guild_member gm ON gm.guild_id=g.id
+                     {filters}
+                     GROUP BY g.id,g.name,g.level,g.exp,g.sp,g.win,g.draw,g.loss,g.ladder_point,g.gold,leader.id,leader.name,leader.level
+                     ORDER BY g.level DESC,member_count DESC,g.name ASC LIMIT 250""", args)
+    return render_template("guilds.html", guilds=roster, query=query)
+
+
+@app.route("/guild/<int:guild_id>")
+@login_required
+def guild(guild_id):
+    details = one("""SELECT g.id,g.name,g.level,g.exp,g.sp,g.win,g.draw,g.loss,g.ladder_point,g.gold,
+                     leader.id AS leader_id,leader.name AS leader_name,leader.level AS leader_level,
+                     COUNT(gm.pid) AS member_count
+                     FROM player.guild g
+                     LEFT JOIN player.player leader ON leader.id=g.master
+                     LEFT JOIN player.guild_member gm ON gm.guild_id=g.id
+                     WHERE g.id=%s
+                     GROUP BY g.id,g.name,g.level,g.exp,g.sp,g.win,g.draw,g.loss,g.ladder_point,g.gold,leader.id,leader.name,leader.level""", (guild_id,))
+    if not details:
+        abort(404)
+    members = rows("""SELECT gm.pid,gm.grade,gm.is_general,gm.offer,p.name,p.level,p.job,p.map_index,p.playtime
+                    FROM player.guild_member gm LEFT JOIN player.player p ON p.id=gm.pid
+                    WHERE gm.guild_id=%s
+                    ORDER BY (gm.pid=%s) DESC,gm.grade ASC,p.level DESC,p.name ASC""", (guild_id, details["leader_id"] or 0))
+    return render_template("guild.html", guild=details, members=members)
+
+
 @app.route("/player/<int:pid>")
 @login_required
 def player(pid):
-    character = one("SELECT id,account_id,name,level,job,exp,gold,hp,mp,x,y,horse_level,alignment,st,ht,dx,iq,stat_point,skill_point,skill_group,skill_level,map_index,playtime FROM player.player WHERE id=%s", (pid,))
+    character = one("SELECT p.id,p.account_id,p.name,p.level,p.job,p.exp,p.gold,p.hp,p.mp,p.x,p.y,p.horse_level,p.alignment,p.st,p.ht,p.dx,p.iq,p.stat_point,p.skill_point,p.skill_group,p.skill_level,p.map_index,p.playtime,COALESCE(NULLIF(a.empire,0),pi.empire,0) AS empire FROM player.player p LEFT JOIN account.account a ON a.id=p.account_id LEFT JOIN player.player_index pi ON pi.id=p.account_id WHERE p.id=%s", (pid,))
     if not character:
         abort(404)
     live = live_statuses().get(pid)
@@ -732,7 +1211,8 @@ def player(pid):
         character["action"] = live.get("status") or live_label("action", live.get("action"))
     else:
         character.update({"personality": "Bot offline", "ambition": "—", "goal": "—", "action": "—"})
-    character["job_name"] = JOB_NAMES[int(character.get("job") or 0) % 4]
+    character["job_name"] = class_profile(character.get("job"))["name"]
+    character["class_profile"] = class_profile(character.get("job"))
     character["experience"] = experience_progress(character.get("level"), character.get("exp"))
     character["honor"] = honor_rank(character.get("alignment"))
     character["honor"]["css"] = {"Rycerski": "knightly", "Szlachetny": "noble", "Dobry": "good", "Przyjazny": "friendly", "Neutralny": "neutral", "Agresywny": "aggressive", "Nieuczciwy": "dishonest", "Złośliwy": "malicious", "Okrutny": "cruel"}[character["honor"]["title"]]
@@ -841,7 +1321,7 @@ def items_database():
     records = rows("SELECT p.vnum,p.name,p.locale_name,p.type,p.subtype,p.size,p.gold,p.shop_buy_price FROM player.item_proto p" + predicate + " ORDER BY p.vnum", params)
     for item in records:
         item["name"] = game_text(item.get("locale_name") or item.get("name"))
-    types = rows("SELECT type,COUNT(*) AS count FROM player.item_proto GROUP BY type ORDER BY type")
+    types = rows("SELECT type,COUNT(*) AS count,MIN(vnum) AS icon_vnum FROM player.item_proto GROUP BY type ORDER BY type")
     for category in types:
         index = int(category["type"])
         category["label"] = ITEM_TYPE_NAMES[index] if 0 <= index < len(ITEM_TYPE_NAMES) else f"ITEM_TYPE_{index}"
@@ -866,23 +1346,74 @@ def accounts():
         authority = request.form.get("authority", "PLAYER")
         gm_name = request.form.get("gm_name", "").strip()
         deletion_code = request.form.get("deletion_code", "").strip()
+        try:
+            gm_job = int(request.form.get("gm_job", 0) or 0)
+        except ValueError:
+            gm_job = -1
+        gm_gender = request.form.get("gm_gender", "classic")
         if not (3 <= len(login) <= 30 and login.replace("_", "").isalnum() and len(password) >= 6 and authority in authorities):
             flash("Login ma mieć 3–30 znaków (litery, cyfry, _), a hasło minimum 6 znaków.", "error")
         elif not (deletion_code.isdigit() and len(deletion_code) == 7):
             flash("Kod usunięcia postaci ma zawierać dokładnie 7 cyfr.", "error")
-        elif authority != "PLAYER" and not gm_name:
-            flash("Dla konta GM wpisz docelowy nick postaci.", "error")
+        elif authority != "PLAYER" and not re.fullmatch(GM_NAME_PATTERN, gm_name):
+            flash("Nick postaci GM ma mieć 2–24 znaki. Dozwolony jest też jeden prefiks, np. [GM]Seban lub [GA]Seban.", "error")
+        elif authority != "PLAYER" and gm_job not in dict(GM_JOB_OPTIONS):
+            flash("Wybierz poprawną klasę postaci GM.", "error")
+        elif authority != "PLAYER" and gm_gender not in dict(GM_GENDER_OPTIONS):
+            flash("Wybierz prawidłową płeć postaci GM.", "error")
         else:
+            account_id = None
+            player_id = None
             try:
                 with db() as con:
                     with con.cursor() as cur:
+                        if authority != "PLAYER":
+                            cur.execute("SELECT id FROM player.player WHERE name=%s LIMIT 1", (gm_name,))
+                            if cur.fetchone():
+                                raise ValueError("Taki nick postaci już istnieje.")
+                        con.begin()
                         cur.execute("INSERT INTO account.account (login,password,social_id,email,status,empire) VALUES (%s,PASSWORD(%s),%s,%s,'OK',%s)", (login, password, deletion_code, email, empire if authority != "PLAYER" else 0))
                         if authority != "PLAYER":
+                            account_id = cur.lastrowid
+                            x, y, map_index = GM_EMPIRE_STARTS[empire]
+                            st, ht, dx, iq, hp, mp = GM_JOB_STARTS[gm_job]
+                            character_race = GM_RACE_BY_CLASS_GENDER[(gm_job, gm_gender)]
+                            cur.execute("""INSERT INTO player.player
+                              (account_id,name,job,dir,x,y,map_index,exit_x,exit_y,exit_map_index,hp,mp,stamina,random_hp,random_sp,level,st,ht,dx,iq,stat_point,skill_point,sub_skill_point,part_main,part_base,part_hair,skill_group,horse_hp,horse_stamina,horse_level,horse_hp_droptime,horse_riding,horse_skill_point,bank_value)
+                              VALUES (%s,%s,%s,0,%s,%s,%s,%s,%s,%s,%s,%s,1000,0,0,1,%s,%s,%s,%s,0,0,0,0,0,0,0,0,0,0,0,0,0,0)""",
+                              (account_id, gm_name, character_race, x, y, map_index, x, y, map_index, hp, mp, st, ht, dx, iq))
+                            player_id = cur.lastrowid
+                            # Metin reads character slots from player_index.  A player row
+                            # without this entry exists in SQL but is invisible at login.
+                            cur.execute("""INSERT INTO player.player_index (id,pid1,pid2,pid3,pid4,empire)
+                              VALUES (%s,%s,0,0,0,%s)
+                              ON DUPLICATE KEY UPDATE pid1=VALUES(pid1),pid2=0,pid3=0,pid4=0,empire=VALUES(empire)""",
+                              (account_id, player_id, empire))
                             cur.execute("INSERT INTO common.gmlist (mAccount,mName,mContactIP,mServerIP,mAuthority) VALUES (%s,%s,'','ALL',%s)", (login, gm_name, authority))
-                flash("Konto utworzone. Uprawnienia GM staną się aktywne po restarcie usług gry.")
+                        con.commit()
+                if authority != "PLAYER":
+                    flash(f"Utworzono konto i postać GM „{gm_name}”. Postać jest dostępna od razu; uprawnienia GM staną się aktywne po restarcie usług gry.")
+                else:
+                    flash("Konto utworzone.")
                 return redirect(url_for("accounts"))
-            except pymysql.MySQLError as exc:
-                flash(f"Nie utworzono konta: {exc.args[1] if len(exc.args)>1 else exc}", "error")
+            except (pymysql.MySQLError, ValueError) as exc:
+                try: con.rollback()
+                except Exception: pass
+                # The original Metin tables use MyISAM, so a failed multi-table
+                # creation is not rolled back by MariaDB.  Remove only records
+                # made by this request so an empty account is never left behind.
+                if account_id:
+                    try:
+                        with db() as cleanup_con:
+                            with cleanup_con.cursor() as cleanup:
+                                cleanup.execute("DELETE FROM common.gmlist WHERE mAccount=%s AND mName=%s", (login, gm_name))
+                                if player_id:
+                                    cleanup.execute("DELETE FROM player.player WHERE id=%s AND account_id=%s", (player_id, account_id))
+                                cleanup.execute("DELETE FROM player.player_index WHERE id=%s", (account_id,))
+                                cleanup.execute("DELETE FROM account.account WHERE id=%s AND login=%s", (account_id, login))
+                    except pymysql.MySQLError:
+                        pass
+                flash(f"Nie utworzono konta: {exc.args[1] if isinstance(exc, pymysql.MySQLError) and len(exc.args)>1 else exc}", "error")
     account_query = request.args.get("q", "").strip()[:60]
     display = request.args.get("display", "100")
     if display not in ("100", "1000", "all"):
@@ -899,7 +1430,7 @@ def accounts():
         query_sql += " LIMIT %s"
         params.append(int(display))
     recent = rows(query_sql, params)
-    return render_template("accounts.html", accounts=recent, authorities=authorities, account_query=account_query, display=display)
+    return render_template("accounts.html", accounts=recent, authorities=authorities, jobs=GM_JOB_OPTIONS, genders=GM_GENDER_OPTIONS, account_query=account_query, display=display)
 
 
 @app.route("/maps")
@@ -910,14 +1441,27 @@ def maps():
       FROM player.web_seban_map_snapshot
       WHERE captured_at >= NOW() - INTERVAL 24 HOUR ORDER BY captured_at ASC
     """)
-    labels, series = [], {}
+    labels, series = [], {index: {} for index, _name in TRACKED_MAP_OPTIONS}
     for row in raw:
+        index = int(row["map_index"] or 0)
+        if index not in series:
+            continue
         if row["label"] not in labels:
             labels.append(row["label"])
-        series.setdefault(map_name := MAP_NAMES.get(int(row["map_index"] or 0), f"Mapa #{row['map_index']}"), {})[row["label"]] = row["character_count"]
-    chart = {"labels": labels, "series": [{"name": key, "data": [values.get(label, 0) for label in labels]} for key, values in sorted(series.items())]}
-    latest = live_map_counts()
+        series[index][row["label"]] = int(row["character_count"] or 0)
+    chart = {"labels": labels, "series": [
+        {"id": index, "name": name, "data": [values.get(label, 0) for label in labels]}
+        for index, name in TRACKED_MAP_OPTIONS for values in (series[index],)
+    ]}
+    current = {int(row["map_index"]): row["character_count"] for row in live_map_counts()}
+    latest = [{"map_index": index, "character_count": current.get(index, 0)} for index, _name in TRACKED_MAP_OPTIONS]
     return render_template("maps.html", chart=chart, latest=latest)
+
+
+@app.route("/changelog")
+@login_required
+def changelog():
+    return render_template("changelog.html", entries=changelog_entries(), panel_version=PANEL_VERSION)
 
 
 @app.route("/api/live-bots")
@@ -957,7 +1501,7 @@ def rankings():
     kinds = {
         "level": "Poziom", "armor": "Zbroja", "weapon": "Broń", "weapon30": "Broń 30 Lv",
         "gold": "Yang", "items": "Przedmioty", "horse": "Koń", "hunting": "Polowanie", "biologist": "Biolog",
-        "shops": "Otwarte stragany", "skills": "Umiejętności", "plus9": "Przedmiot +9", "playtime": "Czas gry",
+        "shops": "Otwarte stragany", "skills": "Umiejętności", "plus9": "Przedmiot +9", "playtime": "Czas gry", "bosses": "Bossy",
     }
     kind = request.args.get("type", "level")
     if kind not in kinds:
@@ -968,9 +1512,11 @@ def rankings():
     ranking = bot_ranking(kind, weapon30_sort)
     ids = [row["id"] for row in ranking]
     if ids:
-        progress_rows = rows("SELECT id,level,exp FROM player.player WHERE id IN (" + ",".join(["%s"] * len(ids)) + ")", ids)
+        progress_rows = rows("SELECT id,level,exp,job FROM player.player WHERE id IN (" + ",".join(["%s"] * len(ids)) + ")", ids)
         progress = {row["id"]: experience_progress(row["level"], row["exp"]) for row in progress_rows}
+        jobs = {row["id"]: row["job"] for row in progress_rows}
         for row in ranking:
+            row["job"] = jobs.get(row["id"], 0)
             row["experience"] = progress.get(row["id"], {"percent": 0})
     for row in ranking:
         if kind == "weapon30":
@@ -983,22 +1529,28 @@ def rankings():
 
 @app.route("/season")
 def season():
-    """Public weekly season, calculated from existing server logs."""
+    """Weekly season from the three indexed event types only."""
+    if time.time() - _season_cache["at"] < 600:
+        return render_template("season.html", weekly=_season_cache["weekly"], records=_season_cache["records"])
     weekly = rows("""SELECT p.id,p.name,p.level,
         SUM(l.how='STONE_KILL') AS metins,
-        SUM(l.how LIKE '%%BOSS%%') AS bosses,
-        SUM(l.how='REFINE_SUCCESS' AND CAST(l.hint AS UNSIGNED)>=7) AS refine7
+        SUM(l.how='BOSS_KILL') AS bosses,
+        SUM(l.how='REFINE SUCCESS' AND (l.hint LIKE '%%+7' OR l.hint LIKE '%%+8' OR l.hint LIKE '%%+9')) AS refine7
         FROM log.log l JOIN player.player p ON p.id=l.who
         WHERE l.time>=NOW()-INTERVAL 7 DAY AND p.name LIKE 'bot%%'
-        GROUP BY p.id ORDER BY (SUM(l.how='STONE_KILL')*150+SUM(l.how LIKE '%%BOSS%%')*500+SUM(l.how='REFINE_SUCCESS' AND CAST(l.hint AS UNSIGNED)>=7)*200) DESC,p.level DESC LIMIT 30""")
+          AND l.how IN ('STONE_KILL','BOSS_KILL','REFINE SUCCESS')
+        GROUP BY p.id ORDER BY (SUM(l.how='STONE_KILL')*150+SUM(l.how='BOSS_KILL')*500+SUM(l.how='REFINE SUCCESS' AND (l.hint LIKE '%%+7' OR l.hint LIKE '%%+8' OR l.hint LIKE '%%+9'))*200) DESC,p.level DESC LIMIT 30""")
     for row in weekly:
         row["points"] = int(row.get("metins") or 0)*150 + int(row.get("bosses") or 0)*500 + int(row.get("refine7") or 0)*200
     records = one("""SELECT
-        (SELECT COUNT(*) FROM log.log WHERE how='STONE_KILL') AS metins,
-        (SELECT COUNT(*) FROM log.log WHERE how LIKE '%%BOSS%%') AS bosses,
-        (SELECT COUNT(*) FROM log.log WHERE how='REFINE_SUCCESS' AND CAST(hint AS UNSIGNED)>=7) AS refine7,
+        SUM(l.how='STONE_KILL') AS metins,
+        SUM(l.how='BOSS_KILL') AS bosses,
+        SUM(l.how='REFINE SUCCESS' AND (l.hint LIKE '%%+7' OR l.hint LIKE '%%+8' OR l.hint LIKE '%%+9')) AS refine7,
         (SELECT MAX(level) FROM player.player) AS level
-    """)
+        FROM log.log l
+        WHERE l.time>=NOW()-INTERVAL 7 DAY
+          AND l.how IN ('STONE_KILL','BOSS_KILL','REFINE SUCCESS')""")
+    _season_cache.update(at=time.time(), weekly=weekly, records=records)
     return render_template("season.html", weekly=weekly, records=records)
 
 
@@ -1006,7 +1558,30 @@ def season():
 @login_required
 def manage():
     map_counts = live_map_counts()
-    return render_template("manage.html", rates=read_rates(), ai_weights=read_ai_weights(), ai_weight_keys=AI_WEIGHT_KEYS, restart=restart_progress(), settings=settings(), map_counts=map_counts, bot_count=len(live_bots()))
+    current_settings = settings()
+    updater = update_status()
+    updater["protected"] = current_settings.get("auth_enabled") == "1" and bool(session.get("seban_admin"))
+    return render_template("manage.html", rates=read_rates(), ai_weights=read_ai_weights(), ai_weight_keys=AI_WEIGHT_KEYS, restart=restart_progress(), settings=current_settings, map_counts=map_counts, bot_count=len(live_bots()), map_respawn_options=MAP_RESPAWN_OPTIONS, map_stone_respawn_ids=MAP_STONE_RESPAWN_IDS, map_respawn_status=read_map_regen_status(), server_settings=server_settings_status(), updater=updater, playerbots_release=playerbots_release_status(), update_csrf=update_csrf_token())
+
+
+@app.post("/manage/update")
+@login_required
+def manage_update():
+    current = settings()
+    if current.get("auth_enabled") != "1" or not session.get("seban_admin"):
+        flash("Aktualizacje z panelu wymagają włączonej ochrony hasłem.", "error")
+        return redirect(url_for("manage"))
+    supplied = request.form.get("update_csrf", "")
+    expected = session.get("seban_update_csrf", "")
+    if not expected or not hmac.compare_digest(supplied, expected):
+        abort(403)
+    try:
+        queue_tieru_update()
+    except (OSError, RuntimeError) as exc:
+        flash(str(exc), "error")
+    else:
+        flash("Pobrano zlecenie aktualizacji. Serwer zostanie przebudowany przez odizolowany updater; postęp jest widoczny poniżej.")
+    return redirect(url_for("manage"))
 
 
 @app.post("/manage/settings")
@@ -1036,23 +1611,91 @@ def manage_settings():
     return redirect(url_for("manage"))
 
 
-@app.post("/manage/rates")
+@app.post("/manage/restart-config")
 @login_required
-def manage_rates():
+def manage_restart_config():
+    action = request.form.get("submit_action", "apply")
+    values, changes = {}, {}
     try:
-        values = {name: int(request.form.get(name, "")) for name in RATE_NAMES}
-    except ValueError:
-        flash("Wpisz całkowite wartości procentowe.", "error")
+        if action not in ("apply", "restart"):
+            raise ValueError("Nieprawidłowa akcja.")
+        if action == "apply":
+            values = {name: int(request.form.get(name, "")) for name in RATE_NAMES}
+            if any(not 1 <= value <= 10000 for value in values.values()):
+                raise ValueError("Mnożniki muszą mieścić się w zakresie 1–10 000%.")
+            for index, name in MAP_RESPAWN_OPTIONS:
+                for prefix in ("", "stone_"):
+                    if prefix and index not in MAP_STONE_RESPAWN_IDS:
+                        continue
+                    key = f"{prefix}{index}"
+                    # Older browser tabs do not contain the Metin fields.
+                    if f"map_{key}" not in request.form:
+                        continue
+                    raw = request.form[f"map_{key}"].strip()
+                    if not raw:
+                        changes[key] = "reset"
+                    else:
+                        seconds = int(raw)
+                        if not 1 <= seconds <= 3600:
+                            raise ValueError(f"{name}: respawn musi mieścić się w zakresie 1–3600 sekund.")
+                        changes[key] = seconds
+        queue_server_settings(action, values, changes)
+    except ValueError as exc:
+        flash(str(exc) if "invalid literal" not in str(exc) else "Wpisz całkowite wartości liczbowe.", "error")
+    except RuntimeError as exc:
+        flash(str(exc), "error")
+    except FileExistsError:
+        flash("Poprzednie zlecenie nadal trwa. Poczekaj na zakończenie restartu.", "error")
+    except OSError:
+        flash("Nie udało się zapisać zlecenia do kolejki gry.", "error")
+    else:
+        flash("Zestaw zapisany do kolejki: jeden restart zastosuje raty i respawn." if action == "apply"
+              else "Zlecono restart bez zapisywania zmian w formularzu.")
+    return redirect(url_for("manage"))
+
+
+@app.post("/manage/restart-clear-stale")
+@login_required
+def manage_restart_clear_stale():
+    support = server_settings_status()
+    if not support["can_clear"]:
+        flash("Nie można usunąć zlecenia: helper może jeszcze je przetwarzać albo zlecenie nie jest wystarczająco stare.", "error")
         return redirect(url_for("manage"))
-    if any(value < 1 or value > 10000 for value in values.values()):
-        flash("Każdy mnożnik musi mieścić się od 1% do 10 000%.", "error")
+    try:
+        (RATES_SPOOL / "server-settings.request").unlink()
+        (RATES_SPOOL / "server-settings.status").write_text(
+            "state=failed\npercent=0\nmessage=Usunięto zaległe zlecenie bez aktywnego helpera gry.\ntime=%s\n" % int(time.time()), encoding="utf-8")
+    except OSError:
+        flash("Nie udało się usunąć zaległego zlecenia z kolejki.", "error")
+    else:
+        flash("Usunięto zaległe zlecenie. Zainstaluj integrację gry, zanim zlecisz kolejną zmianę.")
+    return redirect(url_for("manage"))
+
+
+@app.post("/manage/map-respawns")
+@login_required
+def manage_map_respawns():
+    known_maps = {str(index) for index, _name in MAP_RESPAWN_OPTIONS}
+    map_index = request.form.get("map_index", "")
+    action = request.form.get("action", "")
+    if map_index not in known_maps or action not in ("set", "reset"):
+        flash("Nieprawidłowa mapa lub akcja.", "error")
         return redirect(url_for("manage"))
-    with db() as con:
-        with con.cursor() as cur:
-            for name, value in values.items():
-                cur.execute("INSERT INTO player.web_admin_rates (name,value) VALUES (%s,%s) ON DUPLICATE KEY UPDATE value=VALUES(value)", (name, value))
-    queue_rate_restart(values)
-    flash("Mnożniki zapisane. Serwer otrzymał polecenie bezpiecznego restartu.")
+    seconds = None
+    if action == "set":
+        try:
+            seconds = int(request.form.get("seconds", ""))
+        except ValueError:
+            seconds = 0
+        if not 1 <= seconds <= 3600:
+            flash("Czas respawnu musi mieścić się w zakresie 1–3600 sekund.", "error")
+            return redirect(url_for("manage"))
+    try:
+        queue_map_regen_change(map_index, action, seconds)
+    except OSError:
+        flash("Nie udało się zapisać zmiany mapy do kolejki gry.", "error")
+        return redirect(url_for("manage"))
+    flash("Zmiana respawnu została zlecona. Gra zastosuje ją i uruchomi rdzenie ponownie.")
     return redirect(url_for("manage"))
 
 
@@ -1069,10 +1712,21 @@ def manage_behavior():
             value = AI_WEIGHT_NEUTRAL
         values[key] = max(AI_WEIGHT_MIN, min(AI_WEIGHT_MAX, value))
     values["CHAT"] = 1 if "1" in request.form.getlist("CHAT") else 0
+    # Preserve the existing switch for a form opened before this field existed.
+    values["BOOKS"] = 1 if "BOOKS" not in request.form else (1 if "1" in request.form.getlist("BOOKS") else 0)
     try:
         values["SCRAP"] = max(0, min(100, int(request.form.get("SCRAP", values.get("SCRAP", 0)))))
     except (TypeError, ValueError):
         values["SCRAP"] = 0
+    for key in ("CHEST", "CHEST_STONE"):
+        if key not in request.form:
+            continue
+        try:
+            values[key] = max(0, min(1000, int(request.form[key])))
+        except (TypeError, ValueError):
+            # A malformed chest control must not turn an existing server value
+            # into a guessed default.
+            continue
     try:
         write_ai_weights(values)
     except OSError:
@@ -1097,14 +1751,19 @@ def manage_restart():
 @login_required
 def api_manage_status():
     status = read_rate_status()
-    return {"ok": True, "restart": restart_progress(), "last_restart_time": status.get("time"), "rates": read_rates(), "bots": len(live_bots()), "maps": live_map_counts()}
+    updater = update_status()
+    updater["protected"] = settings().get("auth_enabled") == "1" and bool(session.get("seban_admin"))
+    return {"ok": True, "restart": restart_progress(), "server_settings": server_settings_status(), "updater": updater, "rates": read_rates(), "bots": len(live_bots()), "maps": live_map_counts()}
 
 
 @app.route("/api/heat-events")
 @login_required
 def api_heat_events():
-    event_type = request.args.get("type", "deaths")
-    how = "STONE_KILL" if event_type == "metins" else "DEAD_BY_NPC"
+    event_type = request.args.get("type", "deaths").strip().lower()
+    event_types = {"deaths": "DEAD_BY_NPC", "metins": "STONE_KILL", "bosses": "BOSS_KILL"}
+    how = event_types.get(event_type)
+    if not how:
+        abort(400)
     raw = rows("""SELECT l.x,l.y,l.time,p.name FROM log.log l LEFT JOIN player.player p ON p.id=l.who
         WHERE l.type='CHARACTER' AND l.how=%s AND l.time >= NOW() - INTERVAL 24 HOUR ORDER BY l.time DESC LIMIT 4000""", (how,))
     events = []

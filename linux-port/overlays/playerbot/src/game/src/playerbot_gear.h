@@ -302,7 +302,38 @@ namespace
 			const BYTE weaponSubType = item->GetSubType();
 			if (weaponSubType == WEAPON_DAGGER || weaponSubType == WEAPON_BOW)
 				attack *= 2;
-			score += attack * 1000;
+
+			// The percent lines, as the engine applies them: average damage
+			// multiplies every ordinary hit, skill damage every cast, and both
+			// multiply *this weapon's* damage - so they scale the attack score
+			// rather than adding a flat few thousand beside a million. A
+			// ninja was found wearing a copper bow of 90-156 with a Deer Horn
+			// Bow +8 of 151-244 and +47% average in the bag; by the numbers
+			// the bag one is a third again better before the line is counted.
+			// Negative lines count too: -17% skill damage on that bow is
+			// seventeen percent of every cast.
+			long avgPct = 0, skillPct = 0;
+			for (int i = 0; i < ITEM_APPLY_MAX_NUM; ++i)
+			{
+				const BYTE t = item->GetProto()->aApplies[i].bType;
+				if (t == APPLY_NORMAL_HIT_DAMAGE_BONUS) avgPct += item->GetProto()->aApplies[i].lValue;
+				else if (t == APPLY_SKILL_DAMAGE_BONUS) skillPct += item->GetProto()->aApplies[i].lValue;
+			}
+			for (int i = 0; i < ITEM_ATTRIBUTE_MAX_NUM; ++i)
+			{
+				const BYTE t = item->GetAttributeType(i);
+				if (t == APPLY_NORMAL_HIT_DAMAGE_BONUS) avgPct += item->GetAttributeValue(i);
+				else if (t == APPLY_SKILL_DAMAGE_BONUS) skillPct += item->GetAttributeValue(i);
+			}
+			const int style = GetPlayerBotSchoolStyle(ch);
+			const int avgWeight = style < 0 ? PLAYERBOT_WEAPON_OWN_LINE_PERCENT
+					: (style > 0 ? PLAYERBOT_WEAPON_OTHER_LINE_PERCENT : 60);
+			const int skillWeight = style > 0 ? PLAYERBOT_WEAPON_OWN_LINE_PERCENT
+					: (style < 0 ? PLAYERBOT_WEAPON_OTHER_LINE_PERCENT : 60);
+			long long multiplier = 100 + (avgPct * avgWeight + skillPct * skillWeight) / 100;
+			if (multiplier < 20)
+				multiplier = 20;
+			score += attack * 1000 * multiplier / 100;
 
 			// A level-30 average-damage weapon used to be handed a flat 350000
 			// here. Damage is scored at a thousand a point, so that was more than
@@ -362,13 +393,23 @@ namespace
 			}
 		}
 
+		// A weapon's two damage-percent lines were folded into its attack
+		// above; everything else is a flat line.
+		const bool bWeaponPctDone = item->GetType() == ITEM_WEAPON;
 		for (int i = 0; i < ITEM_APPLY_MAX_NUM; ++i)
-			score += ScorePlayerBotApply(item->GetProto()->aApplies[i].bType,
-					item->GetProto()->aApplies[i].lValue, ch);
-
+		{
+			const BYTE t = item->GetProto()->aApplies[i].bType;
+			if (bWeaponPctDone && (t == APPLY_NORMAL_HIT_DAMAGE_BONUS || t == APPLY_SKILL_DAMAGE_BONUS))
+				continue;
+			score += ScorePlayerBotApply(t, item->GetProto()->aApplies[i].lValue, ch);
+		}
 		for (int i = 0; i < ITEM_ATTRIBUTE_MAX_NUM; ++i)
-			score += ScorePlayerBotApply(item->GetAttributeType(i),
-					item->GetAttributeValue(i), ch);
+		{
+			const BYTE t = item->GetAttributeType(i);
+			if (bWeaponPctDone && (t == APPLY_NORMAL_HIT_DAMAGE_BONUS || t == APPLY_SKILL_DAMAGE_BONUS))
+				continue;
+			score += ScorePlayerBotApply(t, item->GetAttributeValue(i), ch);
+		}
 
 		if (item->GetImmuneFlag() != 0)
 			score += 1000;
@@ -485,9 +526,16 @@ namespace
 		const WORD oldCell = oldItem->GetCell();
 		const DWORD vnum = oldItem->GetVnum();
 		const BYTE refine = oldItem->GetRefineLevel();
+		// Both ends of the gift, in log.log: the giver's history says where
+		// its spare went, the receiver's says where its new piece came from.
+		char szHint[64];
+		snprintf(szHint, sizeof(szHint), "%s", sharer.m_receiver->GetName());
+		LogManager::instance().ItemLog(ch, oldItem, "PLAYERBOT_GIFT_OUT", szHint);
 		oldItem->RemoveFromCharacter();
 		if (oldItem->AddToCharacter(sharer.m_receiver, TItemPos(INVENTORY, receiverCell)))
 		{
+			snprintf(szHint, sizeof(szHint), "%s", ch->GetName());
+			LogManager::instance().ItemLog(sharer.m_receiver, oldItem, "PLAYERBOT_GIFT_IN", szHint);
 			sys_log(0, "PLAYERBOT_AI: gifted reserve gear pid=%u name=%s -> target_pid=%u target_name=%s vnum=%u refine=%u improvement=%lld",
 					ch->GetPlayerID(), ch->GetName(), sharer.m_receiver->GetPlayerID(),
 					sharer.m_receiver->GetName(), vnum, refine, sharer.m_bestImprovement);
@@ -586,6 +634,12 @@ namespace
 		{
 			sys_log(0, "PLAYERBOT_AI: equipped upgrade pid=%u name=%s wear=%d old_vnum=%u new_vnum=%u old_score=%lld new_score=%lld",
 					ch->GetPlayerID(), ch->GetName(), bestWearCell, oldVnum, newVnum, oldScore, bestScore);
+			// The one line a player asks about first - "why is my top Sura
+			// suddenly without her +8" - is the swap, so it goes to log.log
+			// with what came off.
+			char szHint[64];
+			snprintf(szHint, sizeof(szHint), "slot %d zamiast %u", bestWearCell, oldVnum);
+			LogManager::instance().ItemLog(ch, bestItem, "PLAYERBOT_EQUIP", szHint);
 
 			if (bestOldItem)
 				SharePlayerBotOldGearNearby(ch, bestOldItem);
@@ -1017,6 +1071,29 @@ namespace
 				ch, GetPlayerBotProgressionBootsVnum(ch), WEAR_FOOTS);
 	}
 
+	// "Full eq" as a player says it: every slot filled and nothing on the
+	// progression ladder left to buy.
+	bool IsPlayerBotFullyEquipped(LPCHARACTER ch)
+	{
+		if (!ch || !ch->IsItemLoaded())
+			return false;
+		static const BYTE slots[] = {
+			WEAR_WEAPON, WEAR_BODY, WEAR_HEAD, WEAR_SHIELD,
+			WEAR_WRIST, WEAR_FOOTS, WEAR_NECK, WEAR_EAR
+		};
+		for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); ++i)
+			if (!ch->GetWear(slots[i]))
+				return false;
+		return !NeedsPlayerBotProgressionWeapon(ch) &&
+				!NeedsPlayerBotProgressionArmor(ch) &&
+				!NeedsPlayerBotProgressionShield(ch) &&
+				!NeedsPlayerBotProgressionHelmet(ch) &&
+				!NeedsPlayerBotProgressionBoots(ch) &&
+				!NeedsPlayerBotProgressionWrist(ch) &&
+				!NeedsPlayerBotProgressionNecklace(ch) &&
+				!NeedsPlayerBotProgressionEarring(ch);
+	}
+
 	bool IsPlayerBotSpecialLevel30Weapon(LPITEM item)
 	{
 		if (!item || item->GetType() != ITEM_WEAPON)
@@ -1188,18 +1265,30 @@ namespace
 		return true;
 	}
 
+	// Arrows this bot can nock now. A progression chest hands an archer the
+	// next tier early - 8003 wants level forty, 8004 forty-five - and counting
+	// those said "a hundred arrows, no need to buy" to a bot of thirty-four
+	// whose bow had nothing to fire: PrepareWeapon failed on every tick, the
+	// tick left through a town visit no frontier map can start, and twelve
+	// archers stood at arrival points for twenty minutes at a time.
+	bool IsPlayerBotUsableArrow(LPCHARACTER ch, LPITEM item)
+	{
+		return item && item->GetType() == ITEM_WEAPON && item->GetSubType() == WEAPON_ARROW &&
+				item->GetCount() > 0 && item->GetLevelLimit() <= ch->GetLevel();
+	}
+
 	int CountPlayerBotArrows(LPCHARACTER ch)
 	{
 		if (!ch)
 			return 0;
 		int count = 0;
 		LPITEM worn = ch->GetWear(WEAR_ARROW);
-		if (worn && worn->GetType() == ITEM_WEAPON && worn->GetSubType() == WEAPON_ARROW)
+		if (IsPlayerBotUsableArrow(ch, worn))
 			count += worn->GetCount();
 		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
 		{
 			LPITEM item = ch->GetInventoryItem(cell);
-			if (item && item->GetType() == ITEM_WEAPON && item->GetSubType() == WEAPON_ARROW)
+			if (IsPlayerBotUsableArrow(ch, item))
 				count += item->GetCount();
 		}
 		return count;
@@ -1216,11 +1305,22 @@ namespace
 		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
 		{
 			LPITEM item = ch->GetInventoryItem(cell);
-			if (item && item->GetType() == ITEM_WEAPON && item->GetSubType() == WEAPON_ARROW &&
-					item->GetCount() > 0 && ch->EquipItem(item, WEAR_ARROW))
+			if (IsPlayerBotUsableArrow(ch, item) && ch->EquipItem(item, WEAR_ARROW))
 				return true;
 		}
 		return false;
+	}
+
+	// Whether a shield slot is a slot this bot can fill at all: never with a
+	// bow or a two-handed weapon in hand. Counting it as "missing" for an
+	// archer made every archer critically short of town services for life -
+	// sent out of M3 the moment it arrived and straight back by the weapon
+	// hunt, fifteen seconds a round trip.
+	bool PlayerBotWantsShield(LPCHARACTER ch)
+	{
+		LPITEM weapon = ch ? ch->GetWear(WEAR_WEAPON) : NULL;
+		return !(weapon && weapon->GetType() == ITEM_WEAPON &&
+				(weapon->GetSubType() == WEAPON_BOW || weapon->GetSubType() == WEAPON_TWO_HANDED));
 	}
 
 	bool NeedsPlayerBotArrows(LPCHARACTER ch)
@@ -1363,6 +1463,37 @@ namespace
 		price /= 5;
 		price -= price * 3 / 100;
 		return price;
+	}
+
+	// Is this piece one the bot could put on right now, and better than what it
+	// already wears there?
+	//
+	// The stall listed any weapon or armour whose slot was already filled, which
+	// reads as "this is a spare" and nearly always is. A player handing a bot a
+	// pair of +9 boots does not fill an empty slot, it beats a full one - and the
+	// counter got there first, because the private shop pass runs at the top of
+	// the tick and the equipment pass three hundred lines below it. Reported from
+	// the Discord by three people in one afternoon, each of whom had just given a
+	// bot something good and watched it go on sale at the top of the counter: a
+	// spare at +6 or better is the highest-scoring thing a stall can carry.
+	//
+	// "Could put on right now" is the engine's own CanEquipNow, so a piece the
+	// bot has not grown into is not held off the market on a promise: a level-30
+	// sword in the bag of a bot of five is goods, and stays goods.
+	bool IsPlayerBotWearableUpgrade(LPCHARACTER ch, LPITEM item, WORD cell)
+	{
+		if (!IsPlayerBotEquipmentCandidate(ch, item))
+			return false;
+		const int wearCell = item->FindEquipCell(ch);
+		if (wearCell < 0 || wearCell >= WEAR_MAX_NUM)
+			return false;
+		LPITEM worn = ch->GetWear((BYTE)wearCell);
+		if (worn && IS_SET(worn->GetFlag(), ITEM_FLAG_IRREMOVABLE))
+			return false;
+		if (!ch->CanEquipNow(item, TItemPos(INVENTORY, cell)))
+			return false;
+		return !worn || GetPlayerBotEquipmentScore(item, ch) >
+				GetPlayerBotEquipmentScore(worn, ch);
 	}
 
 	enum EPlayerBotPotionSupply
@@ -1613,6 +1744,18 @@ namespace
 		}
 		if (bundle == 0)
 			return false;
+		// AutoGiveItem hands the item back even when it had nowhere to put it:
+		// with no free cell the bundle goes on the ground at the bot's feet, the
+		// bot pays, still "needs arrows", and buys again on the next pass - a
+		// market square carpeted in Wooden Arrows, twenty purchases an hour per
+		// archer. The junk sale has already run by now; a bag still full holds
+		// things worth keeping, and the arrows wait for the next visit.
+		if (ch->GetEmptyInventory(1) < 0)
+		{
+			sys_log(0, "PLAYERBOT_GEAR: no room for arrows pid=%u name=%s arrows=%d",
+					ch->GetPlayerID(), ch->GetName(), CountPlayerBotArrows(ch));
+			return false;
+		}
 
 		LPITEM arrows = ch->AutoGiveItem(
 				PLAYERBOT_WOODEN_ARROW_VNUM, bundle, -1, false);
@@ -1981,6 +2124,67 @@ namespace
 		}
 
 		return false;
+	}
+
+	// Every bot wears the third hand, and keeps wearing it.
+	//
+	// Without it a kill's yang lands on the ground as coin piles and the bot has
+	// to walk to each one; with it the engine credits the money on the spot
+	// (CHARACTER::RewardGold, IsEquipUniqueGroup(UNIQUE_GROUP_AUTOLOOT)). The
+	// bot spends its ticks fighting rather than fetching, and the hunting
+	// grounds stop filling with yang nobody collects.
+	//
+	// Nothing here is a purchase: the item is made, worn, and its wear clock
+	// wound back up before it can run out. See PLAYERBOT_THIRD_HAND_VNUM for
+	// why that clock has to be touched at all, and why it is 72018 and not the
+	// 71010 an item shop would sell.
+	void ManagePlayerBotThirdHand(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
+	{
+		if (!ch || !ch->IsItemLoaded() || ch->IsDead())
+			return;
+		if (dwNow < state.dwNextThirdHandTime)
+			return;
+		state.dwNextThirdHandTime = dwNow + PLAYERBOT_THIRD_HAND_INTERVAL;
+
+		// The bot's copy, worn or carried - carried counts, or a bot that could
+		// not put it on this minute would be handed another one every pass.
+		LPITEM hand = ch->GetWear(WEAR_UNIQUE1);
+		if (!hand || hand->GetVnum() != PLAYERBOT_THIRD_HAND_VNUM)
+			hand = ch->GetWear(WEAR_UNIQUE2);
+		if (hand && hand->GetVnum() != PLAYERBOT_THIRD_HAND_VNUM)
+			hand = NULL;
+		for (WORD cell = 0; cell < INVENTORY_MAX_NUM && !hand; ++cell)
+		{
+			LPITEM item = ch->GetInventoryItem(cell);
+			if (item && item->GetVnum() == PLAYERBOT_THIRD_HAND_VNUM)
+				hand = item;
+		}
+
+		if (!hand)
+		{
+			// AutoGiveItem hands the item over even when there is nowhere to put
+			// it, and it lands on the ground wearing the bot's name - the arrows
+			// and the stall bundles both learned this the hard way. Wait for a
+			// free cell instead.
+			if (ch->GetEmptyInventory(1) < 0)
+				return;
+			hand = ch->AutoGiveItem(PLAYERBOT_THIRD_HAND_VNUM, 1, -1, false);
+			if (!hand)
+				return;
+			sys_log(0, "PLAYERBOT_GEAR: third hand made pid=%u name=%s",
+					ch->GetPlayerID(), ch->GetName());
+		}
+
+		// CHARACTER::EquipItem refuses within a second and a half of an attack
+		// or a cast, which for a bot is most of its life - the first draft put
+		// the winding below behind a successful equip here and wound eight
+		// clocks out of six hundred. Trying is enough: what this pass does not
+		// manage, ManagePlayerBotEquipment picks out of the bag on its own.
+		if (!hand->IsEquipped())
+			ch->EquipItem(hand);
+
+		if (hand->GetSocket(ITEM_SOCKET_UNIQUE_REMAIN_TIME) < PLAYERBOT_THIRD_HAND_REWIND_BELOW)
+			hand->SetSocket(ITEM_SOCKET_UNIQUE_REMAIN_TIME, PLAYERBOT_THIRD_HAND_MINUTES);
 	}
 }
 

@@ -65,6 +65,32 @@ namespace
 		}
 	}
 
+	// The map a player would name, not the one the code names. Used by the
+	// travel line, which used to announce every journey as a hunt for
+	// experience whatever the errand actually was.
+	// Polish declines the destination, so the table carries the phrase that
+	// follows "ide" rather than the bare name: "Ide na Dolina Orkow" is not a
+	// sentence anybody would write.
+	const char* GetPlayerBotMapDestinationPl(long mapIndex)
+	{
+		switch (mapIndex)
+		{
+			case PLAYERBOT_MAP_CHUNJO_M1: return "do Joan";
+			case PLAYERBOT_MAP_CHUNJO_M2: return "do Bokjung";
+			case PLAYERBOT_MAP_CHUNJO_M3: return "do Pyungmoo";
+			case PLAYERBOT_MAP_MONKEY_EASY: return "do Lochu Malp";
+			case PLAYERBOT_MAP_MONKEY_MEDIUM: return "do Lochu Malp II";
+			case PLAYERBOT_MAP_MONKEY_HARD: return "do Lochu Malp III";
+			case PLAYERBOT_MAP_DESERT: return "na Pustynie Yongbi";
+			case PLAYERBOT_MAP_ORC_VALLEY: return "do Doliny Orkow";
+			case PLAYERBOT_MAP_SOHAN: return "na Gore Sohan";
+			case PLAYERBOT_MAP_SPIDER_V1: return "do Lochu Pajakow";
+			case PLAYERBOT_MAP_SPIDER_V2: return "do Lochu Pajakow 2";
+			case PLAYERBOT_MAP_HWANG: return "do Swiatyni Hwang";
+			default: return "";
+		}
+	}
+
 	const char* GetPlayerBotActionLabel(BYTE action)
 	{
 		switch (action)
@@ -83,6 +109,8 @@ namespace
 			case BOT_ACTION_STABLE: return "odwiedzam Stajennego";
 			case BOT_ACTION_STALL: return "prowadze stragan";
 			case BOT_ACTION_MARKET: return "jestem na zakupach";
+			case BOT_ACTION_LURE: return "podciagam moby dla PT";
+			case BOT_ACTION_TOWN_REST: return "chodze po straganach";
 			default: return "mysle";
 		}
 	}
@@ -130,6 +158,8 @@ namespace
 			case BOT_TOWN_PHASE_MISC_WAIT: return "Kupuje potki i sprzedaje lup";
 			case BOT_TOWN_PHASE_BLACKSMITH: return "Ide do kowala";
 			case BOT_TOWN_PHASE_BLACKSMITH_WAIT: return "Ulepszam ekwipunek";
+			case BOT_TOWN_PHASE_SAFEBOX: return "Ide do magazynu z ksiegami";
+			case BOT_TOWN_PHASE_SAFEBOX_WAIT: return "Oddaje ksiegi do magazynu";
 			case BOT_TOWN_PHASE_GATE_IN:
 			case BOT_TOWN_PHASE_GATE_CROSS_IN: return "Ide do miasta";
 			case BOT_TOWN_PHASE_GATE_OUT:
@@ -148,6 +178,19 @@ namespace
 		const char* goal = GetPlayerBotGoalLabel(state.bLongTermGoal);
 		if (state.bVisitingShop)
 		{
+			// "Handluje bronia (cel: zapasy)" says what the bot is standing at
+			// and nothing about what it came for. When the errand is potions,
+			// the numbers are the whole story - and they are the one thing an
+			// operator can check against the shelf.
+			if (state.bLongTermGoal == BOT_GOAL_RESTOCK)
+			{
+				size_t redCount = 0, blueCount = 0;
+				CountPlayerBotPotions(ch, redCount, blueCount);
+				snprintf(status, statusSize, "%s%s - potki %u/%u", prefix,
+						GetPlayerBotTownStatusLabel(state),
+						(unsigned int)redCount, (unsigned int)blueCount);
+				return;
+			}
 			snprintf(status, statusSize, "%s%s (cel: %s)", prefix,
 					GetPlayerBotTownStatusLabel(state), goal);
 			return;
@@ -157,6 +200,57 @@ namespace
 		{
 			snprintf(status, statusSize, "%sUciekam - mam malo HP", prefix);
 			return;
+		}
+		// An errand the watchdog interrupted, and the map the bot still means to
+		// leave for. The audit asked for exactly this pair - "Uzupelniam
+		// mikstury; potem Sohan" - because an observer cannot otherwise tell a
+		// bot that is stuck from one that is waiting.
+		// A keeper carrying its goods to the other town because this ring
+		// is full: the walk, not the goal, is what a player sees.
+		if (state.dwStallWalkUntil != 0 && get_dword_time() < state.dwStallWalkUntil &&
+				ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2 && !ch->GetMyShop())
+		{
+			snprintf(status, statusSize, "%sIde z towarem na targ w Joan", prefix);
+			return;
+		}
+		if (state.bServicePending)
+		{
+			const char* where = state.lDepartureMap != 0
+					? GetPlayerBotMapDestinationPl(state.lDepartureMap) : "";
+			if (where[0])
+				snprintf(status, statusSize, "%sCzekam na trase do handlarza; potem %s",
+						prefix, where);
+			else
+				snprintf(status, statusSize, "%sCzekam na trase do handlarza", prefix);
+			return;
+		}
+		// The luring course says which stage it is in, because "walking away
+		// from the party" and "bringing nine monsters back to it" look the same
+		// from outside and are not the same thing at all.
+		if (state.bLureStage != LURE_STAGE_NONE)
+		{
+			switch (state.bLureStage)
+			{
+				case LURE_STAGE_PLAN:
+					snprintf(status, statusSize, "%sSzykuje lur dla druzyny", prefix);
+					return;
+				case LURE_STAGE_RETURN:
+					snprintf(status, statusSize, "%sWracam do druzyny: prowadze %d mobow",
+							prefix, state.iLureChasing);
+					return;
+				case LURE_STAGE_HANDOFF:
+					snprintf(status, statusSize, "%sPrzekazuje moby: %d przyprowadzonych, %d nadal za mna",
+							prefix, state.iLureDelivered, state.iLureChasing);
+					return;
+				case LURE_STAGE_RECOVER:
+					snprintf(status, statusSize, "%sWstrzymuje lur: druzyna jeszcze walczy", prefix);
+					return;
+				default:
+					snprintf(status, statusSize, "%sLuruje dla PT: %u/%u grupy, sciga mnie %d",
+							prefix, (unsigned int)state.bLureGroupsTagged,
+							(unsigned int)state.bLureGroupsPlanned, state.iLureChasing);
+					return;
+			}
 		}
 		if (state.bRecoveringAfterDeath)
 		{
@@ -188,7 +282,24 @@ namespace
 					const int range = bow ? 800 : 280;
 					const int distance = DISTANCE_APPROX(
 							ch->GetX() - target->GetX(), ch->GetY() - target->GetY());
-					if (distance > range)
+					// Action plus what for. "Walcze z X" is only half of what an
+					// observer needs - the audit's complaint was that a status
+					// never says why this monster and not another one. The
+					// reason is the combat policy's own, recorded when it last
+					// looked at this target.
+					if (state.bLastCombatReason ==
+							(BYTE)playerbot_combat_value::ALLOW_SELF_DEFENSE)
+						snprintf(status, statusSize, "%sBronie sie przed %s", prefix,
+								target->GetName());
+					else if (state.bLastCombatReason ==
+							(BYTE)playerbot_combat_value::ALLOW_PARTY_DEFENSE)
+						snprintf(status, statusSize, "%sPomagam druzynie: %s", prefix,
+								target->GetName());
+					else if (state.bLastCombatReason ==
+							(BYTE)playerbot_combat_value::ALLOW_MATERIAL)
+						snprintf(status, statusSize, "%sZbieram material z %s", prefix,
+								target->GetName());
+					else if (distance > range)
 						snprintf(status, statusSize, "%sGonie %s", prefix, target->GetName());
 					else
 						snprintf(status, statusSize, "%sWalcze z %s", prefix, target->GetName());
@@ -203,7 +314,12 @@ namespace
 				snprintf(status, statusSize, "%sRegeneruje HP", prefix);
 				break;
 			case BOT_ACTION_TRAIN:
-				snprintf(status, statusSize, "%sWybieram profesje", prefix);
+				if (state.bVisitingShop &&
+						(state.bTownVisitPhase == BOT_TOWN_PHASE_SKILL_RESET ||
+						 state.bTownVisitPhase == BOT_TOWN_PHASE_SKILL_RESET_WAIT))
+					snprintf(status, statusSize, "%sResetuje umiejetnosci u staruszki", prefix);
+				else
+					snprintf(status, statusSize, "%sWybieram profesje", prefix);
 				break;
 			case BOT_ACTION_SHOP:
 				snprintf(status, statusSize, "%sHandluje", prefix);
@@ -237,24 +353,46 @@ namespace
 				break;
 			}
 			case BOT_ACTION_STABLE:
-				if (DISTANCE_APPROX(ch->GetX() - PLAYERBOT_STABLE_BOY_X,
-						ch->GetY() - PLAYERBOT_STABLE_BOY_Y) > 850)
+			{
+				// The stable keeper of the map the bot is on: measured against
+				// Joan's alone, a bot handing its medal over in Bokjung was
+				// "on its way" for the whole visit.
+				const bool inM2 = ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2;
+				const long stableX = inM2 ? PLAYERBOT_M2_STABLE_BOY_X : PLAYERBOT_STABLE_BOY_X;
+				const long stableY = inM2 ? PLAYERBOT_M2_STABLE_BOY_Y : PLAYERBOT_STABLE_BOY_Y;
+				const bool bFar = DISTANCE_APPROX(ch->GetX() - stableX, ch->GetY() - stableY) > 850;
+				if (IsPlayerBotBattleHorseEarned(ch))
+					snprintf(status, statusSize, bFar ? "%sIde do Stajennego po konia bojowego"
+							: "%sOdbieram konia bojowego u Stajennego", prefix);
+				else if (bFar)
 					snprintf(status, statusSize, "%sIde do Stajennego z medalem", prefix);
 				else
 					snprintf(status, statusSize, "%sOddaje medal konny (%u/21)", prefix,
 							(unsigned int)ch->GetHorseLevel());
 				break;
+			}
 			case BOT_ACTION_FISHING:
 				if (ch->CountSpecifyItem(PLAYERBOT_FISHING_BAIT_VNUM) <
 						PLAYERBOT_FISHING_BAIT_RESTOCK)
 					snprintf(status, statusSize, "%sIde do Rybaka po przynete", prefix);
 				else if (DISTANCE_APPROX(ch->GetX() - PLAYERBOT_FISHING_BANK_X,
-						ch->GetY() - PLAYERBOT_FISHING_BANK_Y) > 850)
+						ch->GetY() - PLAYERBOT_FISHING_BANK_Y) >
+						PLAYERBOT_FISHING_BANK_RADIUS)
 					snprintf(status, statusSize, "%sIde nad rzeke lowic ryby", prefix);
 				else if (state.bIsFishing)
 					snprintf(status, statusSize, "%sLowie ryby - czekam na branie", prefix);
+				else if (!IsPlayerBotHoldingRod(ch))
+					// The old text here was a plain else, so an angler standing at
+					// the water with no rod on its back announced that it was
+					// baiting one - which is what got reported as "bots put bait
+					// on weapons". Nothing was ever put on a weapon; the label
+					// was simply wrong about what the bot was doing.
+					snprintf(status, statusSize, "%sSzukam wedki", prefix);
 				else
 					snprintf(status, statusSize, "%sZakladam przynete na wedke", prefix);
+				break;
+			case BOT_ACTION_TOWN_REST:
+				snprintf(status, statusSize, "%sOgladam stragany", prefix);
 				break;
 			case BOT_ACTION_MARKET:
 				if (state.dwMarketStallVID != 0)
@@ -270,12 +408,81 @@ namespace
 						ch->CountSpecifyItem(PLAYERBOT_HORSE_MEDAL_VNUM) == 0 &&
 						state.bLongTermGoal == BOT_GOAL_HORSE)
 					snprintf(status, statusSize, "%sIde do Lochu Malp po Medal Konny", prefix);
-				else if (ch->CountSpecifyItem(PLAYERBOT_HORSE_MEDAL_VNUM) > 0)
+				else if (IsPlayerBotOnBattleHorseTrial(ch))
+					snprintf(status, statusSize, "%sZdobywam konia bojowego na pustyni (%d/%d)", prefix,
+							GetPlayerBotBattleHorseKills(ch), PLAYERBOT_BATTLE_HORSE_KILLS);
+				// Only a medal the bot can hand in. A horse at ten waits for
+				// level thirty-five, a medal dropper carries them for its
+				// counter, and both used to announce the stable keeper on every
+				// leg they rode - "idzie do stajennego przez godzine".
+				else if (ch->CountSpecifyItem(PLAYERBOT_HORSE_MEDAL_VNUM) > 0 &&
+						CanPlayerBotAdvanceHorse(ch))
 					snprintf(status, statusSize, "%sIde do najblizszego Stajennego z Medalem", prefix);
-				else if (ch->GetMapIndex() == PLAYERBOT_MAP_MONKEY_EASY)
-					snprintf(status, statusSize, "%sWychodze z Lochu Malp", prefix);
+				else if (IsPlayerBotMonkeyMap(ch->GetMapIndex()))
+				{
+					// Only when the bot has actually decided to go. This was a
+					// plain else on a monkey map, so every bot moving inside the
+					// dungeon announced that it was leaving - and moving is what
+					// a bot in here does all the time: the maze is eleven
+					// chambers joined only by GOTO NPCs, and crossing to the
+					// next one is a walk like any other. Reported from the
+					// Discord as "the bubble says they are leaving and they do
+					// not leave". They were not leaving. Leaving is instant when
+					// it happens at all - the exit is a direct map change, not a
+					// walk - so a bot that is still here is doing something else.
+					// Never "leaving" while the bot is still here, because
+					// leaving is not something that takes time: the exit is a
+					// direct map change made on the tick the decision is taken,
+					// so a bot anybody can still see in the dungeon is by
+					// definition not on its way out. Gating on the goal was not
+					// enough - BOT_GOAL_HORSE is what a medal expedition carries
+					// for its whole visit, so twenty-one of thirty bots still
+					// announced an exit they were nowhere near. Say the true
+					// thing instead: it is crossing the maze.
+					snprintf(status, statusSize, "%sSzukam drogi przez Loch Malp", prefix);
+				}
+				// "Szukam miejsca do expa (cel: zapasy)" was said over a bot
+				// walking to a merchant, which is the audit's example of a
+				// status that describes an action without its purpose. Say
+				// where the bot is going, and when the errand is not experience,
+				// say the errand instead.
+				else if (state.bLongTermGoal == BOT_GOAL_RESTOCK)
+					snprintf(status, statusSize, "%sIde do miasta po zapasy", prefix);
+				else if (state.bLongTermGoal == BOT_GOAL_REFINE)
+					snprintf(status, statusSize, "%sIde do kowala ulepszyc ekwipunek", prefix);
+				else if (state.bLongTermGoal == BOT_GOAL_BIOLOGIST)
+					snprintf(status, statusSize, "%sIde do Biologa", prefix);
+				else if (state.bLongTermGoal == BOT_GOAL_FISHING)
+					snprintf(status, statusSize, "%sIde nad rzeke lowic ryby", prefix);
+				else if (state.bLongTermGoal == BOT_GOAL_GET_EQUIPMENT)
+					snprintf(status, statusSize, "%sIde do miasta po ekwipunek", prefix);
 				else
-					snprintf(status, statusSize, "%sSzukam miejsca do expa (cel: %s)", prefix, goal);
+				{
+					const long wantMap = GetPlayerBotFrontierMapForLevel(ch);
+					const char* where = wantMap != 0 && wantMap != ch->GetMapIndex()
+							? GetPlayerBotMapDestinationPl(wantMap) : "";
+					// The frontier is reached from Bokjung through the
+					// Teleporter, at his price; a bot that cannot pay is not
+					// going anywhere, and "Ide na Gore Sohan" over a bot that
+					// has stood in Bokjung for an hour is what an operator
+					// reads as a bot that cannot find the portal.
+					if (where[0] && ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2 &&
+							ch->GetGold() < GetPlayerBotTeleporterFee(ch))
+						snprintf(status, statusSize, "%sZbieram yang na Teleporter %s (%d/%d)",
+								prefix, where, ch->GetGold(), GetPlayerBotTeleporterFee(ch));
+					else if (where[0])
+						snprintf(status, statusSize, "%sIde %s (cel: %s)", prefix,
+								where, goal);
+					else
+						snprintf(status, statusSize, "%sSzukam lepszego miejsca (cel: %s)",
+								prefix, goal);
+				}
+				break;
+			case BOT_ACTION_STALL:
+				// The head carries the sign in the world; the panel read
+				// "Planuje: poziom" for a keeper at its counter and an operator
+				// counted thirty-nine idle bots in the Joan square.
+				snprintf(status, statusSize, "%sProwadze stragan", prefix);
 				break;
 			default:
 				snprintf(status, statusSize, "%sPlanuje: %s", prefix, goal);

@@ -1,15 +1,20 @@
 {
   "schema": 1,
   "channel": "stable",
-  "publishedAt": "2026-09-07T08:34:00Z",
-  "statusMessage": "Aktualizacja 1.30.2. Do Lochu Pajakow V1 boty ida jak w grze: przez cala Pustynie Yongbi do bramy w prawym dolnym rogu i z powrotem, po drodze nie bijac mobow (najwyzej Metin wart poziomu). Pierwszy start po aktualizacji kompiluje gre na nowo, kilka minut dluzej.",
+  "publishedAt": "2026-09-09T20:32:00Z",
+  "statusMessage": "Aktualizacja 1.31.2. Panel zaawansowany 1.40.0 (motywy, portrety klas, flagi krolestw), poprawiony opis czytania ksiag.",
   "server": {
-    "version": "1.30.2",
-    "url": "https://github.com/TieruYT/metin2-playerbots/releases/download/v1.30.2/metin2-server-update-1.30.2.zip",
-    "sha256": "0372056948B5911C0B09F2DB8A44FBDD6AD943F087731B064A6EE5FF17B74336"
+    "version": "1.31.2",
+    "url": "https://github.com/TieruYT/metin2-playerbots/releases/download/v1.31.2/metin2-server-update-1.31.2.zip",
+    "sha256": "1510D738CA2C112780836C4494EDFDD8CA2896A0BB700B7F221C830E9A9A9C81"
   },
   "support": {
     "contactUrl": "https://discord.gg/pt5tvnrN6",
     "uploadUrl": ""
+  },
+  "client": {
+    "version": "1.31.1",
+    "url": "https://github.com/TieruYT/metin2-playerbots/releases/download/v1.31.1/metin2-client-update-1.31.1.zip",
+    "sha256": "53C419421C9DA9F20C166C701932AFDD59C5EF5B5392C139766DE0086E6C13D4"
   }
 }

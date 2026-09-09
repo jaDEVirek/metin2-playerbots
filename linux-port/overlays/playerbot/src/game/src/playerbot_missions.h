@@ -53,6 +53,20 @@ namespace
 
 	// The Orc Tooth quest has a second half: the teeth are in, and the quest
 	// waits in key_item for Jinunggyi's Soul Stone from the Elite Orcs.
+	// A specimen the bot has no mission left for: the row that wants it is
+	// handed in. Those used to stay in the bag for good ("niech dadza sklepik
+	// z zebami jesli maja nadmiar"); now they are goods. The soul stone is
+	// never surplus - it is the key to the second half of the Orc Tooth row.
+	bool IsPlayerBotBiologistSpecimenSurplus(LPCHARACTER ch, DWORD vnum)
+	{
+		if (!ch || vnum == PLAYERBOT_JINUNGGYI_STONE_VNUM)
+			return false;
+		for (size_t i = 0; i < PLAYERBOT_BIOLOGIST_MISSION_COUNT; ++i)
+			if (PLAYERBOT_BIOLOGIST_MISSIONS[i].itemVnum == vnum)
+				return IsPlayerBotBiologistMissionComplete(ch, i);
+		return false;
+	}
+
 	bool IsPlayerBotBiologistKeyPhase(LPCHARACTER ch, size_t missionIndex)
 	{
 		if (!ch || missionIndex != PLAYERBOT_BIOLOGIST_ORC_TOOTH_INDEX)
@@ -83,12 +97,21 @@ namespace
 	{
 		if (!ch)
 			return NULL;
-		// Three passes: a mission whose specimens the bot already carries, then
-		// one whose monster stands on this map, then the first left undone. A bot
+		// Four passes: a mission whose specimens the bot already carries, then
+		// one whose monster stands on this map, then the first left undone that
+		// the bot has not outgrown, and last the highest one it has left. A bot
 		// that outgrew the mushrooms and lives among the Orcs collects teeth
 		// instead of collecting nothing - and hands in what it carries before the
 		// map it hands in on offers it something else.
-		int carrying = -1, here = -1, first = -1;
+		//
+		// The fourth pass is what the Discord was missing. "First left undone"
+		// on its own hands a Sura of forty-two the Gango Root of level fifteen,
+		// whose monster stands in Joan; it never goes there, so the goal reads
+		// "Korzen Gango 0/5" while the bot hits Orcs and the whole chain stops
+		// at that row for the rest of the world too. The rows are seven separate
+		// quests, not one chain, so an outgrown row is stepped over rather than
+		// blocking the ones behind it.
+		int carrying = -1, here = -1, first = -1, last = -1;
 		for (size_t i = 0; i < PLAYERBOT_BIOLOGIST_MISSION_COUNT; ++i)
 		{
 			const TPlayerBotBiologistMission& mission = PLAYERBOT_BIOLOGIST_MISSIONS[i];
@@ -96,16 +119,38 @@ namespace
 				break;
 			if (IsPlayerBotBiologistMissionComplete(ch, i))
 				continue;
-			if (first < 0)
+			last = (int)i;
+			// Outgrown rows are stepped over by both of the middle passes. A bot
+			// of forty-two standing in Joan for a hand-in has the Gango Root's
+			// monster underfoot, and picking it there would leave it camped on
+			// level-fifteen ground for the rest of the evening; the row it is in
+			// town for is the one it is carrying.
+			const bool outgrown = (int)ch->GetLevel() >
+					(int)mission.requiredLevel + PLAYERBOT_BIOLOGIST_OUTGROWN_LEVELS;
+			if (first < 0 && !outgrown)
 				first = (int)i;
 			int required = 0;
 			const DWORD wanted = GetPlayerBotBiologistWantedItem(ch, i, &required);
-			if (carrying < 0 && ch->CountSpecifyItem(wanted) > 0)
+			// "Carrying" outranks everything, so it has to mean carrying enough.
+			// It used to mean one: a single Gango Root picked up on a fishing
+			// trip to Joan pinned a bot of forty to the level-fifteen row for
+			// good - the row is outgrown, so it never hunts the monster, so it
+			// never reaches the five it needs, so the panel read "Korzen Gango
+			// 0/5" beside a bot hitting Orcs. Measured: thirty-eight bots of
+			// twenty-six and up held the root, thirty-six of them with one to
+			// four, and that is the "wszystkie maja 4/7 Korzen Gango" from the
+			// Discord. An outgrown row is taken only when the bag already holds
+			// the whole hand-in; a row the bot has not outgrown keeps the old
+			// rule, because there it will hunt the rest.
+			const int held = ch->CountSpecifyItem(wanted);
+			if (carrying < 0 && held > 0 && (!outgrown || held >= required))
 				carrying = (int)i;
-			if (here < 0 && IsPlayerBotHuntingMobHosted(mission.mobVnum, ch->GetMapIndex()))
+			if (here < 0 && !outgrown &&
+					IsPlayerBotHuntingMobHosted(mission.mobVnum, ch->GetMapIndex()))
 				here = (int)i;
 		}
-		const int pick = carrying >= 0 ? carrying : (here >= 0 ? here : first);
+		const int pick = carrying >= 0 ? carrying
+				: (here >= 0 ? here : (first >= 0 ? first : last));
 		if (pick < 0)
 			return NULL;
 		if (outIndex)

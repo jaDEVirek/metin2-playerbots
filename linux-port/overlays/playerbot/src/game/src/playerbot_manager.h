@@ -25,17 +25,31 @@ class CPlayerBotManager : public singleton<CPlayerBotManager>
 		bool	IsManaged(DWORD dwPlayerID) const;
 		bool	IsRegistered(DWORD dwPlayerID);
 		size_t	GetCount() const;
+		// Registered identities not spawned right now, ascending, at most
+		// `limit` of them - the F9 panel's "bots ready to spawn" list.
+		void	GetAvailableBots(std::vector<DWORD>& out, size_t limit);
 
 	private:
 		typedef std::map<DWORD, LPDESC> TPlayerBotMap;
 		typedef std::map<DWORD, DWORD> THandleToPlayerMap;
 		typedef std::set<DWORD> TRegisteredPlayerBotSet;
+		// The account behind a registered bot: id and login, from the same
+		// registry query. A bot's descriptor is created without one, and the
+		// engine keys the safebox by the descriptor's account id - so with it
+		// left at zero every bot deposited into one shared box under account 0.
+		struct TPlayerBotAccount { DWORD dwID; std::string strLogin; };
+		typedef std::map<DWORD, TPlayerBotAccount> TPlayerBotAccountMap;
 
 		bool	LoadRegisteredBots();
+		// Says in one line why the cohort is smaller than the seed.
+		void	ReportPlayerBotRegistryShortfall(unsigned int usable);
+		// Re-queues registered identities that are not in the world.
+		void	TopUpMissingBots(DWORD dwNow);
 
 		TPlayerBotMap		m_mapBots;
 		THandleToPlayerMap	m_mapHandles;
 		TRegisteredPlayerBotSet m_setRegisteredBots;
+		TPlayerBotAccountMap	m_mapBotAccounts;
 		// Spawns still to be sent, and when the next batch goes. Filled by
 		// SpawnRegistered, drained by Update, see PLAYERBOT_SPAWN_WINDOW.
 		std::deque<DWORD>	m_dequePendingSpawns;
@@ -44,6 +58,8 @@ class CPlayerBotManager : public singleton<CPlayerBotManager>
 		BYTE			m_bPendingSpawnEmpire;
 		DWORD			m_dwSpawnWindowStarted;
 		size_t			m_uSpawnWindowTotal;
+		// When to count the world again and re-queue whoever is missing.
+		DWORD			m_dwNextTopUpTime;
 		bool			m_bRegistryLoaded;
 		bool			m_bRegistryAvailable;
 };
