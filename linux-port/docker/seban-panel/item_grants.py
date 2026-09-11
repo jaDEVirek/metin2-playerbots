@@ -5,11 +5,21 @@ import time
 
 from flask import abort, flash, redirect, render_template, request, session, url_for
 
-MAX_ITEM_COUNT, MAX_PENDING = 65535, 10
+# 200, bo tyle wynosi pelny stos i tyle jest w stanie wydac silnik za jednym
+# razem. pc.give_item2 czyta ilosc jako int i podaje ja do
+# CHARACTER::AutoGiveItem(DWORD, BYTE, ...) - jeden bajt: 256 staje sie zerem,
+# 300 czterdziestoma czterema, 65535 dwiescia piecdziesiecioma pieciema. Nic
+# tego nie zglaszalo, bo niezerowe item_id wygladalo na sukces, wiec paczka
+# konczyla sie statusem "Nadano" i mniejsza liczba sztuk, niz proszono.
+# Quest odrzuca teraz wszystko powyzej 200 statusem qty_too_big; panel nie
+# powinien takiej liczby w ogole proponowac.
+MAX_ITEM_COUNT, MAX_PENDING = 200, 10
 JOBS = (("", "Każda klasa"), ("0", "Wojownik"), ("1", "Ninja"), ("2", "Sura"), ("3", "Szaman"))
 TERMINAL = {"done": "Nadano", "has_item": "Już posiada", "full": "Brak miejsca w ekwipunku",
     "failed": "Gra nie mogła utworzyć przedmiotu", "bad_args": "Nieprawidłowy VNUM lub ilość",
     "no_skill": "Warunek nie jest już spełniony", "gone": "Postać nie istnieje",
+    "qty_too_big": "Ilość ponad 200 — gra nie wyda tego za jednym razem",
+    "partial": "Wydano mniej, niż proszono (sprawdź plecak)",
     "cancelled": "Anulowano", "review": "Wymaga sprawdzenia", "unknown_cmd": "Quest wymaga aktualizacji"}
 LABELS = {"waiting": "Czeka na wysłanie", "queued": "Przekazano aktywnej postaci", **TERMINAL}
 

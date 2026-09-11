@@ -697,7 +697,7 @@ namespace
 			return true;
 		std::set<DWORD> wantedDrops;
 		CollectPlayerBotWantedMaterials(ch, wantedDrops);
-		const bool huntBestials = ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2 &&
+		const bool huntBestials = IsPlayerBotM2Map(ch->GetMapIndex()) &&
 				ShouldPlayerBotHuntM2Bestials(ch);
 		const playerbot_combat_value::Decision decision =
 				DecidePlayerBotCombatValue(ch, target, state, true,
@@ -788,7 +788,7 @@ namespace
 				m_failedStones(failedStones),
 				m_failedTargets(failedTargets),
 				m_dwNow(dwNow),
-				m_huntM2Bestials(owner && owner->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2 &&
+				m_huntM2Bestials(owner && IsPlayerBotM2Map(owner->GetMapIndex()) &&
 						ShouldPlayerBotHuntM2Bestials(owner)),
 				m_pWantedDrops(NULL),
 				m_pState(NULL),
@@ -1624,8 +1624,7 @@ namespace
 		if (naturalTank)
 			*naturalTank = false;
 		if (!ch || ch->GetLevel() < 15 || ch->GetParty() ||
-				(ch->GetMapIndex() != PLAYERBOT_MAP_CHUNJO_M1 &&
-				 ch->GetMapIndex() != PLAYERBOT_MAP_CHUNJO_M2))
+				!IsPlayerBotVillageMap(ch->GetMapIndex()))
 			return false;
 		// Gathering four packs at once is the largest grind there is, so it
 		// answers to the map rule before anything else about the build.

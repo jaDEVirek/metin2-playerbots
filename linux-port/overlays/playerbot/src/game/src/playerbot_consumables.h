@@ -54,6 +54,22 @@ namespace
 		return item->GetCount() >= PLAYERBOT_CHEST_STALL_MIN_STACK;
 	}
 
+	// Ile pol plecaka jest naprawde puste.
+	//
+	// GetEmptyInventory(height) odpowiada na inne pytanie - "gdzie zmiesci sie
+	// jeden przedmiot tej wysokosci" - i nie da sie z niego zbudowac rezerwacji
+	// na kilka nagrod naraz.
+	int CountPlayerBotFreeInventoryCells(LPCHARACTER ch)
+	{
+		if (!ch)
+			return 0;
+		int free = 0;
+		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
+			if (!ch->GetInventoryItem(cell))
+				++free;
+		return free;
+	}
+
 	bool ManagePlayerBotChests(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
 	{
 		if (!ch || !ch->IsItemLoaded() || dwNow < state.dwNextChestTime)
@@ -72,7 +88,12 @@ namespace
 				LPITEM key = ch->GetInventoryItem(keyCell);
 				if (!key || key->GetType() != ITEM_TREASURE_KEY || key->GetValue(0) != box->GetValue(0))
 					continue;
-				if (ch->GetEmptyInventory(1) < 0)
+				// Miejsce na caly zestaw, a nie na jeden przedmiot: patrz
+				// PLAYERBOT_CHEST_FREE_CELLS. Wysokie przedmioty potrzebuja
+				// dodatkowo ciaglych trzech pol w jednej kolumnie, o co
+				// GetEmptyInventory(3) pyta wprost.
+				if (CountPlayerBotFreeInventoryCells(ch) < PLAYERBOT_CHEST_FREE_CELLS ||
+						ch->GetEmptyInventory(3) < 0)
 					return false;
 				const DWORD boxVnum = box->GetVnum(), keyVnum = key->GetVnum();
 				const int before = ch->GetEmptyInventory(1);
@@ -103,7 +124,9 @@ namespace
 					s_mapPlayerBotChestRefused.find(item->GetVnum());
 			if (refused != s_mapPlayerBotChestRefused.end() && dwNow < refused->second)
 				continue;
-			if (ch->GetEmptyInventory(1) < 0)
+			// Ta sama rezerwacja, co przy skrzyni na klucz.
+			if (CountPlayerBotFreeInventoryCells(ch) < PLAYERBOT_CHEST_FREE_CELLS ||
+					ch->GetEmptyInventory(3) < 0)
 				return false;
 			const int before = ch->GetEmptyInventory(1);
 			const DWORD chestVnum = item->GetVnum();

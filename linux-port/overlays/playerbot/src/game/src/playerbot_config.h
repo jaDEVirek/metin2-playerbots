@@ -300,6 +300,194 @@ namespace
 		sys_log(0, "PLAYERBOT_CONFIG: reloaded %d weights from %s", applied, szPath);
 	}
 
+	// --- The F9 panel's side of the same file ---------------------------------
+	//
+	// The web panel writes playerbot_weights.tsv and the core re-reads it every
+	// five seconds; the GM panel in the client is a second writer of the same
+	// file, so it goes through here rather than growing its own idea of the
+	// format. Two functions, both called from cmd_gm.cpp through
+	// playerbot_manager.h - nothing in this namespace is reachable from an
+	// engine translation unit.
+	//
+	// The order below is the panel's wire order and is fixed: the client zips
+	// its own row table against it by position (GM_PANEL_AI_WEIGHT_SERVER_ORDER
+	// in interfacemodule.py), so a name may be appended here and never moved.
+	const char* const PLAYERBOT_PANEL_WEIGHT_ORDER[] = {
+		"RESTOCK", "REFINE", "SKILL", "HORSE", "BIOLOG", "METIN", "PARTY",
+		"HUNTING", "LEVEL", "FISHING", "TRADE",
+		"CHAT", "BOOKS", "NIGHT", "SCRAP", "CHEST", "CHEST_STONE",
+	};
+	const size_t PLAYERBOT_PANEL_WEIGHT_COUNT =
+			sizeof(PLAYERBOT_PANEL_WEIGHT_ORDER) / sizeof(PLAYERBOT_PANEL_WEIGHT_ORDER[0]);
+
+	// What the file would have to say to produce the state the core is in.
+	// -1 for the two chest keys while no file has set them: the chest odds then
+	// come from CONFIG and the panel must show "-" rather than a number it did
+	// not choose, or the first slider drag would silently take them over.
+	long GetPlayerBotPanelWeightValue(const char* szKey)
+	{
+		if (PlayerBotWeightNameEquals(szKey, "CHAT"))
+			return s_bPlayerBotOverheadChat ? 1 : 0;
+		if (PlayerBotWeightNameEquals(szKey, "BOOKS"))
+			return s_bPlayerBotFastBooks ? 1 : 0;
+		if (PlayerBotWeightNameEquals(szKey, "NIGHT"))
+			return s_bPlayerBotNight ? 1 : 0;
+		if (PlayerBotWeightNameEquals(szKey, "SCRAP"))
+			return s_iPlayerBotScrapPercent;
+		if (PlayerBotWeightNameEquals(szKey, "CHEST"))
+			return s_bPlayerBotChestFromFile ? g_iMoonlightChestPermille : -1;
+		if (PlayerBotWeightNameEquals(szKey, "CHEST_STONE"))
+			return s_bPlayerBotChestFromFile ? g_iMoonlightChestStonePermille : -1;
+		for (size_t i = 0; i < sizeof(PLAYERBOT_WEIGHT_NAMES) /
+				sizeof(PLAYERBOT_WEIGHT_NAMES[0]); ++i)
+		{
+			if (PlayerBotWeightNameEquals(szKey, PLAYERBOT_WEIGHT_NAMES[i].szName))
+				return s_aiPlayerBotWeights[PLAYERBOT_WEIGHT_NAMES[i].bWeight];
+		}
+		return -1;
+	}
+
+	bool BuildPlayerBotPanelWeightReport(char* szOut, size_t len)
+	{
+		if (!szOut || len == 0)
+			return false;
+		szOut[0] = '\0';
+		size_t used = 0;
+		for (size_t i = 0; i < PLAYERBOT_PANEL_WEIGHT_COUNT; ++i)
+		{
+			const int written = snprintf(szOut + used, len - used, "%s%ld",
+					i ? "|" : "", GetPlayerBotPanelWeightValue(PLAYERBOT_PANEL_WEIGHT_ORDER[i]));
+			if (written < 0 || (size_t)written >= len - used)
+				return false;
+			used += (size_t)written;
+		}
+		return true;
+	}
+
+	// The bounds each key is written within. The reader clamps too, but a file
+	// an operator opens should not carry a number the core would refuse - and
+	// the panel is not the only thing that reads it.
+	bool ClampPlayerBotPanelWeightValue(const char* szKey, long& value)
+	{
+		if (PlayerBotWeightNameEquals(szKey, "CHAT") ||
+				PlayerBotWeightNameEquals(szKey, "BOOKS") ||
+				PlayerBotWeightNameEquals(szKey, "NIGHT"))
+		{
+			value = value ? 1 : 0;
+			return true;
+		}
+		if (PlayerBotWeightNameEquals(szKey, "SCRAP"))
+		{
+			value = value < 0 ? 0 : (value > 100 ? 100 : value);
+			return true;
+		}
+		if (PlayerBotWeightNameEquals(szKey, "CHEST") ||
+				PlayerBotWeightNameEquals(szKey, "CHEST_STONE"))
+		{
+			value = value < 0 ? 0 : (value > 1000 ? 1000 : value);
+			return true;
+		}
+		for (size_t i = 0; i < sizeof(PLAYERBOT_WEIGHT_NAMES) /
+				sizeof(PLAYERBOT_WEIGHT_NAMES[0]); ++i)
+		{
+			if (!PlayerBotWeightNameEquals(szKey, PLAYERBOT_WEIGHT_NAMES[i].szName))
+				continue;
+			value = ClampPlayerBotWeight(value);
+			return true;
+		}
+		return false;
+	}
+
+	// One key changed, everything else in the file kept as it stands - the
+	// comments at the top included, because an operator reads them and the web
+	// panel wrote them. Written beside the file and renamed over it, so a core
+	// re-reading on its five-second clock never sees a half-written table.
+	//
+	// The game runs as metin2 and the spool is group-writable (gid m2spool in
+	// both images), which is what makes the rename possible over a file the
+	// panel container created as root.
+	bool WritePlayerBotPanelWeight(const char* szKey, long value)
+	{
+		if (!szKey || !*szKey)
+			return false;
+		if (!ClampPlayerBotPanelWeightValue(szKey, value))
+			return false;   // a name this core does not know; refuse rather than append
+
+		const char* szPath = GetPlayerBotWeightPath();
+		std::vector<std::string> lines;
+		bool replaced = false;
+		FILE* fp = fopen(szPath, "r");
+		if (fp)
+		{
+			char line[512];
+			while (fgets(line, sizeof(line), fp))
+			{
+				// The key is the first field of a line that is not a comment.
+				// Everything else - blank lines, the header, a key we are not
+				// touching - is copied through byte for byte.
+				const char* cursor = line;
+				while (*cursor == ' ' || *cursor == '\t')
+					++cursor;
+				if (*cursor != '#' && *cursor != '\0' && *cursor != '\r' && *cursor != '\n')
+				{
+					const char* keyStart = cursor;
+					while (*cursor && *cursor != ' ' && *cursor != '\t' &&
+							*cursor != '\r' && *cursor != '\n')
+						++cursor;
+					const std::string found(keyStart, (size_t)(cursor - keyStart));
+					if (PlayerBotWeightNameEquals(found.c_str(), szKey))
+					{
+						char rewritten[64];
+						snprintf(rewritten, sizeof(rewritten), "%s\t%ld\n", szKey, value);
+						lines.push_back(std::string(rewritten));
+						replaced = true;
+						continue;
+					}
+				}
+				lines.push_back(std::string(line));
+			}
+			fclose(fp);
+		}
+		if (!replaced)
+		{
+			char appended[64];
+			snprintf(appended, sizeof(appended), "%s\t%ld\n", szKey, value);
+			lines.push_back(std::string(appended));
+		}
+
+		char szTemp[256];
+		snprintf(szTemp, sizeof(szTemp), "%s.gmpanel", szPath);
+		FILE* out = fopen(szTemp, "w");
+		if (!out)
+		{
+			sys_err("PLAYERBOT_CONFIG: cannot write %s", szTemp);
+			return false;
+		}
+		for (size_t i = 0; i < lines.size(); ++i)
+		{
+			if (fputs(lines[i].c_str(), out) == EOF)
+			{
+				fclose(out);
+				unlink(szTemp);
+				sys_err("PLAYERBOT_CONFIG: short write to %s", szTemp);
+				return false;
+			}
+		}
+		if (fclose(out) != 0 || rename(szTemp, szPath) != 0)
+		{
+			unlink(szTemp);
+			sys_err("PLAYERBOT_CONFIG: cannot replace %s", szPath);
+			return false;
+		}
+
+		// Applied here as well as written: the reload would pick it up within
+		// five seconds anyway, but a GM dragging a slider watches the world and
+		// not the clock, and the file's own mtime check makes this harmless.
+		ApplyPlayerBotWeightLine(szKey, value);
+		sys_log(0, "PLAYERBOT_CONFIG: F9 panel set %s = %ld", szKey, value);
+		return true;
+	}
+
 	// Called once per tick. Does nothing at all between checks, and nothing but
 	// a stat(2) when the file has not changed since the last one.
 	void RefreshPlayerBotWeights(DWORD dwNow)

@@ -192,6 +192,13 @@ def main():
         return
     if cmd == 'repack':
         out_base, repl = sys.argv[3], sys.argv[4]
+        # A file in the replacement directory that the archive does not already
+        # hold is almost always a mistake - a note, a backup, an editor's stray
+        # copy - and the client cannot read it anyway: nothing imports a module
+        # that was not in root.epk before. It used to be added silently, which
+        # is how a README.md written beside the four panel sources ended up
+        # inside the pack. --allow-new says "yes, really add it".
+        allow_new = '--allow-new' in sys.argv[5:]
         replacements = {}
         for root, _, names in os.walk(repl):
             for n in names:
@@ -210,6 +217,11 @@ def main():
                 seen.add(key)
                 print('replaced', e['name'], len(data))
             files.append((e['name'], data, e['type'] if e['type'] in (0, 1, 2) else default_type))
+        if replacements and not allow_new:
+            raise SystemExit(
+                    'refusing to add files the archive does not have: ' +
+                    ', '.join(sorted(replacements)) +
+                    '\n(pass --allow-new if that is really what you want)')
         for key, data in sorted(replacements.items()):
             print('added', key, len(data))
             files.append((key, data, default_type))

@@ -1,4 +1,11 @@
-# Klient (`linux-port/client-root/`): pliki, które podmieniamy w `pack/root.epk`
+# Klient (`linux-port/client-root/`): pliki, ktore podmieniamy w `pack/root.epk`
+
+> Ten opis lezy obok katalogu, a nie w nim. `tools/eterpack.py repack`
+> bierze *kazdy* plik z katalogu podmian, wiec README lezacy w srodku
+> wjezdzal do paczki klienta jako `readme.md`. Teraz repack odmawia
+> dokladania plikow, ktorych archiwum nie ma, ale opis i tak nie ma tam
+> czego szukac.
+
 
 Klient r40250 trzyma skrypty w `pack/root.epk` (indeks w `root.eix`). Nic na
 maszynie gracza nie dopisze pliku do tego archiwum, więc zmiana po stronie

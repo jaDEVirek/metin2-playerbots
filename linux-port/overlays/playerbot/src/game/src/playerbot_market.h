@@ -374,10 +374,14 @@ namespace
 		// Joan was looked at and had nothing this bot wanted, so Bokjung is
 		// worth a walk for a while. Without this a shopper would cross to the
 		// quiet market for ever and never see the busy one.
-		if (ch && ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M1 && state.bMarketTrip)
+		// A walk to Joan that ran out of time counts as Joan looked at, or the
+		// next shopping pass would set off again from wherever it gave up.
+		if (ch && state.bMarketTrip &&
+				(IsPlayerBotM1Map(ch->GetMapIndex()) || state.bMarketToJoan))
 			state.dwMarketM2AllowedUntil = get_dword_time() +
 					PLAYERBOT_MARKET_M2_FALLBACK;
 		state.bMarketTrip = false;
+		state.bMarketToJoan = false;
 		state.dwMarketTripUntil = 0;
 		state.dwMarketBrowseTime = 0;
 		state.dwMarketStallVID = 0;
@@ -405,6 +409,48 @@ namespace
 			EndPlayerBotMarketTrip(ch, state,
 					dwNow >= state.dwMarketTripUntil ? "timeout" : "broke");
 			return false;
+		}
+		// The first leg of a "Joan first" trip: keep walking the portal until
+		// the map changes. The shopping pass runs every two to five minutes,
+		// and asking for the portal once left the route to the tick's
+		// continuation passes - which walked the bot to the gate cell and
+		// then handed it to the wander. 152 of 160 walks to that gate in ten
+		// minutes were this, with one crossing; the bots stood at the gate
+		// with "Sohan" or "Monkey Dungeon" over their heads and rode off.
+		if (state.bMarketToJoan)
+		{
+			if (!IsPlayerBotM2Map(ch->GetMapIndex()))
+			{
+				state.bMarketToJoan = false;
+				state.dwMarketTripUntil = dwNow + PLAYERBOT_MARKET_TRIP_TIMEOUT;
+				state.dwMarketBrowseTime = dwNow;
+			}
+			else
+			{
+				if (state.lDepartureMap != 0)
+				{
+					EndPlayerBotMarketTrip(ch, state, "departure_set");
+					return false;
+				}
+				// This kingdom's own gate and this kingdom's own first village.
+				// The walk is the same one it has always been; which market it
+				// ends at is whichever one the bot's second village opens onto.
+				const int owner = playerbot_empire_rules::GetMapOwnerEmpire(ch->GetMapIndex());
+				const long firstVillage = playerbot_empire_rules::GetHomeMap(owner,
+						playerbot_empire_rules::MAP_ROLE_M1);
+				playerbot_empire_rules::TKingdomGate gate;
+				playerbot_empire_rules::TPoint pitch;
+				if (!playerbot_empire_rules::FindKingdomGate(owner, ch->GetMapIndex(),
+							firstVillage, gate) ||
+						!playerbot_empire_rules::GetTownPitch(firstVillage, pitch))
+				{
+					EndPlayerBotMarketTrip(ch, state, "no_gate_home");
+					return false;
+				}
+				return MovePlayerBotToWorldPortal(ch, state,
+						gate.gate.x, gate.gate.y,
+						firstVillage, pitch.x, pitch.y, dwNow, "market_to_m1");
+			}
 		}
 		SetPlayerBotAction(state, BOT_ACTION_MARKET, dwNow);
 
@@ -536,16 +582,21 @@ namespace
 		// counters customers, and it is also what stops five hundred bots
 		// circling the same seven stalls. Bokjung opens up again for a while
 		// once Joan has been looked at and had nothing.
-		if (!haveStallInReach && ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2 &&
-				dwNow >= state.dwMarketM2AllowedUntil)
+		// Only for a bot whose place is Bokjung: one that is leaving for the
+		// frontier, or is held back from it by an errand, shops in reach and
+		// goes - the same line the stall's walk to Joan draws.
+		if (!haveStallInReach && IsPlayerBotM2Map(ch->GetMapIndex()) &&
+				dwNow >= state.dwMarketM2AllowedUntil &&
+				state.lDepartureMap == 0 && GetPlayerBotFrontierMapForLevel(ch) == 0)
 		{
-			PlayerBotLogThrottled("market_to_m1", dwNow,
-					"PLAYERBOT_MARKET: looking in Joan first pid=%u name=%s",
-					ch->GetPlayerID(), ch->GetName());
-			return MovePlayerBotToWorldPortal(ch, state,
-					PLAYERBOT_M2_TO_M1_PORTAL_X, PLAYERBOT_M2_TO_M1_PORTAL_Y,
-					PLAYERBOT_MAP_CHUNJO_M1, PLAYERBOT_M1_GUARD_X,
-					PLAYERBOT_M1_GUARD_Y, dwNow, "market_to_m1");
+			state.bMarketTrip = true;
+			state.bMarketToJoan = true;
+			state.dwMarketTripUntil = dwNow + PLAYERBOT_MARKET_JOAN_WALK_TIMEOUT;
+			state.dwMarketBrowseTime = 0;
+			state.dwMarketStallVID = 0;
+			sys_log(0, "PLAYERBOT_MARKET: looking in Joan first pid=%u name=%s pos=(%ld,%ld)",
+					ch->GetPlayerID(), ch->GetName(), ch->GetX(), ch->GetY());
+			return ContinuePlayerBotMarketTrip(ch, state, dwNow, pitchX, pitchY);
 		}
 		if (!haveStallInReach &&
 				DISTANCE_APPROX(ch->GetX() - pitchX, ch->GetY() - pitchY) >
@@ -604,7 +655,7 @@ namespace
 			if (ch->GetMyShop() && !state.vecShopOffers.empty())
 			{
 				++stalls;
-				if (ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2)
+				if (IsPlayerBotM2Map(ch->GetMapIndex()))
 					++s_iPlayerBotStallsInM2;
 				for (size_t k = 0; k < state.vecShopOffers.size(); ++k)
 				{

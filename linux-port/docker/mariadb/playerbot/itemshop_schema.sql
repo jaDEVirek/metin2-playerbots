@@ -113,8 +113,17 @@ SELECT * FROM (SELECT
  UNION ALL SELECT 15, 4, 'Niebieska Perla', 'Material do wysokich ulepszen.', 30, 'mileage', 27993, 1, '27993'
  UNION ALL SELECT 16, 4, 'Krwawa Perla', 'Material do wysokich ulepszen.', 50, 'mileage', 27994, 1, '27994'
  UNION ALL SELECT 17, 4, 'Wino z Kwiatu Brzoskwini x5', 'Napoj.', 8, 'mileage', 70020, 5, '70020'
+ UNION ALL SELECT 18, 2, 'Ksiega Zapomnienia', 'Cofa jeden punkt wybranej umiejetnosci - dla umiejetnosci, ktora utknela na 17 po trzydziestym poziomie.', 30, 'cash', 70037, 1, '70037'
 ) AS seed
 WHERE NOT EXISTS (SELECT 1 FROM itemshop.ishop_items);
+
+-- Added after the first shops were seeded; a shop that already exists gets
+-- it once, under the next free id, and never twice.
+INSERT INTO itemshop.ishop_items (id, category, name_item, `desc`, price, currency, vnum, count, vnum_icon)
+SELECT (SELECT COALESCE(MAX(id), 0) + 1 FROM (SELECT id FROM itemshop.ishop_items) AS ids), 2,
+   'Ksiega Zapomnienia', 'Cofa jeden punkt wybranej umiejetnosci - dla umiejetnosci, ktora utknela na 17 po trzydziestym poziomie.', 30, 'cash', 70037, 1, '70037'
+FROM DUAL
+WHERE NOT EXISTS (SELECT 1 FROM itemshop.ishop_items WHERE vnum = 70037);
 
 INSERT INTO itemshop.wheel_prizes (id, level, is_jackpot, name_item, item_desc, vnum, vnum_icon, count, weight)
 SELECT * FROM (SELECT

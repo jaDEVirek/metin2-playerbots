@@ -155,8 +155,16 @@ $script:Strings = @{
         diagnostics  = 'DIAGNOSTYKA'
         openLog      = 'OTWORZ LOG'
         logFolder    = 'FOLDER LOGOW'
-        botCount     = 'LICZBA BOTOW (0-1500)'
+        botCount     = 'LICZBA BOTOW (0-2500)'
         importDb     = 'IMPORTUJ BAZE'
+        worldBackup  = 'KOPIA SWIATA'
+        backupDialog = 'Kopia swiata'
+        backupInfo   = 'Kopia zapisuje caly swiat - postacie, poziomy, ekwipunek, boty i konta gry - do jednego pliku zip w folderze backups. Serwer zostanie na czas kazdej z tych operacji zatrzymany i zapisany.'
+        backupMake   = 'Zapisz kopie swiata'
+        backupLoad   = 'Przywroc swiat z kopii'
+        backupReset  = 'Zacznij od zera (swieza instalacja)'
+        backupPick   = 'Wybierz plik kopii'
+        backupNone   = 'W folderze backups nie ma jeszcze zadnej kopii. Zapisz najpierw kopie.'
         repairDb     = 'NAPRAW DOSTEP DO BAZY'
         dbAccess     = 'DANE DO BAZY (NAVICAT)'
         gmPanel      = 'PANEL GM F9 (TEST)'
@@ -174,6 +182,7 @@ $script:Strings = @{
         panelInfo    = 'Oba panele pokazuja ten sam swiat i dzialaja jednoczesnie.'
         panelClassic = "Oryginalny panel`r`nmapa i sterowanie"
         panelSeban   = "Zaawansowany panel seban latino`r`nprofile, rankingi, gospodarka, obciazenie"
+        panelPw      = 'Nie moge sie zalogowac (haslo do panelu)'
         importDialog = 'Importuj baze z innej instalacji'
         importInfo   = 'Wybierz zrodlowa instalacje. Jej swiat (postacie, poziomy, ekwipunek) zostanie skopiowany do biezacej instalacji.'
         importOk     = 'Importuj'
@@ -194,8 +203,16 @@ $script:Strings = @{
         diagnostics  = 'DIAGNOSTICS'
         openLog      = 'OPEN LOG'
         logFolder    = 'LOG FOLDER'
-        botCount     = 'BOT COUNT (0-1500)'
+        botCount     = 'BOT COUNT (0-2500)'
         importDb     = 'IMPORT DATABASE'
+        worldBackup  = 'WORLD BACKUP'
+        backupDialog = 'World backup'
+        backupInfo   = 'A backup writes the whole world - characters, levels, equipment, bots and game accounts - into one zip file in the backups folder. The server is stopped and saved for each of these operations.'
+        backupMake   = 'Save a backup'
+        backupLoad   = 'Restore from a backup'
+        backupReset  = 'Start over (fresh install)'
+        backupPick   = 'Choose a backup file'
+        backupNone   = 'There is no backup in the backups folder yet. Save one first.'
         repairDb     = 'REPAIR DATABASE ACCESS'
         dbAccess     = 'DATABASE LOGIN (NAVICAT)'
         gmPanel      = 'GM PANEL F9 (BETA)'
@@ -213,6 +230,7 @@ $script:Strings = @{
         panelInfo    = 'Both panels show the same world and run at the same time.'
         panelClassic = "Original panel`r`nmap and controls"
         panelSeban   = "Advanced panel by seban latino`r`nprofiles, rankings, economy, load"
+        panelPw      = 'I cannot log in (panel password)'
         importDialog = 'Import a database from another installation'
         importInfo   = 'Pick the source installation. Its world - characters, levels, equipment - is copied into this one.'
         importOk     = 'Import'
@@ -612,8 +630,12 @@ function Get-InstalledServerVersion {
 function Show-BotCountDialog {
     # Slider instead of a typed number: the range is a property of the world, and
     # dragging is far friendlier than guessing a value. The maximum matches the
-    # canonical cohort the seed creates (PID 4..1503); how many of those a world
-    # can actually spawn depends on its registry, which is often smaller.
+    # canonical cohort the seed creates - 1500 for Chunjo alone (PID 4..1503) and
+    # 2500 once the other two kingdoms are switched on (M2_PLAYERBOT_KINGDOMS=1,
+    # PID 4..2503). It stopped at 1500 while the world already held 2500, so a
+    # thousand seeded bots could not be asked for from here at all. Asking for
+    # more than a world holds is safe and always was: the core spawns what its
+    # registry has and logs requested/registered/started.
     param([int]$Current = 350)
     $dialog = [Windows.Forms.Form]::new()
     $dialog.Text = (T 'botDialog')
@@ -624,7 +646,7 @@ function Show-BotCountDialog {
     $dialog.MinimizeBox = $false
 
     $info = [Windows.Forms.Label]::new()
-    $info.Text = "Ilu botów ma grać jednocześnie?`r`nEfektywny limit to liczba botów w Twoim świecie (kanoniczna paczka ma 350).`r`nZmiana wymaga restartu serwera."
+    $info.Text = "Ilu botów ma grać jednocześnie?`r`nEfektywny limit to liczba botów w Twoim świecie: 1500 dla samego Chunjo,`r`n2500 przy włączonych trzech królestwach. Zmiana wymaga restartu serwera."
     $info.Location = [Drawing.Point]::new(14, 12)
     $info.Size = [Drawing.Size]::new(440, 54)
     $dialog.Controls.Add($info)
@@ -639,13 +661,13 @@ function Show-BotCountDialog {
     $bar = [Windows.Forms.TrackBar]::new()
     $bar.Name = 'botBar'
     $bar.Minimum = 0
-    $bar.Maximum = 1500
+    $bar.Maximum = 2500
     $bar.TickFrequency = 50
     $bar.SmallChange = 1
     $bar.LargeChange = 25
     $bar.Location = [Drawing.Point]::new(12, 104)
     $bar.Size = [Drawing.Size]::new(442, 45)
-    $bar.Value = [Math]::Max(0, [Math]::Min(1500, $Current))
+    $bar.Value = [Math]::Max(0, [Math]::Min(2500, $Current))
     $dialog.Controls.Add($bar)
     $valueLabel.Text = "Boty: $($bar.Value)"
     # $this/FindForm keeps the handler independent of captured locals.
@@ -891,13 +913,17 @@ $dbAccessButton = New-Button (T 'dbAccess') 28 418 218 32 ([Drawing.Color]::From
 # rides in every update, this button fetches the client package from the
 # manifest's `client` component and swaps pack/root.eix + root.epk.
 $gmPanelButton = New-Button (T 'gmPanel') 262 418 218 32 ([Drawing.Color]::FromArgb(120, 70, 130))
+# Backup, restore and "start over" behind one button: reported from the
+# Discord as "the launcher can import a database but nothing says how to
+# export one", together with a wish to get back to a fresh install.
+$worldBackupButton = New-Button (T 'worldBackup') 496 418 230 32 ([Drawing.Color]::FromArgb(70, 120, 90))
 
 # The language switch sits with the other small buttons rather than in a menu:
 # somebody who cannot read the window needs to find it without reading anything.
 $languageButton = New-Button (T 'language') 508 702 218 28 ([Drawing.Color]::FromArgb(60, 70, 95))
 $languageButton.Add_Click({ Switch-LauncherLanguage })
 
-foreach ($button in @($installButton, $playButton, $dockerButton, $stopButton, $panelButton, $clientButton, $updateButton, $bundleButton, $diagnosticsButton, $openLogButton, $folderButton, $botCountButton, $importDbButton, $repairDbButton, $dbAccessButton, $gmPanelButton, $languageButton)) {
+foreach ($button in @($installButton, $playButton, $dockerButton, $stopButton, $panelButton, $clientButton, $updateButton, $bundleButton, $diagnosticsButton, $openLogButton, $folderButton, $botCountButton, $importDbButton, $repairDbButton, $dbAccessButton, $gmPanelButton, $worldBackupButton, $languageButton)) {
     $script:form.Controls.Add($button)
 }
 
@@ -1012,6 +1038,74 @@ function Get-M2PanelAddresses {
     }
 }
 
+function Show-PanelPasswordDialog {
+    # In-process and read-only: an action would print the passphrase through the
+    # launcher log, and the launcher log travels in support bundles that get
+    # posted on the Discord. Same rule as the database credentials dialog.
+    $envPath = Join-Path $root 'linux-port\docker\.env'
+    $passphrase = ''
+    if (Test-Path -LiteralPath $envPath -PathType Leaf) {
+        $match = [Regex]::Match([IO.File]::ReadAllText($envPath), '(?m)^M2_PANEL_PASSWORD=(.+?)\s*$')
+        if ($match.Success) { $passphrase = $match.Groups[1].Value }
+    }
+    if (-not $passphrase) {
+        [Windows.Forms.MessageBox]::Show(
+            "W pliku .env nie ma jeszcze hasla do panelu.`r`n`r`nKliknij GRAJ raz - launcher je uzupelni i pokaze.",
+            'Haslo do panelu', 'OK', 'Information') | Out-Null
+        return
+    }
+
+    $dialog = [Windows.Forms.Form]::new()
+    $dialog.Text = 'Haslo do panelu WWW'
+    $dialog.Size = [Drawing.Size]::new(520, 250)
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+
+    $info = [Windows.Forms.Label]::new()
+    $info.Text = 'Panel ma jedno haslo i nie ma loginu. Zaznacz je i skopiuj.'
+    $info.Location = [Drawing.Point]::new(16, 14)
+    $info.Size = [Drawing.Size]::new(480, 20)
+    $dialog.Controls.Add($info)
+
+    $box = [Windows.Forms.TextBox]::new()
+    $box.Text = $passphrase
+    $box.ReadOnly = $true
+    $box.Location = [Drawing.Point]::new(16, 40)
+    $box.Size = [Drawing.Size]::new(480, 26)
+    $box.Font = [Drawing.Font]::new('Consolas', 12)
+    $dialog.Controls.Add($box)
+
+    $hint = [Windows.Forms.Label]::new()
+    $hint.Text = ('Jesli panel go nie przyjmuje, zapamietal starsze haslo z pierwszego' + [Environment]::NewLine +
+        'uruchomienia. Reset kasuje jeden plik konfiguracyjny panelu i ustawia' + [Environment]::NewLine +
+        'haslo powyzej. Swiat, postacie i boty sa w bazie i nie sa tym ruszane.')
+    $hint.Location = [Drawing.Point]::new(16, 76)
+    $hint.Size = [Drawing.Size]::new(480, 60)
+    $dialog.Controls.Add($hint)
+
+    $resetButton = [Windows.Forms.Button]::new()
+    $resetButton.Text = 'Zresetuj haslo panelu'
+    $resetButton.Location = [Drawing.Point]::new(16, 148)
+    $resetButton.Size = [Drawing.Size]::new(230, 34)
+    $resetButton.DialogResult = [Windows.Forms.DialogResult]::Yes
+    $dialog.Controls.Add($resetButton)
+
+    $closeButton = [Windows.Forms.Button]::new()
+    $closeButton.Text = 'Zamknij'
+    $closeButton.Location = [Drawing.Point]::new(396, 148)
+    $closeButton.Size = [Drawing.Size]::new(100, 34)
+    $closeButton.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $dialog.Controls.Add($closeButton)
+    $dialog.CancelButton = $closeButton
+
+    $answer = $dialog.ShowDialog()
+    $dialog.Dispose()
+    if ($answer -ne [Windows.Forms.DialogResult]::Yes) { return }
+    Start-LauncherAction -Action 'PanelPassword' -Yes
+}
+
 function Show-PanelChoiceDialog {
     # Two panels look at the same world and neither replaces the other, so the
     # button asks instead of deciding: the classic one is the map and the
@@ -1047,6 +1141,16 @@ function Show-PanelChoiceDialog {
     $sebanButton.DialogResult = [Windows.Forms.DialogResult]::No
     $dialog.Controls.Add($sebanButton)
 
+    # The third thing somebody pressing this button may actually want.
+    # "podajcie te kody do gm bo ja nie moge na www wejsc", "ja nie mam zadnego
+    # hasla nawet w panelu tieru" - it is one line in .env and nothing showed it.
+    $passwordButton = [Windows.Forms.Button]::new()
+    $passwordButton.Text = (T 'panelPw')
+    $passwordButton.Location = [Drawing.Point]::new(16, 174)
+    $passwordButton.Size = [Drawing.Size]::new(370, 30)
+    $passwordButton.DialogResult = [Windows.Forms.DialogResult]::Retry
+    $dialog.Controls.Add($passwordButton)
+
     $cancelButton = [Windows.Forms.Button]::new()
     $cancelButton.Text = (T 'cancel')
     $cancelButton.Location = [Drawing.Point]::new(396, 174)
@@ -1061,6 +1165,7 @@ function Show-PanelChoiceDialog {
     switch ($answer) {
         ([Windows.Forms.DialogResult]::Yes) { return $Addresses.ClassicUrl }
         ([Windows.Forms.DialogResult]::No)  { return $Addresses.SebanUrl }
+        ([Windows.Forms.DialogResult]::Retry) { return 'panel-password' }
         default { return $null }
     }
 }
@@ -1068,6 +1173,10 @@ function Show-PanelChoiceDialog {
 $panelButton.Add_Click({
     $addresses = Get-M2PanelAddresses -ServerRoot $root
     $url = Show-PanelChoiceDialog -Addresses $addresses
+    if ($url -eq 'panel-password') {
+        Show-PanelPasswordDialog
+        return
+    }
     if ($url) {
         Write-LocalLog "Otwieram panel: $url"
         Start-Process $url
@@ -1095,7 +1204,7 @@ $updateButton.Add_Click({
     $serverProperty = $manifest.PSObject.Properties['server']
     if ($serverProperty -and $serverProperty.Value) { $server = $serverProperty.Value }
     if (-not $server -or -not [string]$server.version) {
-        $message = 'Kanał aktualizacji nie ma obecnie nowej wersji serwera. Twoja instalacja pozostaje bez zmian.'
+        $message = 'Kanał aktualizacji nie podał wersji serwera. Twoja instalacja pozostaje bez zmian.'
         $statusProperty = $manifest.PSObject.Properties['statusMessage']
         if ($statusProperty -and [string]$statusProperty.Value) { $message = [string]$statusProperty.Value }
         Write-LocalLog $message
@@ -1237,6 +1346,94 @@ $importDbButton.Add_Click({
         'Potwierdź import bazy', 'YesNo', 'Warning')
     if ($confirm -ne [Windows.Forms.DialogResult]::Yes) { return }
     Start-LauncherAction -Action 'ImportDb' -Yes -ExtraArgs @('-ImportSource', "$picked")
+})
+$worldBackupButton.Add_Click({
+    # One button rather than three, because the main window has no room for
+    # three and the report was that the backup could not be FOUND, not that it
+    # was too many clicks away. The dialog says what each of them does before
+    # anything is stopped or deleted.
+    if (-not (Confirm-DockerReady)) { return }
+    $dlg = [Windows.Forms.Form]::new()
+    $dlg.Text = (T 'backupDialog')
+    $dlg.Size = [Drawing.Size]::new(470, 300)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $lbl = [Windows.Forms.Label]::new()
+    $lbl.Text = (T 'backupInfo')
+    $lbl.Location = [Drawing.Point]::new(12, 10)
+    $lbl.Size = [Drawing.Size]::new(430, 60)
+    $dlg.Controls.Add($lbl)
+    $choice = ''
+    $makeButton = [Windows.Forms.Button]::new()
+    $makeButton.Text = (T 'backupMake')
+    $makeButton.Location = [Drawing.Point]::new(12, 80)
+    $makeButton.Size = [Drawing.Size]::new(430, 40)
+    $makeButton.Add_Click({ $script:guiBackupChoice = 'make'; $dlg.DialogResult = [Windows.Forms.DialogResult]::OK })
+    $dlg.Controls.Add($makeButton)
+    $loadButton = [Windows.Forms.Button]::new()
+    $loadButton.Text = (T 'backupLoad')
+    $loadButton.Location = [Drawing.Point]::new(12, 126)
+    $loadButton.Size = [Drawing.Size]::new(430, 40)
+    $loadButton.Add_Click({ $script:guiBackupChoice = 'load'; $dlg.DialogResult = [Windows.Forms.DialogResult]::OK })
+    $dlg.Controls.Add($loadButton)
+    $resetButton = [Windows.Forms.Button]::new()
+    $resetButton.Text = (T 'backupReset')
+    $resetButton.Location = [Drawing.Point]::new(12, 172)
+    $resetButton.Size = [Drawing.Size]::new(430, 40)
+    $resetButton.BackColor = [Drawing.Color]::FromArgb(180, 75, 55)
+    $resetButton.ForeColor = [Drawing.Color]::White
+    $resetButton.Add_Click({ $script:guiBackupChoice = 'reset'; $dlg.DialogResult = [Windows.Forms.DialogResult]::OK })
+    $dlg.Controls.Add($resetButton)
+    $cancelButton = [Windows.Forms.Button]::new()
+    $cancelButton.Text = (T 'cancel')
+    $cancelButton.Location = [Drawing.Point]::new(347, 222)
+    $cancelButton.Size = [Drawing.Size]::new(95, 30)
+    $cancelButton.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $dlg.Controls.Add($cancelButton)
+    $dlg.CancelButton = $cancelButton
+    $script:guiBackupChoice = ''
+    $result = $dlg.ShowDialog()
+    $choice = $script:guiBackupChoice
+    $dlg.Dispose()
+    if ($result -ne [Windows.Forms.DialogResult]::OK -or -not $choice) { return }
+
+    if ($choice -eq 'make') {
+        Start-LauncherAction -Action 'BackupDb' -Yes
+        return
+    }
+    if ($choice -eq 'load') {
+        $backupRoot = Join-Path $root 'backups'
+        if (-not (Test-Path -LiteralPath $backupRoot -PathType Container) -or
+            -not (Get-ChildItem -LiteralPath $backupRoot -Filter 'db-backup-*.zip' -File -ErrorAction SilentlyContinue)) {
+            [Windows.Forms.MessageBox]::Show((T 'backupNone'), (T 'backupDialog'), 'OK', 'Information') | Out-Null
+            return
+        }
+        $picker = [Windows.Forms.OpenFileDialog]::new()
+        $picker.Title = (T 'backupPick')
+        $picker.InitialDirectory = $backupRoot
+        $picker.Filter = 'Kopia swiata (db-backup-*.zip)|db-backup-*.zip|ZIP|*.zip'
+        if ($picker.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) { $picker.Dispose(); return }
+        $file = $picker.FileName
+        $picker.Dispose()
+        $confirm = [Windows.Forms.MessageBox]::Show(
+            "Przywrócić świat z '$([IO.Path]::GetFileName($file))'?`r`n`r`nObecny świat zostanie ZASTĄPIONY. Zanim to nastąpi, launcher zapisze go do własnej kopii w folderze 'backups', więc da się cofnąć.",
+            'Potwierdź przywrócenie kopii', 'YesNo', 'Warning')
+        if ($confirm -ne [Windows.Forms.DialogResult]::Yes) { return }
+        Start-LauncherAction -Action 'RestoreDb' -Yes -ExtraArgs @('-RestoreSource', "$file")
+        return
+    }
+    # reset
+    $confirm = [Windows.Forms.MessageBox]::Show(
+        "Zresetować świat do stanu świeżej instalacji?`r`n`r`nZniknie CAŁY obecny świat: postacie, poziomy, ekwipunek, boty i konta gry. Launcher najpierw zapisze go do kopii zip w folderze 'backups', więc da się do niego wrócić przyciskiem KOPIA SWIATA -> Przywroc swiat z kopii.`r`n`r`nPierwszy start po resecie potrwa dłużej - baza powstaje od nowa i boty są zasiewane.",
+        'Potwierdź reset świata', 'YesNo', 'Warning')
+    if ($confirm -ne [Windows.Forms.DialogResult]::Yes) { return }
+    $again = [Windows.Forms.MessageBox]::Show(
+        "Na pewno? To ostatnie pytanie.`r`n`r`nPo kliknięciu TAK obecny świat przestaje być światem tego serwera.",
+        'Reset świata', 'YesNo', 'Warning')
+    if ($again -ne [Windows.Forms.DialogResult]::Yes) { return }
+    Start-LauncherAction -Action 'ResetWorld' -Yes
 })
 $dbAccessButton.Add_Click({
     # In-process on purpose: an action would print through the log box and the

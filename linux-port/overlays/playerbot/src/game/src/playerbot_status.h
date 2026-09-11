@@ -75,9 +75,22 @@ namespace
 	{
 		switch (mapIndex)
 		{
+			// The names are the engine's own: new_quest_lv52 reads the first
+			// villages out of { "Yongan", "Joan", "Pyongmoo" } by empire and
+			// new_quest_lv7 names the second ones Jayang, Bokjung and Bakra.
+			// Map 24 used to be labelled Pyungmoo here, which is Jinno's
+			// capital and not Chunjo's guild ground.
+			case 1: return "do Yongan";
+			case 3: return "do Jayang";
 			case PLAYERBOT_MAP_CHUNJO_M1: return "do Joan";
 			case PLAYERBOT_MAP_CHUNJO_M2: return "do Bokjung";
-			case PLAYERBOT_MAP_CHUNJO_M3: return "do Pyungmoo";
+			case 41: return "do Pyongmoo";
+			case 43: return "do Bakra";
+			case 4:
+			case PLAYERBOT_MAP_CHUNJO_M3:
+			case 44: return "na Ziemie Klanu";
+			case 5:
+			case 45:
 			case PLAYERBOT_MAP_MONKEY_EASY: return "do Lochu Malp";
 			case PLAYERBOT_MAP_MONKEY_MEDIUM: return "do Lochu Malp II";
 			case PLAYERBOT_MAP_MONKEY_HARD: return "do Lochu Malp III";
@@ -207,12 +220,6 @@ namespace
 		// bot that is stuck from one that is waiting.
 		// A keeper carrying its goods to the other town because this ring
 		// is full: the walk, not the goal, is what a player sees.
-		if (state.dwStallWalkUntil != 0 && get_dword_time() < state.dwStallWalkUntil &&
-				ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2 && !ch->GetMyShop())
-		{
-			snprintf(status, statusSize, "%sIde z towarem na targ w Joan", prefix);
-			return;
-		}
 		if (state.bServicePending)
 		{
 			const char* where = state.lDepartureMap != 0
@@ -357,9 +364,10 @@ namespace
 				// The stable keeper of the map the bot is on: measured against
 				// Joan's alone, a bot handing its medal over in Bokjung was
 				// "on its way" for the whole visit.
-				const bool inM2 = ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2;
-				const long stableX = inM2 ? PLAYERBOT_M2_STABLE_BOY_X : PLAYERBOT_STABLE_BOY_X;
-				const long stableY = inM2 ? PLAYERBOT_M2_STABLE_BOY_Y : PLAYERBOT_STABLE_BOY_Y;
+				playerbot_empire_rules::TTownServices svc;
+				const bool haveStable = playerbot_empire_rules::GetTownServices(ch->GetMapIndex(), svc);
+				const long stableX = haveStable ? svc.stableKeeper.x : ch->GetX();
+				const long stableY = haveStable ? svc.stableKeeper.y : ch->GetY();
 				const bool bFar = DISTANCE_APPROX(ch->GetX() - stableX, ch->GetY() - stableY) > 850;
 				if (IsPlayerBotBattleHorseEarned(ch))
 					snprintf(status, statusSize, bFar ? "%sIde do Stajennego po konia bojowego"
@@ -375,9 +383,11 @@ namespace
 				if (ch->CountSpecifyItem(PLAYERBOT_FISHING_BAIT_VNUM) <
 						PLAYERBOT_FISHING_BAIT_RESTOCK)
 					snprintf(status, statusSize, "%sIde do Rybaka po przynete", prefix);
-				else if (DISTANCE_APPROX(ch->GetX() - PLAYERBOT_FISHING_BANK_X,
-						ch->GetY() - PLAYERBOT_FISHING_BANK_Y) >
-						PLAYERBOT_FISHING_BANK_RADIUS)
+				else if (GetPlayerBotFishingBank(ch->GetMapIndex()) == NULL ||
+						DISTANCE_APPROX(
+							ch->GetX() - GetPlayerBotFishingBank(ch->GetMapIndex())->centre.x,
+							ch->GetY() - GetPlayerBotFishingBank(ch->GetMapIndex())->centre.y) >
+						GetPlayerBotFishingBank(ch->GetMapIndex())->radius)
 					snprintf(status, statusSize, "%sIde nad rzeke lowic ryby", prefix);
 				else if (state.bIsFishing)
 					snprintf(status, statusSize, "%sLowie ryby - czekam na branie", prefix);
@@ -401,10 +411,10 @@ namespace
 					snprintf(status, statusSize, "%sSzukam czegos na straganach", prefix);
 				break;
 			case BOT_ACTION_TRAVEL:
-				if (ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M1 &&
+				if (IsPlayerBotM1Map(ch->GetMapIndex()) &&
 						state.bLongTermGoal == BOT_GOAL_HORSE)
 					snprintf(status, statusSize, "%sIde przez portal do M2 po Medal Konny", prefix);
-				else if (ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2 &&
+				else if (IsPlayerBotM2Map(ch->GetMapIndex()) &&
 						ch->CountSpecifyItem(PLAYERBOT_HORSE_MEDAL_VNUM) == 0 &&
 						state.bLongTermGoal == BOT_GOAL_HORSE)
 					snprintf(status, statusSize, "%sIde do Lochu Malp po Medal Konny", prefix);
@@ -466,7 +476,7 @@ namespace
 					// going anywhere, and "Ide na Gore Sohan" over a bot that
 					// has stood in Bokjung for an hour is what an operator
 					// reads as a bot that cannot find the portal.
-					if (where[0] && ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2 &&
+					if (where[0] && IsPlayerBotM2Map(ch->GetMapIndex()) &&
 							ch->GetGold() < GetPlayerBotTeleporterFee(ch))
 						snprintf(status, statusSize, "%sZbieram yang na Teleporter %s (%d/%d)",
 								prefix, where, ch->GetGold(), GetPlayerBotTeleporterFee(ch));

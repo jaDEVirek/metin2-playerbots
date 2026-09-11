@@ -410,14 +410,9 @@ namespace
 		return false;
 	}
 
-	int CountPlayerBotFreeInventoryCells(LPCHARACTER ch)
-	{
-		int free = 0;
-		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
-			if (!ch->GetInventoryItem(cell))
-				++free;
-		return free;
-	}
+	// CountPlayerBotFreeInventoryCells jest w playerbot_consumables.h, ktory
+	// jest wlaczany wczesniej: skrzynie musza pytac o to samo, a w jednej
+	// jednostce kompilacji definicja moze byc tylko jedna.
 
 	// Occupied cells against PLAYERBOT_BAG_FULL_PERCENT of the bag. Counted
 	// by cell rather than by item, so a weapon's three cells count as three.
@@ -511,15 +506,40 @@ namespace
 		if (IsPlayerBotSpecialLevel30Weapon(item))
 			return false;
 
+		// The Archer's one stone weapon (playerbot_gear.h) is kept.
+		if (IsPlayerBotArcherBuild(ch) && IsPlayerBotStoneMeleeWeapon(ch, item) &&
+				FindPlayerBotStoneWeapon(ch, false) == item)
+			return false;
+
+		// Gear the counter could not sell in six stands is scrap, whatever the
+		// rules below would keep it for - up to PLAYERBOT_SHOP_UNSOLD_SCRAP_MAX_REFINE.
+		// This has to come before the precious-refine keep below, or it never
+		// applies to the +4 and +5 the counter actually keeps, which is what it
+		// was written for: with it underneath, a bag of unsold +5 was for life.
+		if ((item->GetType() == ITEM_WEAPON || item->GetType() == ITEM_ARMOR) &&
+				item->GetRefineLevel() <= PLAYERBOT_SHOP_UNSOLD_SCRAP_MAX_REFINE)
+		{
+			TPlayerBotAIStateMap::const_iterator st = s_mapPlayerBotAIStates.find(ch->GetPlayerID());
+			if (st != s_mapPlayerBotAIStates.end())
+			{
+				std::map<DWORD, BYTE>::const_iterator unsold = st->second.mapStallUnsold.find(item->GetID());
+				if (unsold != st->second.mapStallUnsold.end() &&
+						unsold->second >= PLAYERBOT_SHOP_UNSOLD_SCRAP_STANDS)
+					return true;
+			}
+		}
+
 		// Whatever else it is, a +7 or better is not something to hand an NPC for
 		// a fifth of the shop price. The reserve rule below keeps one spare per
 		// slot and sold the rest; that is how a Riba +9 went to a merchant
-		// because the same bot was carrying an axe +9. These go on a stall.
+		// because the same bot was carrying an axe +9. These go on a stall -
+		// and, up to +6, only for as many stands as somebody might buy them.
 		if (item->GetRefineLevel() >= PLAYERBOT_PRECIOUS_REFINE)
 			return false;
 
 		// A scrap keeper's low refines are its stock, not its junk - until the
 		// bag runs short, and then the merchant gets them like anyone else's.
+
 		if ((item->GetType() == ITEM_WEAPON || item->GetType() == ITEM_ARMOR) &&
 				IsPlayerBotScrapKeeper(ch->GetPlayerID()) &&
 				CountPlayerBotFreeInventoryCells(ch) > PLAYERBOT_SCRAP_KEEP_FREE_CELLS)
@@ -557,6 +577,10 @@ namespace
 					!PlayerBotHasTreasureKeyFor(ch, item);
 		if (item->GetType() == ITEM_TREASURE_KEY ||
 				item->GetType() == ITEM_GIFTBOX || vnum == PLAYERBOT_SKILL_FORGET_SCROLL_VNUM)
+			return false;
+		// A refine scroll stays in the bag or goes on a counter, never to the
+		// merchant. It is still stall goods: another bot needs one too.
+		if (IsPlayerBotRefineScroll(vnum))
 			return false;
 		// A soul stone is somebody's socket: this bot's, or across a counter
 		// another's. The merchant paid one yang for a Potwora +4.
@@ -841,6 +865,27 @@ namespace
 		return blessing;
 	}
 
+	// Whether a piece lying in the bag is one this bot would actually raise.
+	//
+	// It exists because the planner and the pass that does the refining used to
+	// answer that question differently: the planner accepted anything the
+	// general equipment selector liked, the executor then also rejected
+	// whatever the junk rule had marked for the merchant. A bot could therefore
+	// see an opportunity, commit to a blacksmith visit - and BOT_TOWN_PHASE
+	// treats a started visit as a commitment that outranks the ordinary goal
+	// choice - walk there, find nothing to do, and come back. Reported as "mam
+	// wszystko +9 zalozone, a bot dalej lezie do kowala".
+	//
+	// Worn pieces do not go through here: the junk rule does not apply to
+	// something the bot is wearing, and a full +9 set is not a reason to refuse
+	// a legitimate upgrade waiting in the bag.
+	bool IsPlayerBotRefineBagCandidate(LPCHARACTER ch, LPITEM item)
+	{
+		return item && item->GetRefinedVnum() != 0 &&
+				IsPlayerBotEquipmentCandidate(ch, item) &&
+				!IsPlayerBotJunkItem(ch, item);
+	}
+
 	bool ManagePlayerBotRefining(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
 	{
 		if (!ch || !ch->IsItemLoaded() || dwNow < state.dwNextRefineCheckTime)
@@ -885,15 +930,14 @@ namespace
 		// Also collect candidate gear in inventory
 		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
 		{
-			LPITEM item = ch->GetInventoryItem(cell);
-			if (!item || item->GetRefinedVnum() == 0 || !IsPlayerBotEquipmentCandidate(ch, item))
-				continue;
 			// What the merchant would take on the next town visit is not
 			// worth a refine now: Ametystowy Naszyjnik+0 was raised to +1 at
 			// 17:58 and sold for scrap at 18:19. A spare that is kept - an
 			// upgrade, a higher tier than the worn piece, a reserve at +6 -
 			// is worth raising; the rest is scrap and stays at what it is.
-			if (IsPlayerBotJunkItem(ch, item))
+			// The planner asks the same function, above.
+			LPITEM item = ch->GetInventoryItem(cell);
+			if (!IsPlayerBotRefineBagCandidate(ch, item))
 				continue;
 
 			const BYTE plusLevel = item->GetRefineLevel();
@@ -984,14 +1028,29 @@ namespace
 			// SetRefineMode, spends it, and on failure hands back the item one
 			// level down rather than nothing.
 			int scrollCell = -1;
-			if (plusLevel >= PLAYERBOT_SCROLL_REFINE_MIN_PLUS)
+			// A prize piece may ask for a scroll at any plus, not only from +6.
+			// The +6 rule is about not spending a scarce scroll on an ordinary
+			// item; a piece the bot refuses to risk needs one wherever it
+			// stands, and without this it was refused a scroll below +6 and
+			// then held for want of one - the deadlock that parked 451 weapons
+			// on +4.
+			if (plusLevel >= PLAYERBOT_SCROLL_REFINE_MIN_PLUS || IsPlayerBotPrizeItem(item))
 				scrollCell = FindPlayerBotRefineScrollCell(ch, plusLevel);
 			// No scroll, a roll that can fail, and a weapon worth more than the
 			// next plus: leave it. The blacksmith burns what he fails.
-			if (scrollCell < 0 && IsPlayerBotPrizeItem(item))
+			// A level-30 weapon from +6 on goes only under a scroll, prize lines
+			// or not - a burnt Full Moon Sword +7 is a week of somebody's
+			// hunting, and the Moonlight chests keep the scrolls coming.
+			if (scrollCell < 0 && (IsPlayerBotPrizeItem(item) ||
+					(IsPlayerBotSpecialLevel30Weapon(item) && plusLevel >= PLAYERBOT_SCROLL_REFINE_MIN_PLUS)))
 			{
 				const TRefineTable* prt = CRefineManager::instance().GetRefineRecipe(item->GetRefineSet());
-				if (prt && prt->prob < 100)
+				// Hold only where a failure really costs something. Ninety and
+				// eighty percent are not odds worth freezing a weapon over, and
+				// freezing it is what happened: every step of refine_proto is
+				// under a hundred, so "prob < 100" held every prize item at
+				// whatever plus it happened to have.
+				if (prt && prt->prob < PLAYERBOT_PRIZE_SAFE_REFINE_PROB)
 				{
 					PlayerBotLogThrottled("refine_prize_no_scroll", dwNow,
 							"PLAYERBOT_AI: refine held, prize line and no blessing scroll pid=%u name=%s vnum=%u plus=%u prob=%d",
@@ -1265,6 +1324,10 @@ namespace
 			bought = BuyPlayerBotEmergencyWeapon(ch) || bought;
 		if (isArcher)
 			bought = BuyPlayerBotArrowsAtMerchant(ch) || bought;
+		// ...and a stone weapon, the dagger of its level, when the bag has none.
+		if (isArcher && !FindPlayerBotStoneWeapon(ch, true))
+			bought = BuyPlayerBotProgressionGear(ch,
+					GetPlayerBotProgressionStoneWeaponVnum(ch), "stone dagger") || bought;
 		if (NeedsPlayerBotProgressionWeapon(ch) &&
 				(!isArcher || CountPlayerBotArrows(ch) >= PLAYERBOT_ARROW_RESTOCK_THRESHOLD))
 			bought = BuyPlayerBotProgressionGear(ch,
@@ -1341,8 +1404,10 @@ namespace
 
 		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
 		{
+			// The same test the refining pass applies, not a looser one: a
+			// promise the executor will refuse is a walk to town for nothing.
 			LPITEM item = ch->GetInventoryItem(cell);
-			if (IsPlayerBotEquipmentCandidate(ch, item) &&
+			if (IsPlayerBotRefineBagCandidate(ch, item) &&
 					CanPlayerBotAttemptRefineItem(ch, item))
 				return true;
 		}

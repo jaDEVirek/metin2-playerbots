@@ -415,24 +415,31 @@ namespace
 			score += 1000;
 
 		// A race-attack bonus is only worth carrying where that race is what you
-		// actually fight. The population learns which monsters live on each map,
-		// so "strong against orcs" counts for far more in Orc Valley than in a
-		// place where nothing orcish ever spawns.
+		// actually fight, and it is worth what share of the map that race is:
+		// "strong against orcs" covers 63% of Orc Valley, "strong against
+		// animals" the whole of a Monkey Dungeon, and nothing at all on the
+		// desert, which is made of a race no item can reach. The share comes
+		// from the same call the reroll scorer uses, so the pass that buys an
+		// item and the pass that rerolls it can no longer disagree about the
+		// line that made the bot pick it up.
 		if (ch)
 		{
-			const int dominant = GetPlayerBotFightingRace(ch);
-			if (dominant != PLAYERBOT_RACE_NONE)
+			int racePercent = 0;
+			const int dominant = GetPlayerBotFightingRace(ch, &racePercent);
+			if (dominant != PLAYERBOT_RACE_NONE && racePercent > 0)
 			{
 				const BYTE wanted = GetPlayerBotRaceApplyType(dominant);
+				const long long perPoint = (long long)PLAYERBOT_GEAR_RACE_LINE_VALUE *
+						racePercent / 100;
 				for (int i = 0; i < ITEM_ATTRIBUTE_MAX_NUM; ++i)
 				{
 					if (item->GetAttributeType(i) == wanted)
-						score += (long long)item->GetAttributeValue(i) * 600;
+						score += (long long)item->GetAttributeValue(i) * perPoint;
 				}
 				for (int i = 0; i < ITEM_APPLY_MAX_NUM; ++i)
 				{
 					if (item->GetProto()->aApplies[i].bType == wanted)
-						score += (long long)item->GetProto()->aApplies[i].lValue * 600;
+						score += (long long)item->GetProto()->aApplies[i].lValue * perPoint;
 				}
 			}
 		}
@@ -546,10 +553,96 @@ namespace
 		return false;
 	}
 
+	// The Archer's stone weapon (by build, whatever is in the hand - the
+	// IsPlayerBotArcher of playerbot_targeting.h asks for the bow). A bow cannot break a Metin: the stone does
+	// not move, the arrows run out, the shot's rhythm is a fraction of a
+	// swing's, and the bot "fell over x times and gave up" (Kuszaa). A dagger
+	// or a sword the ninja can wear, kept in the bag, goes into the hand for
+	// the stone and comes out afterwards. Both are one item per bot - the
+	// best by the equipment score - and the junk rule and the counter leave
+	// that one alone.
+	bool IsPlayerBotArcherBuild(LPCHARACTER ch)
+	{
+		return ch && ch->GetJob() == JOB_ASSASSIN && ch->GetSkillGroup() == 2;
+	}
+
+	bool IsPlayerBotStoneMeleeWeapon(LPCHARACTER ch, LPITEM item)
+	{
+		if (!ch || !item || item->GetType() != ITEM_WEAPON)
+			return false;
+		const BYTE sub = item->GetSubType();
+		return (sub == WEAPON_DAGGER || sub == WEAPON_SWORD) && item->CanUsedBy(ch) &&
+				item->GetLevelLimit() <= ch->GetLevel();
+	}
+
+	// The best stone weapon the bot holds: in the bag, or - with includeWorn -
+	// in the hand as well. NULL when there is none. A dagger beats a sword
+	// whatever the score: it swings faster and costs less, and a stone has no
+	// armour worth a heavier blow.
+	LPITEM FindPlayerBotStoneWeapon(LPCHARACTER ch, bool includeWorn)
+	{
+		if (!ch)
+			return NULL;
+		LPITEM best = NULL;
+		long long bestScore = 0;
+		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
+		{
+			LPITEM item = ch->GetInventoryItem(cell);
+			if (!item || !IsPlayerBotStoneMeleeWeapon(ch, item))
+				continue;
+			const bool dagger = item->GetSubType() == WEAPON_DAGGER;
+			const bool bestDagger = best && best->GetSubType() == WEAPON_DAGGER;
+			if (best && bestDagger && !dagger)
+				continue;
+			const long long score = GetPlayerBotEquipmentScore(item, ch);
+			if (!best || (dagger && !bestDagger) || score > bestScore)
+			{
+				best = item;
+				bestScore = score;
+			}
+		}
+		if (includeWorn && !best)
+		{
+			LPITEM worn = ch->GetWear(WEAR_WEAPON);
+			if (worn && IsPlayerBotStoneMeleeWeapon(ch, worn))
+				best = worn;
+		}
+		return best;
+	}
+
+	// What the hand should hold right now: the job's weapon, or the stone
+	// weapon while an Archer is on a stone.
+	bool PlayerBotWeaponFitsNow(LPCHARACTER ch, const TPlayerBotAIState& state, LPITEM item)
+	{
+		if (IsPlayerBotArcherBuild(ch) && state.bMeleeForStone)
+			return IsPlayerBotStoneMeleeWeapon(ch, item);
+		return IsPlayerBotWeapon(ch, item);
+	}
+
 	bool ManagePlayerBotEquipment(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
 	{
 		if (!ch || !ch->IsItemLoaded())
 			return false;
+
+		// The Archer's stone mode, decided here because this pass is what
+		// puts a weapon in the hand: on while the target is a standing stone
+		// and a stone weapon is at hand, off the moment it is not - either
+		// flip is looked at on this very tick.
+		if (IsPlayerBotArcherBuild(ch))
+		{
+			LPCHARACTER target = state.dwTargetVID != 0
+					? CHARACTER_MANAGER::instance().Find(state.dwTargetVID) : NULL;
+			const bool wantMelee = target && target->IsStone() && !target->IsDead() &&
+					FindPlayerBotStoneWeapon(ch, true) != NULL;
+			if (wantMelee != state.bMeleeForStone)
+			{
+				state.bMeleeForStone = wantMelee;
+				state.dwNextEquipmentCheckTime = dwNow;
+				sys_log(0, "PLAYERBOT_GEAR: archer %s pid=%u name=%s target_vid=%u",
+						wantMelee ? "draws the stone weapon" : "takes the bow back",
+						ch->GetPlayerID(), ch->GetName(), (unsigned int)state.dwTargetVID);
+			}
+		}
 
 		if (dwNow < state.dwNextEquipmentCheckTime && !state.bEquipPending)
 			return false;
@@ -560,10 +653,20 @@ namespace
 		long long bestImprovement = 0;
 		long long bestScore = 0;
 
+		const bool stoneMode = IsPlayerBotArcherBuild(ch) && state.bMeleeForStone;
+		// The one stone weapon the bot has chosen (dagger first), not any
+		// blade in the bag: the score alone would put a heavier sword ahead.
+		LPITEM chosenStoneWeapon = stoneMode ? FindPlayerBotStoneWeapon(ch, false) : NULL;
 		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
 		{
 			LPITEM item = ch->GetInventoryItem(cell);
-			if (!IsPlayerBotEquipmentCandidate(ch, item))
+			if (!item)
+				continue;
+			const bool stoneWeapon = stoneMode && item == chosenStoneWeapon &&
+					!item->IsExchanging();
+			if (!stoneWeapon && !IsPlayerBotEquipmentCandidate(ch, item))
+				continue;
+			if (item->GetType() == ITEM_WEAPON && !PlayerBotWeaponFitsNow(ch, state, item))
 				continue;
 
 			const int wearCell = item->FindEquipCell(ch);
@@ -578,7 +681,13 @@ namespace
 				continue;
 
 			const long long itemScore = GetPlayerBotEquipmentScore(item, ch);
-			const long long oldScore = oldItem ? GetPlayerBotEquipmentScore(oldItem, ch) : 0;
+			// A weapon in the hand that does not fit the moment - the bow while
+			// the Archer is on a stone, the dagger once the stone is gone - is
+			// worth nothing against the one that does.
+			const long long oldScore = oldItem
+					? ((wearCell == WEAR_WEAPON && !PlayerBotWeaponFitsNow(ch, state, oldItem))
+						? 0 : GetPlayerBotEquipmentScore(oldItem, ch))
+					: 0;
 			if (oldItem && itemScore <= oldScore)
 				continue;
 
@@ -766,6 +875,30 @@ namespace
 			const int reqLevel = GetPlayerBotProtoLevelLimit(proto);
 			// Strictly higher, so a level-0 starter belonging to the next class
 			// can never displace a piece this character actually qualifies for.
+			if (reqLevel <= (int)ch->GetLevel() && reqLevel > bestLevel)
+			{
+				bestVnum = candidateVnum;
+				bestLevel = reqLevel;
+			}
+		}
+		return bestVnum;
+	}
+
+	// The dagger ladder, for the Archer's stone weapon.
+	DWORD GetPlayerBotProgressionStoneWeaponVnum(LPCHARACTER ch)
+	{
+		if (!ch)
+			return 0;
+		const DWORD familyBase = 1000;
+		DWORD bestVnum = familyBase;
+		int bestLevel = -1;
+		for (int tier = 0; tier < 20; ++tier)
+		{
+			const DWORD candidateVnum = familyBase + tier * 10;
+			TItemTable* proto = ITEM_MANAGER::instance().GetTable(candidateVnum);
+			if (!proto)
+				continue;
+			const int reqLevel = GetPlayerBotProtoLevelLimit(proto);
 			if (reqLevel <= (int)ch->GetLevel() && reqLevel > bestLevel)
 			{
 				bestVnum = candidateVnum;
@@ -1242,6 +1375,38 @@ namespace
 		return 6;
 	}
 
+	// What the village merchants actually stock, and what they charge for it.
+	//
+	// The three shops hold sixty-four rows between them in this world, and
+	// nothing outside them can be bought by a player at any counter. The
+	// progression ladder walks item_proto by vnum stride instead, so it named
+	// pieces no shop has ever sold - and the purchase below simply created
+	// them. What a player saw was a bot in a level-60 Mask of Fear bought for
+	// twenty thousand yang at the armour merchant, with the log line to prove
+	// it (jaksiezabic). A bot buys what a player could buy at the same counter,
+	// at the same price; everything above that comes from drops, the counters
+	// and the blacksmith, exactly as it does for a player.
+	bool FindPlayerBotMerchantOffer(DWORD vnum, long long* priceOut)
+	{
+		static const DWORD merchants[] = { 9001, 9002, 9003 };
+		for (size_t i = 0; i < sizeof(merchants) / sizeof(merchants[0]); ++i)
+		{
+			LPSHOP shop = CShopManager::instance().GetByNPCVnum(merchants[i]);
+			if (!shop)
+				continue;
+			const std::vector<CShop::SHOP_ITEM>& offers = shop->GetItemVector();
+			for (size_t k = 0; k < offers.size(); ++k)
+			{
+				if (offers[k].vnum != vnum)
+					continue;
+				if (priceOut)
+					*priceOut = offers[k].price > 0 ? offers[k].price : 0;
+				return true;
+			}
+		}
+		return false;
+	}
+
 	bool BuyPlayerBotProgressionGear(LPCHARACTER ch, DWORD vnum, const char* category)
 	{
 		if (!ch || vnum == 0)
@@ -1250,7 +1415,11 @@ namespace
 		if (!proto || ch->GetEmptyInventory(std::max(1, (int)proto->bSize)) < 0)
 			return false;
 
-		long long price = proto->dwShopBuyPrice > 0 ? proto->dwShopBuyPrice : proto->dwGold;
+		long long price = 0;
+		if (!FindPlayerBotMerchantOffer(vnum, &price))
+			return false;
+		if (price <= 0)
+			price = proto->dwShopBuyPrice > 0 ? proto->dwShopBuyPrice : proto->dwGold;
 		price = std::max<long long>(100, price);
 		if (ch->GetGold() < price)
 			return false;
@@ -1821,7 +1990,10 @@ namespace
 	bool PrepareWeapon(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
 	{
 		LPITEM equippedWeapon = ch->GetWear(WEAR_WEAPON);
-		if (equippedWeapon && IsPlayerBotWeapon(ch, equippedWeapon))
+		// PlayerBotWeaponFitsNow and not IsPlayerBotWeapon: the Archer's dagger
+		// on a stone is the right weapon for the moment, not a profession
+		// mismatch to be taken off.
+		if (equippedWeapon && PlayerBotWeaponFitsNow(ch, state, equippedWeapon))
 		{
 			state.dwEmergencyScavengeUntil = 0;
 			if (equippedWeapon->GetSubType() == WEAPON_BOW)
@@ -2146,45 +2318,33 @@ namespace
 			return;
 		state.dwNextThirdHandTime = dwNow + PLAYERBOT_THIRD_HAND_INTERVAL;
 
-		// The bot's copy, worn or carried - carried counts, or a bot that could
-		// not put it on this minute would be handed another one every pass.
-		LPITEM hand = ch->GetWear(WEAR_UNIQUE1);
-		if (!hand || hand->GetVnum() != PLAYERBOT_THIRD_HAND_VNUM)
-			hand = ch->GetWear(WEAR_UNIQUE2);
-		if (hand && hand->GetVnum() != PLAYERBOT_THIRD_HAND_VNUM)
-			hand = NULL;
-		for (WORD cell = 0; cell < INVENTORY_MAX_NUM && !hand; ++cell)
+		// Since patch 0010 every kill's yang goes straight to the purse, for
+		// bots and players alike, so the Third Hand only takes a slot ("da sie
+		// dodac status trzeciej reki bez zajmowania slota w eq?"). Whatever a
+		// bot still wears or carries of the group is taken away.
+		for (int pass = 0; pass < 2; ++pass)
 		{
-			LPITEM item = ch->GetInventoryItem(cell);
-			if (item && item->GetVnum() == PLAYERBOT_THIRD_HAND_VNUM)
-				hand = item;
-		}
-
-		if (!hand)
-		{
-			// AutoGiveItem hands the item over even when there is nowhere to put
-			// it, and it lands on the ground wearing the bot's name - the arrows
-			// and the stall bundles both learned this the hard way. Wait for a
-			// free cell instead.
-			if (ch->GetEmptyInventory(1) < 0)
-				return;
-			hand = ch->AutoGiveItem(PLAYERBOT_THIRD_HAND_VNUM, 1, -1, false);
+			LPITEM hand = NULL;
+			for (BYTE wear = 0; wear < WEAR_MAX_NUM && !hand; ++wear)
+			{
+				LPITEM worn = ch->GetWear(wear);
+				if (worn && worn->GetVnum() >= PLAYERBOT_THIRD_HAND_VNUM_FIRST &&
+						worn->GetVnum() <= PLAYERBOT_THIRD_HAND_VNUM)
+					hand = worn;
+			}
+			for (WORD cell = 0; cell < INVENTORY_MAX_NUM && !hand; ++cell)
+			{
+				LPITEM item = ch->GetInventoryItem(cell);
+				if (item && item->GetVnum() >= PLAYERBOT_THIRD_HAND_VNUM_FIRST &&
+						item->GetVnum() <= PLAYERBOT_THIRD_HAND_VNUM && !item->isLocked())
+					hand = item;
+			}
 			if (!hand)
 				return;
-			sys_log(0, "PLAYERBOT_GEAR: third hand made pid=%u name=%s",
-					ch->GetPlayerID(), ch->GetName());
+			sys_log(0, "PLAYERBOT_GEAR: third hand retired pid=%u name=%s vnum=%u worn=%d",
+					ch->GetPlayerID(), ch->GetName(), hand->GetVnum(), hand->IsEquipped() ? 1 : 0);
+			ITEM_MANAGER::instance().RemoveItem(hand, "PLAYERBOT_THIRD_HAND_RETIRED");
 		}
-
-		// CHARACTER::EquipItem refuses within a second and a half of an attack
-		// or a cast, which for a bot is most of its life - the first draft put
-		// the winding below behind a successful equip here and wound eight
-		// clocks out of six hundred. Trying is enough: what this pass does not
-		// manage, ManagePlayerBotEquipment picks out of the bag on its own.
-		if (!hand->IsEquipped())
-			ch->EquipItem(hand);
-
-		if (hand->GetSocket(ITEM_SOCKET_UNIQUE_REMAIN_TIME) < PLAYERBOT_THIRD_HAND_REWIND_BELOW)
-			hand->SetSocket(ITEM_SOCKET_UNIQUE_REMAIN_TIME, PLAYERBOT_THIRD_HAND_MINUTES);
 	}
 }
 

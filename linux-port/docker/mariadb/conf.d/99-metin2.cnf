@@ -25,6 +25,18 @@ collation-server     = latin1_swedish_ci
 # is close enough to it to be worth raising.
 max_connections = 200
 
+# Seventy-three of the seventy-five game tables are MyISAM, which does not
+# survive an unclean stop: a pulled plug, a killed container or a full disk
+# leaves one marked as crashed, and everything that reads it fails from then on
+# ("Table './player/quest' is marked as crashed and last (automatic?) repair
+# failed" - the panel showing it, reported from the Discord). MariaDB's default
+# here is BACKUP,QUICK, and QUICK only rebuilds the index file: when the data
+# file is the damaged one the automatic repair gives up, which is exactly what
+# that message says happened. FORCE runs the full repair even when it would
+# cost a row, and BACKUP keeps the damaged .MYD next to it first, so nothing is
+# thrown away silently. A repaired table beats a server nobody can log into.
+myisam_recover_options = BACKUP,FORCE
+
 # 128 sequential 'Data truncated' warnings on player.mob_proto.size and
 # player.skill_proto.setAffectFlag{,2} during the first-run import are EXPECTED
 # and harmless: the dump itself stores '' in those enum columns, so a faithful

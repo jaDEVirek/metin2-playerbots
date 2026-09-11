@@ -40,6 +40,47 @@ function Set-DotEnvValue {
     return $Content + "$Name=$Value" + [Environment]::NewLine
 }
 
+function Add-MissingDotEnvKeys {
+    # A player's .env is written once and never rewritten: what is in it is
+    # theirs, including passwords nobody else has a copy of. So a switch added
+    # to .env.example after they installed never appears for them, and telling
+    # them to "set M2_PLAYERBOT_KINGDOMS=1 in .env" is advice about a line that
+    # is not there. That is how the three kingdoms looked broken on an install
+    # which had been updated rather than made fresh (jaksiezabic, 1.32.1):
+    # Compose still had its own default, so nothing failed - the player simply
+    # had no way to turn the feature on.
+    #
+    # Only ABSENT keys are added, always with the example's own default, and a
+    # line that already exists is never touched. Secrets are skipped whatever
+    # happens: a placeholder quietly landing next to a real password is a far
+    # worse failure than a missing switch.
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory = $true)][string]$ExamplePath
+    )
+    if (-not (Test-Path -LiteralPath $ExamplePath -PathType Leaf)) { return $Content }
+    $added = New-Object System.Collections.Generic.List[string]
+    foreach ($line in [IO.File]::ReadAllLines($ExamplePath)) {
+        $match = [Regex]::Match($line, '^\s*([A-Za-z0-9_]+)=(.*)$')
+        if (-not $match.Success) { continue }
+        $name = $match.Groups[1].Value
+        if ($name -match 'PASSWORD|SECRET|TOKEN|_KEY$') { continue }
+        # An empty value in the example means "leave it to Compose", and every
+        # place that reads one uses ${VAR:-default}, which falls back on an
+        # empty value too. Writing the empty line would gain nothing and would
+        # put a setting in front of the player that has no meaning on its own -
+        # M2_SEBAN_TIERU_PANEL_URL is the one that made this worth a rule.
+        if (-not $match.Groups[2].Value.Trim()) { continue }
+        if ([Regex]::IsMatch($Content, '(?m)^' + [Regex]::Escape($name) + '=')) { continue }
+        $Content = Set-DotEnvValue -Content $Content -Name $name -Value $match.Groups[2].Value
+        $added.Add($name)
+    }
+    if ($added.Count -gt 0) {
+        Write-Host ("Dopisano do .env brakujace ustawienia: " + ($added -join ', ')) -ForegroundColor DarkGray
+    }
+    return $Content
+}
+
 function Get-DotEnvValue {
     param(
         [Parameter(Mandatory = $true)][string]$Content,
@@ -322,6 +363,36 @@ function Get-DockerDesktopCandidates {
     return @($paths | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -Unique)
 }
 
+function Assert-PanelPassphrase {
+    # The one password an operator actually types, and the one way it can go
+    # missing.
+    #
+    # .env.example ships M2_PANEL_PASSWORD empty. The installer fills it in and
+    # prints it at the end, but every other route to a .env leaves it empty - a
+    # file copied from the example by hand, an interrupted install, a stack
+    # started with `docker compose up` directly. The panel container then does
+    # what its entrypoint has always done: invents a twenty-character password,
+    # writes only its PBKDF2 hash into m2panel.conf, and prints the plaintext
+    # once to a container log nobody reads. From then on the panel has a
+    # password that exists nowhere: "ja nie mam zadnego hasla nawet w panelu
+    # tieru", "przy czystej instalacji losuje haslo".
+    #
+    # So the launcher fills the blank before Compose ever sees it. Written to
+    # .env, where the operator can read it back, and said out loud once here.
+    #
+    # An .env that already carries one is never touched - it may be the hash in
+    # m2panel.conf, and overwriting it would lock the operator out for real.
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content,
+        [ref]$Generated
+    )
+    $match = [Regex]::Match($Content, '(?m)^M2_PANEL_PASSWORD=(.*)$')
+    if ($match.Success -and $match.Groups[1].Value.Trim()) { return $Content }
+    $passphrase = New-DotEnvPassphrase
+    if ($Generated) { $Generated.Value = $passphrase }
+    return (Set-DotEnvValue -Content $Content -Name 'M2_PANEL_PASSWORD' -Value $passphrase)
+}
+
 function Initialize-InstallationIdentity {
     $envPath = Join-Path $PSScriptRoot 'linux-port\docker\.env'
     if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
@@ -387,7 +458,28 @@ function Initialize-InstallationIdentity {
         [Text.UTF8Encoding]::new($false))
     $content = Set-DotEnvValue -Content $content -Name 'M2_COMPOSE_PROJECT_NAME' -Value $project
     $content = Set-DotEnvValue -Content $content -Name 'M2_CONTAINER_PREFIX' -Value $prefix
+    # Last, so anything the identity decides above wins over the example.
+    $content = Add-MissingDotEnvKeys -Content $content -ExamplePath (
+        Join-Path (Split-Path -Parent $envPath) '.env.example')
+    # And after that, because Add-MissingDotEnvKeys deliberately never touches a
+    # PASSWORD key - which is right for not clobbering one, and leaves an empty
+    # one empty.
+    $panelGenerated = ''
+    $content = Assert-PanelPassphrase -Content $content -Generated ([ref]$panelGenerated)
     [IO.File]::WriteAllText($envPath, $content, [Text.UTF8Encoding]::new($false))
+    if ($panelGenerated) {
+        Write-Host ''
+        Write-Host '=============================================================' -ForegroundColor Yellow
+        Write-Host '  HASLO DO PANELU WWW (wygenerowane, bo w .env go nie bylo)' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host "      $panelGenerated" -ForegroundColor White
+        Write-Host ''
+        Write-Host '  Jest tez w linux-port\docker\.env (M2_PANEL_PASSWORD).' -ForegroundColor Yellow
+        Write-Host '  Jesli panel go nie przyjmuje, to znaczy, ze zapamietal' -ForegroundColor Yellow
+        Write-Host '  starsze - uzyj przycisku HASLO DO PANELU w launcherze.' -ForegroundColor Yellow
+        Write-Host '=============================================================' -ForegroundColor Yellow
+        Write-Host ''
+    }
     Write-Host "Installation identity: $project" -ForegroundColor DarkGray
 }
 

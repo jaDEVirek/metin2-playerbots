@@ -247,10 +247,26 @@ quest web_admin begin
 								if cmd == "RIDER_CHECK" then
 								    result = "done"
 								elseif cmd == "RIDER_ITEM" or cmd == "BULK_ITEM" or cmd == "BULK_MISSING" then
+								    -- 200 i ani sztuki wiecej na jedno wydanie.
+								    --
+								    -- pc.give_item2 czyta ilosc jako int i podaje ja do
+								    -- CHARACTER::AutoGiveItem(DWORD, BYTE, ...) - jeden bajt.
+								    -- 256 staje sie zerem, 300 czterdziestoma czterema, 65535
+								    -- dwiescia piecdziesiecioma pieciema, i nic tego nie zglasza:
+								    -- panel widzi niezerowe item_id i zapisuje "nadano". 200 to
+								    -- pelny stos, do ktorego AutoGiveItem sam dolewa
+								    -- (MIN(200 - GetCount(), ...)), wiec powyzej tej liczby
+								    -- kontrakt i tak sie konczy.
+								    --
+								    -- Odrzucamy zamiast obcinac: paczka, ktora dostala mniej, niz
+								    -- prosila, i nazywa to sukcesem, jest gorsza od paczki, ktora
+								    -- powiedziala "nie umiem".
 								    local vnum = tonumber(arg1)
 								    local qty = tonumber(arg2)
-								    if vnum == nil or qty == nil or vnum < 1 or vnum > 2147483647 or qty < 1 or qty > 65535 or vnum ~= math.floor(vnum) or qty ~= math.floor(qty) then
+								    if vnum == nil or qty == nil or vnum < 1 or vnum > 2147483647 or qty < 1 or qty ~= math.floor(qty) or vnum ~= math.floor(vnum) then
 								        result = "bad_args"
+								    elseif qty > 200 then
+								        result = "qty_too_big"
 								    elseif cmd == "RIDER_ITEM" and pc.get_skill_level(130) < 1 then
 								        result = "no_skill"
 								    elseif cmd == "BULK_MISSING" and pc.count_item(vnum) > 0 then
@@ -258,16 +274,25 @@ quest web_admin begin
 								    elseif not pc.enough_inventory(vnum) then
 								        result = "full"
 								    else
+								        local before = pc.count_item(vnum)
 								        local item_id = pc.give_item2(vnum, qty)
 								        if item_id == nil or item_id == 0 then
 								            result = "failed"
+								        elseif pc.count_item(vnum) - before < qty then
+								            -- Niezerowe item_id nie dowodzi, ze wszystko trafilo do
+								            -- plecaka: AutoGiveItem przy braku miejsca kladzie
+								            -- przedmiot na ziemi i tez zwraca wskaznik. Liczymy.
+								            result = "partial"
 								        end
 								    end
 								elseif cmd == "ITEM" then
 									local vnum = tonumber(arg1)
 									local qty = tonumber(arg2) or 1
-									if vnum == nil then
+									-- Ta sama granica, co wyzej, i z tego samego powodu.
+									if vnum == nil or qty < 1 or qty ~= math.floor(qty) then
 										result = "bad_args"
+									elseif qty > 200 then
+										result = "qty_too_big"
 									else
 										pc.give_item2(vnum, qty)
 									end
@@ -356,7 +381,7 @@ quest web_admin begin
 								-- Only words from our own short list may
 								-- reach the database. Nothing a user typed
 								-- can get in here.
-								if result ~= "done" and result ~= "bad_args" and result ~= "no_skill" and result ~= "has_item" and result ~= "full" and result ~= "failed" then
+								if result ~= "done" and result ~= "bad_args" and result ~= "no_skill" and result ~= "has_item" and result ~= "full" and result ~= "failed" and result ~= "qty_too_big" and result ~= "partial" then
 									result = "unknown_cmd"
 								end
 

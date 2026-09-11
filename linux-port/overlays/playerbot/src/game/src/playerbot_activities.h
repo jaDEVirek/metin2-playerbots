@@ -49,9 +49,11 @@ namespace
 
 	bool ManagePlayerBotHorse(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
 	{
-		if (!ch || (ch->GetMapIndex() != PLAYERBOT_MAP_CHUNJO_M1 &&
-				ch->GetMapIndex() != PLAYERBOT_MAP_CHUNJO_M2) || state.bVisitingShop ||
-				state.bVisitingBiologist)
+		// The stable keeper stands in all six villages, so the horse errand is a
+		// local one wherever the bot lives.
+		playerbot_empire_rules::TTownServices svc;
+		if (!ch || !playerbot_empire_rules::GetTownServices(ch->GetMapIndex(), svc) ||
+				state.bVisitingShop || state.bVisitingBiologist)
 			return false;
 		if (!state.bVisitingStable && dwNow < state.dwNextHorseCheckTime)
 			return false;
@@ -98,9 +100,9 @@ namespace
 		state.dwTargetVID = 0;
 		ch->SetVictim(NULL);
 
-		const bool inM2 = ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M2;
-		const long stableX = inM2 ? PLAYERBOT_M2_STABLE_BOY_X : PLAYERBOT_STABLE_BOY_X;
-		const long stableY = inM2 ? PLAYERBOT_M2_STABLE_BOY_Y : PLAYERBOT_STABLE_BOY_Y;
+		const bool inM2 = IsPlayerBotM2Map(ch->GetMapIndex());
+		const long stableX = svc.stableKeeper.x;
+		const long stableY = svc.stableKeeper.y;
 		long approachX = 0, approachY = 0;
 		GetPlayerBotNpcApproach(ch->GetPlayerID(), stableX, stableY,
 				inM2 ? 0x4d324853U : 0x484f5253U, approachX, approachY);
@@ -247,9 +249,20 @@ namespace
 		}
 	}
 
-	void GetPlayerBotFishingStand(DWORD playerID, DWORD dwNow, long& standX, long& standY)
+	// Slot ids are per map: three banks numbering their stands from zero would
+	// have an angler in Yongan holding Joan's stand seven.
+	int PlayerBotFishingClaimKey(long mapIndex, int slot)
 	{
-		const int slots = (int)PLAYERBOT_FISHING_STAND_COUNT;
+		return (int)mapIndex * 1000 + slot;
+	}
+
+	void GetPlayerBotFishingStand(DWORD playerID, DWORD dwNow, long mapIndex,
+			long& standX, long& standY)
+	{
+		const TPlayerBotFishingBank* bank = GetPlayerBotFishingBank(mapIndex);
+		if (!bank)
+			return;
+		const int slots = (int)bank->standCount;
 		int mine = -1;
 		for (std::map<int, TPlayerBotFishingStand>::iterator it =
 				s_mapPlayerBotFishingStands.begin();
@@ -270,7 +283,7 @@ namespace
 			const int start = (int)(PlayerBotNavHash(playerID ^ 0x42414e4bU) % (DWORD)slots);
 			for (int step = 0; step < slots && mine < 0; ++step)
 			{
-				const int slot = (start + step) % slots;
+				const int slot = PlayerBotFishingClaimKey(mapIndex, (start + step) % slots);
 				std::map<int, TPlayerBotFishingStand>::const_iterator it =
 						s_mapPlayerBotFishingStands.find(slot);
 				if (it == s_mapPlayerBotFishingStands.end() ||
@@ -280,29 +293,39 @@ namespace
 			// More anglers than stands one day: share a stand rather than refuse
 			// to fish.
 			if (mine < 0)
-				mine = start;
+				mine = PlayerBotFishingClaimKey(mapIndex, start);
 			TPlayerBotFishingStand& claim = s_mapPlayerBotFishingStands[mine];
 			claim.dwPid = playerID;
 			claim.dwTouched = dwNow;
 		}
-		standX = PLAYERBOT_FISHING_STANDS[mine].x;
-		standY = PLAYERBOT_FISHING_STANDS[mine].y;
+		const int index = mine - PlayerBotFishingClaimKey(mapIndex, 0);
+		if (index < 0 || index >= slots)
+			return;
+		standX = bank->stands[index].x;
+		standY = bank->stands[index].y;
 	}
 
 	// The water this stand looks at. Due east was right for the one straight
 	// stretch the first version knew about and wrong for every bend.
-	void GetPlayerBotFishingFacing(DWORD playerID, long& waterX, long& waterY)
+	void GetPlayerBotFishingFacing(DWORD playerID, long mapIndex,
+			long& waterX, long& waterY)
 	{
-		waterX = PLAYERBOT_FISHING_WATER_X;
+		const TPlayerBotFishingBank* bank = GetPlayerBotFishingBank(mapIndex);
+		waterX = bank ? bank->centre.x : PLAYERBOT_FISHING_WATER_X;
 		waterY = 0;
+		if (!bank)
+			return;
 		for (std::map<int, TPlayerBotFishingStand>::const_iterator it =
 				s_mapPlayerBotFishingStands.begin();
 				it != s_mapPlayerBotFishingStands.end(); ++it)
 		{
 			if (it->second.dwPid != playerID)
 				continue;
-			waterX = PLAYERBOT_FISHING_STANDS[it->first].waterX;
-			waterY = PLAYERBOT_FISHING_STANDS[it->first].waterY;
+			const int index = it->first - PlayerBotFishingClaimKey(mapIndex, 0);
+			if (index < 0 || index >= (int)bank->standCount)
+				return;
+			waterX = bank->stands[index].waterX;
+			waterY = bank->stands[index].waterY;
 			return;
 		}
 	}
@@ -653,7 +676,7 @@ namespace
 		// the market ring for a while instead of walking straight back out -
 		// which is the whole of what makes that square look inhabited, since the
 		// bank, the bait merchant and the stalls are all on this one map.
-		if (ch && ch->GetMapIndex() == PLAYERBOT_MAP_CHUNJO_M1 &&
+		if (ch && IsPlayerBotM1Map(ch->GetMapIndex()) &&
 				number(1, 100) <= PLAYERBOT_TOWN_LINGER_PERCENT)
 			state.dwTownLingerUntil = dwNow + number(
 					(int)PLAYERBOT_TOWN_LINGER_MIN, (int)PLAYERBOT_TOWN_LINGER_MAX);
@@ -810,7 +833,8 @@ namespace
 			return true;
 		if (!ch || ch->IsDead())
 			return false;
-		if (ch->GetMapIndex() != PLAYERBOT_MAP_CHUNJO_M1)
+		const TPlayerBotFishingBank* bank = GetPlayerBotFishingBank(ch->GetMapIndex());
+		if (bank == NULL)
 		{
 			// The rod must not travel to a hunting map in the weapon slot.
 			if (state.bFishingSession)
@@ -875,12 +899,13 @@ namespace
 		long destX = 0, destY = 0;
 		if (needsTackle)
 		{
-			GetPlayerBotNpcApproach(ch->GetPlayerID(), PLAYERBOT_FISHERMAN_X,
-					PLAYERBOT_FISHERMAN_Y, 0x46495348U, destX, destY);
+			GetPlayerBotNpcApproach(ch->GetPlayerID(), bank->fisherman.x,
+					bank->fisherman.y, 0x46495348U, destX, destY);
 		}
 		else
 		{
-			GetPlayerBotFishingStand(ch->GetPlayerID(), dwNow, destX, destY);
+			GetPlayerBotFishingStand(ch->GetPlayerID(), dwNow, ch->GetMapIndex(),
+					destX, destY);
 			// A last check against the navigation's own grid, in case a stand
 			// falls in a cell it refuses - but within two cells, not twelve.
 			// Twelve is six hundred world units against an arrival radius of
@@ -960,7 +985,11 @@ namespace
 			ClearPlayerBotRoute(state, true);
 		}
 
-		SetPlayerBotRidingForTravel(ch, state, false, dwNow, "fishing");
+		if (SetPlayerBotRidingForTravel(ch, state, false, dwNow, "fishing"))
+			// StopRiding leaves the horse standing behind the angler for the
+			// whole session ("wszystkie moje boty lowia z konmi obok"); it is
+			// sent away like a player would, and summoned again for the ride.
+			ch->HorseSummon(false);
 		if (ch->IsStateMove())
 			ch->Stop();
 		ch->SetPosition(POS_STANDING);
@@ -1033,6 +1062,14 @@ namespace
 				return true;
 			}
 
+			// A catch goes through AutoGiveItem, and AutoGiveItem never refuses a
+			// full bag: it puts the fish on the grass and reports success. That is
+			// what "the anglers drop their catch and every bot runs for it" was
+			// (bierzyn, 10 September, with the photograph). A session with no
+			// cell left ends here; the planner sends the bot to empty the bag.
+			if (ch->GetEmptyInventory(1) < 0)
+				return EndPlayerBotFishingSession(ch, state, dwNow, "bag_full");
+
 			// CHARACTER::fishing() dereferences the sectree map and the tile under
 			// the bot without checking either, so never call it blind.
 			if (!ch->GetSectree() ||
@@ -1045,7 +1082,8 @@ namespace
 			// Face straight across at the river rather than along the bank: the
 			// water lies due east of this stretch.
 			long waterX = 0, waterY = 0;
-			GetPlayerBotFishingFacing(ch->GetPlayerID(), waterX, waterY);
+			GetPlayerBotFishingFacing(ch->GetPlayerID(), ch->GetMapIndex(),
+					waterX, waterY);
 			ch->SetRotationToXY(waterX, waterY != 0 ? waterY : ch->GetY());
 			ch->fishing();
 			if (!ch->m_pkFishingEvent)
