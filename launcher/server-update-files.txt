@@ -55,7 +55,6 @@ linux-port/overlays/playerbot/tools/generate_seed.py
 linux-port/overlays/playerbot/sql/playerbot_names.sql
 linux-port/docker/mariadb/playerbot/playerbot_names.sql
 linux-port/overlays/playerbot/tools/generate_bot_names.py
-linux-port/overlays/playerbot/data/bot_names_community.txt
 linux-port/overlays/playerbot/data/bot_names_iwakura.txt
 # The overlay sources, and the staged build context they are compiled from.
 # Wildcards, not lists: splitting a source file must not require editing this

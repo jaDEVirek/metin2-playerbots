@@ -30,7 +30,29 @@ BIOLOGIST_MISSIONS = (
     ("make_herb_lv20", 20, "Bez", 10),
     ("make_herb_lv25", 25, "Grzyb Tue", 10),
     ("collect_quest_lv30", 30, "Ząb Orka", 10),
+    # The chain does not stop at the Orc Tooth: its own last state runs
+    # collect_quest_lv40, and that one runs lv50. Both want fifteen specimens
+    # at the same sixty percent, and both end with a permanent affect - five
+    # attack speed, then sixty defence - and a casket.
+    ("collect_quest_lv40", 40, "Księga Klątw", 15),
+    ("collect_quest_lv50", 50, "Pamiątka Po Demonie", 15),
 )
+# A row whose monster stands on no map the bots' core hosts can never be
+# finished, and the game steps over it (GetActivePlayerBotBiologistMission,
+# through PLAYERBOT_HUNTING_MOB_HOMES).  The panel has to step over the same
+# rows or it names a stage the game will never choose - which is exactly the
+# "panel says one thing, ranking says another" the Gango Root produced.
+# Measured off this world's own spawn files: the Demon Souvenir's specimen and
+# key come only from 1001-1004, and all four stand solely on
+# metin2_map_deviltower1 (index 66), which game2 hosts while every bot lives on
+# game1.  Take the name out of here the day that map moves.
+#
+# Empty since the Demon Tower (map 66) was moved onto the core the bots live on:
+# 1001-1004 carry the level-50 specimen and its key, they stand nowhere else in
+# this world, and with the map hosted the game takes that row like any other.
+BIOLOGIST_UNREACHABLE = frozenset()
+BIOLOGIST_REACHABLE = tuple(
+    m for m in BIOLOGIST_MISSIONS if m[0] not in BIOLOGIST_UNREACHABLE)
 # The specimen each row wants, and how far past a row the game stops hunting
 # it. Both mirror playerbot_missions.h: a row the bot has outgrown by
 # BIOLOGIST_OUTGROWN_LEVELS is stepped over unless the bag already holds the
@@ -41,8 +63,33 @@ BIOLOGIST_ITEM_VNUMS = {
     "make_herb_lv4": 50701, "make_herb_lv7": 50702, "make_herb_lv10": 50703,
     "make_herb_lv15": 50704, "make_herb_lv20": 50705, "make_herb_lv25": 50706,
     "collect_quest_lv30": 30006,
+    "collect_quest_lv40": 30047, "collect_quest_lv50": 30015,
 }
 BIOLOGIST_OUTGROWN_LEVELS = 10
+# From this level a row's specimen is a refine material too, and the core takes
+# any of it the bot carries to the Biologist, outgrown row or not
+# (PLAYERBOT_BIOLOGIST_COLLECT_QUEST_LEVEL).
+BIOLOGIST_COLLECT_QUEST_LEVEL = 30
+# A compiled quest's state index is a hash of the state's name, the same number
+# in every quest (quest/object/state/). key_item is the second half of the three
+# collect rows: every specimen is in and the Biologist waits for the key.
+BIOLOGIST_KEY_ITEM_STATE = -1726153001
+BIOLOGIST_KEY_VNUMS = {
+    "collect_quest_lv30": 30220, "collect_quest_lv40": 30221, "collect_quest_lv50": 30222,
+}
+# The collect rows are one chain in the quests: the Orc Tooth's last state starts
+# the Curse Book and the Curse Book's the Demon Souvenir. The core keeps that order
+# (IsPlayerBotBiologistMissionOpen, playerbot_missions.h), and so does the panel.
+BIOLOGIST_CHAIN_PREVIOUS = {
+    "collect_quest_lv40": "collect_quest_lv30", "collect_quest_lv50": "collect_quest_lv40",
+}
+# Where each row's monster stands (PLAYERBOT_HUNTING_MOB_HOMES): the herb rows
+# hunt village game, which every first and second village hosts.
+BIOLOGIST_VILLAGE_MAPS = frozenset((1, 3, 21, 23, 41, 43))
+BIOLOGIST_MOB_MAPS = {
+    "collect_quest_lv30": frozenset((64,)), "collect_quest_lv40": frozenset((64,)),
+    "collect_quest_lv50": frozenset((66,)),
+}
 
 # The official ``special.levelup_quest`` choices for the M1/M2 stage.  The
 # game server writes progress to quest ``levelup``; the panel only interprets
@@ -160,8 +207,39 @@ HUNTING_MOB_NAMES_PL = {
     5126: "Silna Złota Małpa",
 }
 
+# A skill book is vnum 50300 (or a named book) with the skill id in socket0;
+# the bag showed only "Ksiega Umiejetnosci" and nobody could tell which
+# skill it was (Tieru, 13 September). Flatten the per-class skill tables
+# into one id -> name map so a book can spell its skill out.
+SKILL_ID_NAMES = {}
+SKILL_ID_NAMES_PL = {}
+
+
+def item_full_name(vnum, socket0, language=None):
+    """Localized name, with the skill spelled out for a skill book."""
+    language = language or (lang() if has_request_context() else "en")
+    name = localized_item_name(vnum, language)
+    try:
+        item_proto_ready()
+        vt = ITEM_TYPES.get(int(vnum or 0), (0, 0))[0]
+    except Exception:
+        vt = 0
+    # 17 = ITEM_SKILLBOOK. The skill id lives in socket0.
+    if vt == 17 and int(socket0 or 0) > 0:
+        table = SKILL_ID_NAMES_PL if language == "pl" else SKILL_ID_NAMES
+        sk = table.get(int(socket0)) or SKILL_ID_NAMES.get(int(socket0))
+        if sk:
+            name = "%s: %s" % (name, sk)
+    return name
+
+
 def hunting_progress_label(current, selection, remain, complete, language=None):
     language = language or (lang() if has_request_context() else "en")
+    # The level-up hunt (levelup.quest) ships in quest/_unused on the
+    # mt2009 line: no kill hook fires, so the counter reads "0/N" for good.
+    # The core ignores it (see playerbot_missions.h); the panel says nothing.
+    if ENGINE_MT2009:
+        return ""
     current, selection = int(current or 0), 2 if int(selection or 1) == 2 else 1
     remain, complete = max(0, int(remain or 0)), max(0, int(complete or 0))
     mission = HUNTING_MISSIONS.get(current)
@@ -192,6 +270,10 @@ PLAYERBOT_STATUS_PATHS = (
     "/opt/metin2/var/channel1/first/playerbot_status.tsv",
     "/opt/metin2/var/channel1/game1/playerbot_status.tsv",
     "/opt/metin2/var/channel1/game2/playerbot_status.tsv",
+    # The second channel's cores, when the server runs one (M2_PLAYERBOT_CH2).
+    "/opt/metin2/var/channel2/first/playerbot_status.tsv",
+    "/opt/metin2/var/channel2/game1/playerbot_status.tsv",
+    "/opt/metin2/var/channel2/game2/playerbot_status.tsv",
 )
 _PLAYERBOT_STATUS_LOCK = threading.Lock()
 _PLAYERBOT_STATUS_CACHE_KEY = None
@@ -217,6 +299,44 @@ BOT_PERSONALITY_LABELS = {
         9: "M2 Bestial dropper", 10: "Medal dropper",
     },
 }
+# The status file's columns before Iwakura's personalities (2.0.85): a core of
+# that age writes these fourteen and no header row the parser can read by.
+PLAYERBOT_STATUS_LEGACY_COLUMNS = (
+    "pid", "personality", "ambition", "role", "in_party", "goal", "action",
+    "updated_ms", "map", "x", "y", "hp", "max_hp", "status",
+)
+# playerbot_persona::PERSONA_NONE: what the persona and mood columns carry
+# while the PERSONA switch is off.
+PLAYERBOT_PERSONA_NONE = 255
+# Iwakura's personalities, "SYSTEM OSOBOWOSCI v2.0" (playerbot_persona_rules.h,
+# EPersona - the order is the interface). Under the switch the bot's old
+# personality is its character, shown beside these.
+BOT_PERSONA_LABELS = {
+    "pl": {
+        0: "Grinder", 1: "Zdobywca", 2: "Handlarz", 3: "Hazardzista",
+        4: "Perfekcjonista", 5: "Pogromca metinów", 6: "Górnik", 7: "Rybak",
+        8: "Najemnik", 9: "Towarzysz",
+    },
+    "en": {
+        0: "Grinder", 1: "Conqueror", 2: "Trader", 3: "Gambler",
+        4: "Perfectionist", 5: "Metin slayer", 6: "Miner", 7: "Fisherman",
+        8: "Mercenary", 9: "Companion",
+    },
+}
+BOT_MOOD_LABELS = {
+    "pl": {0: "Słaby", 1: "Normalny", 2: "Bardzo dobry"},
+    "en": {0: "Poor", 1: "Normal", 2: "Very good"},
+}
+BOT_MOOD_LOCK_LABELS = {
+    "pl": {1: "euforia po ulepszeniu", 2: "kapitulacja (Anty-PK)"},
+    "en": {1: "refine euphoria", 2: "capitulation (anti-PK)"},
+}
+# The droppers (IsPlayerBotDropper in playerbot_types.h). A dropper farms one
+# thing for the market and takes neither the Biologist nor a horse trial -
+# the operator's rule of 15 September - so its Biologist card reads "does not
+# apply" instead of a 0/7 that looks like a bot stuck for good (GG1249125 and
+# OptimusPrime001 on Urtopy's world, 18 September).
+BOT_DROPPER_PERSONALITIES = frozenset((7, 8, 9, 10))
 BOT_AMBITION_LABELS = {
     "pl": {
         0: "Poziom", 1: "Ekwipunek", 2: "Metiny", 3: "Koń",
@@ -252,13 +372,19 @@ BOT_ACTION_LABELS = {
         4: "Regeneruje się", 5: "Wybiera profesję", 6: "Handluje", 7: "Ulepsza EQ",
         8: "Czyta KU", 9: "Wkłada KD", 10: "Organizuje PT", 11: "Robi Biologa",
         12: "Odwiedza Stajennego", 13: "Prowadzi stragan",
+        # 14-18 were missing here while playerbot_types.h had carried them for
+        # months: a bot whose status text was empty fell back to "Planuje
+        # nastepny ruch" whatever it was really doing.
+        14: "Łowi ryby", 15: "Przegląda stragany", 16: "Wabi potwory",
+        17: "Odpoczywa w mieście", 18: "Kopie rudę",
     },
     "en": {
         0: "Planning next move", 1: "Travelling", 2: "Fighting", 3: "Picking up loot",
         4: "Recovering", 5: "Choosing profession", 6: "Trading", 7: "Refining gear",
         8: "Reading a skill book", 9: "Socketing a spirit stone", 10: "Organising a party",
         11: "Doing Biologist mission", 12: "Visiting the Stable Boy",
-        13: "Keeping a stall",
+        13: "Keeping a stall", 14: "Fishing", 15: "Browsing stalls",
+        16: "Luring monsters", 17: "Resting in town", 18: "Mining ore",
     },
 }
 
@@ -283,11 +409,18 @@ def read_playerbot_live_status():
             try:
                 # The r40250 core and Polish locale tables use Windows-1250.
                 with open(path, "r", encoding="cp1250", errors="replace") as stream:
+                    header = None
                     for line in stream:
+                        # By the header, since Iwakura's personalities added
+                        # columns (persona, mood, mood_lock, lock_level); a
+                        # core from before them writes the old fourteen, and
+                        # the status text is the last column in both.
                         if line.startswith("pid\t"):
+                            header = line.rstrip("\r\n").split("\t")
                             continue
-                        parts = line.rstrip("\r\n").split("\t", 13)
-                        if len(parts) != 14:
+                        columns = header or PLAYERBOT_STATUS_LEGACY_COLUMNS
+                        parts = line.rstrip("\r\n").split("\t", len(columns) - 1)
+                        if len(parts) != len(columns) or columns[-1] != "status":
                             skipped += 1
                             continue
                         # One bad row costs one row.
@@ -300,19 +433,28 @@ def read_playerbot_live_status():
                         # the other panel, which is what a truncated parse looks
                         # like from the outside.
                         try:
-                            values = [int(value) for value in parts[:13]]
+                            row = {name: int(value) for name, value in zip(columns[:-1], parts[:-1])}
                         except ValueError:
                             skipped += 1
                             continue
-                        pid = values[0]
+                        if "pid" not in row:
+                            skipped += 1
+                            continue
+                        pid = row["pid"]
+                        persona = row.get("persona", PLAYERBOT_PERSONA_NONE)
+                        mood = row.get("mood", PLAYERBOT_PERSONA_NONE)
                         result[pid] = {
-                            "pid": pid, "personality_id": values[1],
-                            "ambition_id": values[2], "role": values[3],
-                            "in_pt": bool(values[4]), "goal_id": values[5],
-                            "action_id": values[6], "updated_ms": values[7],
-                            "map_index": values[8], "x": values[9], "y": values[10],
-                            "hp": values[11], "max_hp": values[12],
-                            "status": parts[13],
+                            "pid": pid, "personality_id": row.get("personality", 0),
+                            "ambition_id": row.get("ambition", 0), "role": row.get("role", 0),
+                            "in_pt": bool(row.get("in_party", 0)), "goal_id": row.get("goal", 0),
+                            "action_id": row.get("action", 0), "updated_ms": row.get("updated_ms", 0),
+                            "map_index": row.get("map", 0), "x": row.get("x", 0), "y": row.get("y", 0),
+                            "hp": row.get("hp", 0), "max_hp": row.get("max_hp", 0),
+                            "persona_id": None if persona == PLAYERBOT_PERSONA_NONE else persona,
+                            "mood_id": None if mood == PLAYERBOT_PERSONA_NONE else mood,
+                            "mood_lock": row.get("mood_lock", 0),
+                            "lock_level": row.get("lock_level", 0),
+                            "status": parts[-1],
                         }
             except OSError:
                 continue
@@ -349,18 +491,43 @@ def localize_playerbot_status(entry, language):
         entry.get("action_id"), BOT_ACTION_LABELS["en"][0])
 
 
+def playerbot_mood_label(entry, language):
+    """ "Słaby", or "Bardzo dobry (euforia po ulepszeniu)" while a lock holds;
+    "" while the PERSONA switch is off."""
+    mood = entry.get("mood_id") if entry else None
+    if mood is None:
+        return ""
+    text = BOT_MOOD_LABELS[language].get(mood, BOT_MOOD_LABELS[language][1])
+    lock = BOT_MOOD_LOCK_LABELS[language].get(entry.get("mood_lock") or 0)
+    return "%s (%s)" % (text, lock) if lock else text
+
+
 def playerbot_live_labels(entry, language):
     language = language if language in ("pl", "en") else "en"
     if not entry:
         return {
             "personality": BOT_PERSONALITY_LABELS[language][0],
+            "charakter": "",
+            "mood": "",
+            "hold": "",
             "ambition": BOT_AMBITION_LABELS[language][0],
             "goal": BOT_GOAL_LABELS[language][0],
             "action": BOT_ACTION_LABELS[language][0],
         }
+    old = BOT_PERSONALITY_LABELS[language].get(
+        entry.get("personality_id"), BOT_PERSONALITY_LABELS[language][0])
+    persona = entry.get("persona_id")
+    # Under Iwakura's personalities the one that claims the bot now is its
+    # personality, and the draw it has had since login is its character.
+    personality = BOT_PERSONA_LABELS[language].get(persona, old) if persona is not None else old
+    hold = ""
+    if persona is not None and entry.get("lock_level"):
+        hold = ("blokada expa na %d lvl" if language == "pl" else "exp held at level %d") % entry["lock_level"]
     return {
-        "personality": BOT_PERSONALITY_LABELS[language].get(
-            entry.get("personality_id"), BOT_PERSONALITY_LABELS[language][0]),
+        "personality": personality,
+        "charakter": old if persona is not None else "",
+        "mood": playerbot_mood_label(entry, language),
+        "hold": hold,
         "ambition": BOT_AMBITION_LABELS[language].get(
             entry.get("ambition_id"), BOT_AMBITION_LABELS[language][0]),
         "goal": BOT_GOAL_LABELS[language].get(
@@ -429,6 +596,15 @@ PLAYER_SKILLS_EN = {
              (110, "Swiftness"), (111, "Attack Up")),
 }
 
+# Flatten the per-class skill tables into one id -> name map, so a skill book
+# (skill id in socket0) can spell its skill out in the inventory (item_full_name).
+for _grp in PLAYER_SKILLS.values():
+    for _sid, _nm in _grp:
+        SKILL_ID_NAMES_PL[_sid] = _nm
+for _grp in PLAYER_SKILLS_EN.values():
+    for _sid, _nm in _grp:
+        SKILL_ID_NAMES[_sid] = _nm
+
 
 def skill_rank_label(master_type, level):
     master_type, level = int(master_type or 0), int(level or 0)
@@ -492,6 +668,12 @@ def _env_path(name, default):
     return os.environ.get(name, "").strip() or default
 
 PANEL_DIR  = _env_path("M2PANEL_DIR", "/usr/local/m2panel")
+
+# Which engine this panel is looking at (M2PANEL_ENGINE from compose). Read
+# here, ahead of everything that differs by engine: the item tables, the
+# update check, the attribute numbering further down.
+PANEL_ENGINE = os.environ.get("M2PANEL_ENGINE", "r40250").strip().lower()
+ENGINE_MT2009 = PANEL_ENGINE == "mt2009"
 # Files shipped next to admin_panel.py itself; that is where install.sh puts
 # them and where they sit in the source tree, so this needs no variable to
 # work — but a read-only image may want them elsewhere.
@@ -871,6 +1053,42 @@ GM_REQUEST = os.path.join(GM_SPOOL, "gm.request")
 # build shipped it.
 AI_SPOOL     = _env_path("M2PANEL_AI_SPOOL", "/opt/m2spool")
 AI_WEIGHTS   = os.path.join(AI_SPOOL, "playerbot_weights.tsv")
+# The operator's word on single items: keep / stall / merchant / drop per
+# vnum or per item type, read by the core the way the weights are.
+AI_ITEM_POLICY = os.path.join(AI_SPOOL, "playerbot_item_policy.tsv")
+AI_ITEM_POLICY_WORDS = ("keep", "stall", "merchant", "drop", "zostaw", "stragan", "handlarz", "wyrzuc")
+
+
+def read_ai_item_policy():
+    try:
+        with open(AI_ITEM_POLICY, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def check_ai_item_policy(text):
+    """The line numbers the core would skip, so the operator hears about a
+    typo now rather than watching a bot ignore the rule."""
+    bad = []
+    for no, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        key = parts[0].lower()
+        ok_key = key.isdigit() or (key.startswith("type:") and key[5:].isdigit())
+        if len(parts) != 2 or not ok_key or parts[1].lower() not in AI_ITEM_POLICY_WORDS:
+            bad.append(no)
+    return bad
+
+
+def write_ai_item_policy(text):
+    os.makedirs(AI_SPOOL, exist_ok=True)
+    tmp = AI_ITEM_POLICY + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text.replace("\r\n", "\n").rstrip("\n") + "\n")
+    os.replace(tmp, AI_ITEM_POLICY)
 AI_W_MIN, AI_W_MAX, AI_W_NEUTRAL = 25, 250, 100
 
 # Name, emoji, and the order they are shown in -- which is the order the core
@@ -896,7 +1114,25 @@ def read_ai_weights():
     vals["CHAT"] = 1
     vals["BOOKS"] = 1
     vals["NIGHT"] = 1
+    # "Boty graja jak zywi ludzie": sessions and rests. Experimental, off.
+    vals["LIFE"] = 0
+    # Guild wars between the bots' guilds (playerbot_guild_war.h). On.
+    vals["WARS"] = 1
+    vals["TOWER"] = 1
+    # The bots' ItemShop purchases (playerbot_itemshop.h). On.
+    vals["ISHOP"] = 1
+    # Iwakura's personalities and moods (playerbot_persona.h). On: the operator
+    # asked for them (19 September); off is the world as it was before.
+    vals["PERSONA"] = 1
     vals["SCRAP"] = 0
+    # Percent of bots that rest on the market ring after a town errand; 100 is
+    # the author's town, 0 is "every bot hunting".
+    vals["REST"] = 100
+    # Percent of bots that pick fights with bots of another kingdom; 0 is off.
+    vals["KINGDOMPVP"] = 0
+    # The lowest plus a refine under a Blessing or Dragon God scroll may land
+    # on; 1 is no floor, which is also what the core starts from.
+    vals["SCROLL_FROM"] = 1
     # The chest event's two figures. None until the file says: the panel does
     # not know what CONFIG holds, and must not write a guess over it.
     vals["CHEST"] = None
@@ -920,9 +1156,41 @@ def read_ai_weights():
                 if name == "NIGHT":
                     vals["NIGHT"] = 0 if parts[1].strip() in ("0", "off", "no") else 1
                     continue
+                if name == "LIFE":
+                    vals["LIFE"] = 0 if parts[1].strip() in ("0", "off", "no") else 1
+                    continue
+                if name == "WARS":
+                    vals["WARS"] = 0 if parts[1].strip() in ("0", "off", "no") else 1
+                if name == "TOWER":
+                    vals["TOWER"] = 0 if parts[1].strip() in ("0", "off", "no") else 1
+                    continue
+                if name == "ISHOP":
+                    vals["ISHOP"] = 0 if parts[1].strip() in ("0", "off", "no") else 1
+                    continue
+                if name == "PERSONA":
+                    vals["PERSONA"] = 0 if parts[1].strip() in ("0", "off", "no") else 1
+                    continue
                 if name == "SCRAP":
                     try:
                         vals["SCRAP"] = max(0, min(100, int(parts[1])))
+                    except ValueError:
+                        pass
+                    continue
+                if name == "REST":
+                    try:
+                        vals["REST"] = max(0, min(100, int(parts[1])))
+                    except ValueError:
+                        pass
+                    continue
+                if name == "KINGDOMPVP":
+                    try:
+                        vals["KINGDOMPVP"] = max(0, min(100, int(parts[1])))
+                    except ValueError:
+                        pass
+                    continue
+                if name == "SCROLL_FROM":
+                    try:
+                        vals["SCROLL_FROM"] = max(1, min(9, int(parts[1])))
                     except ValueError:
                         pass
                     continue
@@ -964,8 +1232,26 @@ def write_ai_weights(vals):
     # Not a weight: whether the core raises the night flag (xmas_snow) between
     # 22:00 and 05:59 of the server's local time.
     body.append("NIGHT\t%d" % (1 if vals.get("NIGHT", 1) else 0))
+    # Not a weight: whether bots play in sessions and log out to rest in
+    # between (experimental, off by default).
+    body.append("LIFE\t%d" % (1 if vals.get("LIFE", 0) else 0))
+    # Not a weight: whether the bots' guilds fight field wars.
+    body.append("WARS\t%d" % (1 if vals.get("WARS", 1) else 0))
+    body.append("TOWER\t%d" % (1 if vals.get("TOWER", 1) else 0))
+    # Not a weight: whether the bots cash their vouchers and buy in the ItemShop.
+    body.append("ISHOP\t%d" % (1 if vals.get("ISHOP", 1) else 0))
+    # Not a weight: Iwakura's personalities, moods and the Grinder's locks.
+    body.append("PERSONA\t%d" % (1 if vals.get("PERSONA", 1) else 0))
     # Percent of stall keepers that sell scrap gear; 0 is off.
     body.append("SCRAP\t%d" % max(0, min(100, int(vals.get("SCRAP", 0)))))
+    # Percent of bots that rest in town after an errand; 0 means nobody does.
+    body.append("REST\t%d" % max(0, min(100, int(vals.get("REST", 100)))))
+    # Percent of bots hostile to the other kingdoms; 0 means the world is at
+    # peace with itself, which is the default the core also starts from.
+    body.append("KINGDOMPVP\t%d" % max(0, min(100, int(vals.get("KINGDOMPVP", 0)))))
+    # The lowest plus a scroll refine may land on; 1 leaves the bots' own
+    # rules alone.
+    body.append("SCROLL_FROM\t%d" % max(1, min(9, int(vals.get("SCROLL_FROM", 1)))))
     # The Moonlight chest: thousandths per kill and per Metin. Written only once
     # the operator has set them, so an untouched install keeps its CONFIG.
     for key in ("CHEST", "CHEST_STONE"):
@@ -975,6 +1261,285 @@ def write_ai_weights(vals):
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("\n".join(body) + "\n")
     os.replace(tmp, AI_WEIGHTS)
+
+
+# The Moonlight chest switch: one click that turns the drop off without
+# losing the two figures the operator had set ("Daj w panelu www mozliwosc
+# wylaczenia dropu szkat blasku", Tieru, 16 September). Off is CHEST 0 and
+# CHEST_STONE 0 in the weights file - what the core reads within five
+# seconds - and the sliders' values kept beside it in a file of the panel's
+# own, because an unknown key in the weights file costs the core a log line
+# on every re-read.
+CHEST_SWITCH = os.path.join(AI_SPOOL, "playerbot_chest_switch.tsv")
+
+# The timed events the game core runs (playerbot_events.h): chest windows,
+# rate windows, and "activate now" lines. Same shape as the weights: the
+# panel writes, the core stats the file every five seconds. The core answers
+# with playerbot_events_status.tsv beside its playerbot_status.tsv.
+EVENTS_FILE = os.path.join(AI_SPOOL, "playerbot_events.tsv")
+EVENT_KINDS = ("chest", "exp", "drop", "yang")
+EVENTS_STATUS_FILES = [
+    "/opt/metin2/var/channel1/game1/playerbot_events_status.tsv",
+    "/opt/metin2/var/channel1/first/playerbot_events_status.tsv",
+    "/opt/metin2/var/channel1/game2/playerbot_events_status.tsv",
+]
+# The bot guilds, one file per core (playerbot_guild.h writes it once a
+# minute): every core knows every guild, but counts only the bots of it
+# standing in its own world, so the page adds the three up.
+GUILD_STATUS_FILES = [
+    "/opt/metin2/var/channel1/game1/playerbot_guild_status.tsv",
+    "/opt/metin2/var/channel1/first/playerbot_guild_status.tsv",
+    "/opt/metin2/var/channel1/game2/playerbot_guild_status.tsv",
+]
+GUILD_TIER_KEYS = ("gl_tier_elite", "gl_tier_strong", "gl_tier_medium", "gl_tier_ordinary")
+GUILD_EMPIRE_KEYS = {1: "gl_empire_shinsoo", 2: "gl_empire_chunjo", 3: "gl_empire_jinno"}
+EVENT_NOW_MINUTES = (15, 30, 60, 120, 180, 360)
+_EVENT_HHMM = re.compile(r"^([01]?\d|2[0-4]):([0-5]\d)$")
+
+
+def event_hhmm(text):
+    """'HH:MM' normalised, or None. 24:00 is a valid end."""
+    m = _EVENT_HHMM.match((text or "").strip())
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if h == 24 and mi != 0:
+        return None
+    return "%02d:%02d" % (h, mi)
+
+
+def read_events():
+    """The file as the page shows it: rows (a row switched off is kept as a
+    '#off' line the core skips) and the 'now' lines by kind."""
+    rows, nows = [], {}
+    try:
+        with open(EVENTS_FILE, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return rows, nows
+    for line in lines:
+        line = line.rstrip("\r")
+        if not line.strip():
+            continue
+        on = True
+        if line.startswith("#off\t"):
+            on = False
+            line = line[len("#off\t"):]
+        elif line.startswith("#"):
+            continue
+        f = line.split("\t")
+        if f[0] == "now" and len(f) >= 4 and f[1] in EVENT_KINDS:
+            try:
+                nows[f[1]] = {"until": int(f[2]), "value": int(f[3])}
+            except ValueError:
+                pass
+            continue
+        if len(f) < 5 or f[0] not in EVENT_KINDS:
+            continue
+        days = [d for d in range(1, 8) if f[1] == "*" or str(d) in f[1].split(",")]
+        start, end = event_hhmm(f[2]), event_hhmm(f[3])
+        if not start or not end:
+            continue
+        try:
+            value = int(f[4])
+        except ValueError:
+            value = 0
+        rows.append({"kind": f[0], "days": days, "start": start, "end": end,
+                     "value": value, "on": on})
+    return rows, nows
+
+
+def write_events(rows, nows):
+    """Replace the file in one step, written beside and renamed over, because
+    the core reads it on its own clock and must never see half of it."""
+    body = ["# Metin2 playerbots -- timed events (the panel's Events page).",
+            "# kind<TAB>days<TAB>from<TAB>to<TAB>value  |  now<TAB>kind<TAB>until_epoch<TAB>value",
+            "# days: * or 1..7 (1 = Monday); a '#off' line is a row switched off.",
+            ""]
+    for r in rows:
+        days = "*" if len(r["days"]) == 7 else (",".join(str(d) for d in r["days"]) or "-")
+        line = "%s\t%s\t%s\t%s\t%d" % (r["kind"], days, r["start"], r["end"], int(r["value"]))
+        body.append(line if r.get("on", True) else "#off\t" + line)
+    for kind in EVENT_KINDS:
+        n = nows.get(kind)
+        if n and int(n.get("until", 0)) > time.time():
+            body.append("now\t%s\t%d\t%d" % (kind, int(n["until"]), int(n.get("value", 0))))
+    tmp = EVENTS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(body) + "\n")
+    os.replace(tmp, EVENTS_FILE)
+
+
+def read_events_status():
+    """What the core last wrote, by kind; {} when no core has written for five
+    minutes (an older core, or none running)."""
+    best, best_written = {}, 0
+    for path in EVENTS_STATUS_FILES:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        cur, written = {}, 0
+        for line in lines[1:]:
+            f = line.rstrip("\r").split("\t")
+            if len(f) < 8 or f[0] not in EVENT_KINDS:
+                continue
+            try:
+                cur[f[0]] = {"scheduled": f[1] == "1", "active": f[2] == "1", "value": int(f[3]),
+                             "until": int(f[4]), "next_start": int(f[5]), "next_value": int(f[6])}
+                written = int(f[7])
+            except ValueError:
+                continue
+        if cur and written > best_written:
+            best, best_written = cur, written
+    if not best or time.time() - best_written > 300:
+        return {}
+    now = time.localtime()
+    for st in best.values():
+        for key in ("until", "next_start"):
+            stamp = st.get(key, 0)
+            if stamp:
+                lt = time.localtime(stamp)
+                same_day = (lt.tm_year, lt.tm_yday) == (now.tm_year, now.tm_yday)
+                st[key + "_text"] = time.strftime("%H:%M" if same_day else "%d.%m %H:%M", lt)
+    return best
+
+
+
+def read_guild_status():
+    """The bot guilds as the cores last reported them: a list of dicts sorted
+    by tier, then level, then members; [] when no core has written for five
+    minutes. Online bots and the experience offered are summed over the cores,
+    everything else is the guild's own (the same on every core)."""
+    guilds, newest = {}, 0
+    for path in GUILD_STATUS_FILES:
+        try:
+            mtime = os.path.getmtime(path)
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        if not lines:
+            continue
+        newest = max(newest, mtime)
+        head = lines[0].rstrip("\r").split("\t")
+        for line in lines[1:]:
+            f = line.rstrip("\r").split("\t")
+            if len(f) < len(head):
+                continue
+            row = dict(zip(head, f))
+            try:
+                gid = int(row.get("guild_id", 0))
+                online = int(row.get("online", 0))
+                avg = int(row.get("avg_strength", 0))
+                offered = int(row.get("exp_offered_here", 0))
+            except ValueError:
+                continue
+            if gid <= 0:
+                continue
+            g = guilds.get(gid)
+            if g is None:
+                g = {"guild_id": gid, "name": row.get("name", ""), "online": 0, "strength_sum": 0,
+                     "exp_offered": 0, "master": row.get("master", "")}
+                for key in ("empire", "tier", "level", "members", "master_pid", "ladder",
+                            "wins", "draws", "losses", "war_score", "war_enemy_score"):
+                    try:
+                        g[key] = int(row.get(key, 0))
+                    except ValueError:
+                        g[key] = 0
+                g["war_with"] = row.get("war_with", "")
+                g["next_war_in_s"] = None
+                g["tower_raid"] = 0
+                guilds[gid] = g
+            # The kingdom's next war, as the core that hosts its guild map
+            # counts it (0 = under way, -1 = none scheduled); a core that
+            # does not host it writes -1, so the best answer wins.
+            try:
+                nw = int(row.get("next_war_in_s", -1))
+            except ValueError:
+                nw = -1
+            if nw >= 0 and (g["next_war_in_s"] is None or g["next_war_in_s"] < 0 or nw < g["next_war_in_s"]):
+                g["next_war_in_s"] = nw
+            if not g["master"] and row.get("master"):
+                g["master"] = row["master"]
+            if not g["war_with"] and row.get("war_with"):
+                g["war_with"] = row["war_with"]
+            if row.get("tower_raid", "0").strip() == "1":
+                g["tower_raid"] = 1
+            g["online"] += online
+            g["strength_sum"] += avg * online
+            g["exp_offered"] += offered
+    if not guilds or time.time() - newest > 300:
+        return []
+    out = []
+    for g in guilds.values():
+        g["avg_strength"] = g["strength_sum"] // g["online"] if g["online"] else 0
+        g["tier_key"] = GUILD_TIER_KEYS[min(max(g["tier"], 0), 3)]
+        g["empire_key"] = GUILD_EMPIRE_KEYS.get(g["empire"], "gl_empire_unknown")
+        out.append(g)
+    out.sort(key=lambda g: (g["tier"], -g["level"], -g["members"], g["name"]))
+    return out
+
+
+def read_chest_switch():
+    """(off, saved_kill, saved_stone); the saved values are None until set."""
+    off, kill, stone = False, None, None
+    try:
+        with open(CHEST_SWITCH, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                parts = line.replace("\t", " ").split()
+                if len(parts) < 2:
+                    continue
+                try:
+                    value = int(parts[1])
+                except ValueError:
+                    continue
+                if parts[0] == "off":
+                    off = value == 1
+                elif parts[0] == "kill":
+                    kill = max(0, min(1000, value))
+                elif parts[0] == "stone":
+                    stone = max(0, min(1000, value))
+    except OSError:
+        pass
+    return off, kill, stone
+
+
+def write_chest_switch(off, kill, stone):
+    body = ["off\t%d" % (1 if off else 0)]
+    if kill is not None:
+        body.append("kill\t%d" % max(0, min(1000, int(kill))))
+    if stone is not None:
+        body.append("stone\t%d" % max(0, min(1000, int(stone))))
+    tmp = CHEST_SWITCH + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(body) + "\n")
+    os.replace(tmp, CHEST_SWITCH)
+
+
+# Whether the bots are still waiting at the door. The migrator writes this
+# file for a world it has just made, when the launcher was told to hold them,
+# and this page is where they are let in. "1" holds; anything else, including
+# no file at all, does not - so an install that never heard of it behaves as
+# it always did. The core reads it on the weights clock, five seconds.
+BOT_HOLD_FILE = os.path.join(AI_SPOOL, "playerbot_hold")
+
+
+def read_bot_hold():
+    """True while the bots are held. A file nobody can read is not a hold."""
+    try:
+        with open(BOT_HOLD_FILE, encoding="utf-8", errors="replace") as fh:
+            return fh.read(32).strip().startswith("1")
+    except OSError:
+        return False
+
+
+def write_bot_hold(held):
+    tmp = BOT_HOLD_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("1\n" if held else "0\n")
+    os.replace(tmp, BOT_HOLD_FILE)
 
 
 LANG_SPOOL   = _env_path("M2PANEL_LANG_SPOOL", "/opt/m2spool")
@@ -1100,7 +1665,7 @@ def _conf_from_env():
     for key in ENV_CONF:
         raw = os.environ.get("M2PANEL_" + key.upper(), "").strip()
         if not raw:
-            continue
+            continue              # not said; local_only then follows the bind address
         if key in ("port", "inventory_slots", "max_item_count", "max_level", "bridge_port",
                    "browser_cache_mb"):
             try:
@@ -1251,7 +1816,7 @@ BRAND = str(CONF.get("brand", "") or "").strip() or "Singleplayer Official Metin
 # An operator who wants a different address edits this line, which is a change
 # to the software and shows up as one -- not a setting that quietly diverges
 # between installs and leaves players pointed at nothing.
-DISCORD_URL = "https://discord.gg/SSHajSeHm"
+DISCORD_URL = "https://discord.gg/pt5tvnrN6"
 
 CLIENT_NAME  = str(CONF.get("client_name", "Metin2 Client") or "").strip()
 CLIENT_FILE  = _client_download_name(CLIENT_NAME)
@@ -1576,10 +2141,22 @@ def local_changelog():
 # executed, unpacked or written to disk as code. Two files are read and only
 # two: VERSION (64 bytes, and only three numbers of it are believed) and
 # CHANGELOG.md (text, escaped before it is ever shown).
+# The two engine lines publish two VERSION files in one repository: the root
+# one is the r40250 line's, linux-port-mt2009/VERSION the mt2009 line's. The
+# check used to read the root one whatever the engine, so a 2.0.5 panel
+# compared itself with 1.33.3 and said "you have the newest" for ever
+# (archded, l0st3k, 12 September). The engine flag is read here, ahead of
+# the rest of the engine-specific setup below, because this URL needs it.
+UPDATE_ENGINE = os.environ.get("M2PANEL_ENGINE", "r40250").strip().lower()
 UPDATE_BASE_URL = _env_path(
     "M2PANEL_UPDATE_URL",
     "https://raw.githubusercontent.com/TieruYT/"
     "metin2-playerbots/main")
+# Where this engine's VERSION lives under that base; the changelog is shared.
+UPDATE_VERSION_PATH = "/linux-port-mt2009/VERSION" if UPDATE_ENGINE == "mt2009" else "/VERSION"
+# The other line's VERSION, so a 1.x panel can say that 2.x exists. Only the
+# r40250 line looks across: a 2.x install has nothing to move to.
+UPDATE_NEXT_LINE_PATH = "/linux-port-mt2009/VERSION" if UPDATE_ENGINE != "mt2009" else ""
 
 UPDATE_TIMEOUT  = 8             # seconds, hard, on every network operation
 UPDATE_EVERY    = 24 * 3600     # after a successful check
@@ -1598,7 +2175,8 @@ _UPD = {"checked": 0.0,   # last SUCCESSFUL check
         "tried":   0.0,   # last attempt, successful or not
         "latest":  "",    # last version seen published
         "notes":   "",    # its changelog, fetched only when it is newer
-        "error":   ""}    # short, non-technical reason the last attempt failed
+        "error":   "",    # short, non-technical reason the last attempt failed
+        "next_line": ""}  # the 2.x line's version, seen from a 1.x panel
 
 _UPD_LOCK = threading.Lock()
 
@@ -1618,6 +2196,8 @@ def _upd_load():
                 pass
         latest = str(saved.get("latest") or "")
         _UPD["latest"] = latest if semver(latest) else ""
+        next_line = str(saved.get("next_line") or "")
+        _UPD["next_line"] = next_line if semver(next_line) else ""
         _UPD["notes"]  = str(saved.get("notes") or "")[:CHANGELOG_MAX]
         _UPD["error"]  = str(saved.get("error") or "")[:200]
 
@@ -1665,10 +2245,18 @@ def _update_check_now():
     """One attempt. Never raises: a failure is a recorded fact, not an event."""
     now = time.time()
     try:
-        raw = _update_fetch(UPDATE_BASE_URL + "/VERSION", 64)
+        raw = _update_fetch(UPDATE_BASE_URL + UPDATE_VERSION_PATH, 64)
         first = (raw.strip().splitlines() or [""])[0].strip()
         if not semver(first):
             raise ValueError("the published VERSION is not a version")
+        next_line = ""
+        if UPDATE_NEXT_LINE_PATH:
+            try:
+                raw2 = _update_fetch(UPDATE_BASE_URL + UPDATE_NEXT_LINE_PATH, 64)
+                cand = (raw2.strip().splitlines() or [""])[0].strip()
+                next_line = cand if semver(cand) else ""
+            except Exception:
+                next_line = ""      # the other line is a courtesy, never an error
         notes = ""
         if semver_newer(first, PANEL_VERSION):
             # Only now is the changelog worth the bytes -- and only then does
@@ -1678,7 +2266,8 @@ def _update_check_now():
             except Exception:
                 notes = ""      # the version alone is still worth having
         with _UPD_LOCK:
-            _UPD.update(checked=now, tried=now, latest=first, notes=notes, error="")
+            _UPD.update(checked=now, tried=now, latest=first, notes=notes, error="",
+                        next_line=next_line)
     except Exception as exc:
         with _UPD_LOCK:
             # Keep whatever was known before; only the attempt failed.
@@ -1711,12 +2300,16 @@ def update_state():
     """What the templates ask. Reads memory only -- never the network."""
     with _UPD_LOCK:
         latest, checked, error = _UPD["latest"], _UPD["checked"], _UPD["error"]
+        next_line = _UPD["next_line"]
     return {"enabled":   UPDATE_CHECK,
             "current":   PANEL_VERSION,
             "latest":    latest,
             "available": semver_newer(latest, PANEL_VERSION),
             "checked":   checked,
-            "error":     error}
+            "error":     error,
+            # A 1.x panel with a 2.x line published: not an update it can
+            # install, so never "available" - said beside the version instead.
+            "next_line": next_line if (next_line and semver_newer(next_line, PANEL_VERSION)) else ""}
 
 def update_notes():
     """The published changelog, when there is a newer version. Text, not HTML."""
@@ -2029,13 +2622,114 @@ def translate_item_name_pl(name):
                       flags=re.IGNORECASE)
     return name
 
+# On mt2009 the files above are r40250's: items.json carries that engine's
+# English names and cell sizes, item_names_pl.txt its Polish table, and the
+# panel fell back on word-by-word translation for the rest - "Leather Buty",
+# "Wooden Kolczyki", "Azure Suit" beside "Sztylet", "Przedmiot #30347" for
+# an item the other engine never had, and a two-cell dagger drawn in one
+# cell. The db core mirrors the package's item_proto.txt and item_names.txt
+# into player.item_proto at every boot (locale_name is the Polish name on
+# this package), so that table is the one source that is always right for
+# this world. Read once the database answers, and again every hour.
+ITEM_SIZES = {}
+ITEM_TYPES = {}
+# What the tooltip's base lines are computed from, per vnum: the proto's
+# type/subtype, value0..5, the fixed applies and the level limit - the same
+# fields the static item_defs.json carries for r40250, so the tooltip code
+# needs no second path. Without this an mt2009 world showed the other
+# engine's attack values on a vnum both have, and nothing on the rest.
+ITEM_BASE = {}
+_PROTO = {"loaded": 0.0, "tried": 0.0}
+_PROTO_LOCK = threading.Lock()
+
+def _load_item_proto():
+    """The world's items into ITEMS / ITEM_NAMES / ITEM_NAMES_PL / ITEM_SIZES."""
+    global ITEMS
+    with _PROTO_LOCK:
+        now = time.time()
+        if now - _PROTO["tried"] < 60:
+            return
+        _PROTO["tried"] = now
+        try:
+            with db() as c, c.cursor() as cur:
+                # Both name columns are cp1250_polish_ci on this package and
+                # the panel's connection is latin1, so the server converts on
+                # the way out and every letter latin1 lacks - l with a stroke,
+                # s/z/n with an acute, e with an ogonek - arrives as "?"
+                # ("Skrzyd?a Demona", "Zw?j B?ogos?awie?stwa" in 2.0.13). The
+                # bytes are asked for as they are and decoded here.
+                cur.execute("SELECT vnum, CAST(name AS BINARY) AS name, "
+                            "CAST(locale_name AS BINARY) AS locale_name, "
+                            "type, subtype, size, "
+                            "value0, value1, value2, value3, value4, value5, "
+                            "applytype0, applyvalue0, applytype1, applyvalue1, "
+                            "applytype2, applyvalue2, "
+                            "limittype0, limitvalue0, limittype1, limitvalue1 "
+                            "FROM player.item_proto")
+                rows = cur.fetchall()
+        except Exception:
+            return
+        if not rows:
+            return
+        items = []
+        for r in rows:
+            vnum = int(r["vnum"] or 0)
+            pl = log_text(r.get("locale_name")).strip()
+            en = log_text(r.get("name")).strip() or pl
+            if not pl:
+                continue
+            ITEM_NAMES_PL[vnum] = pl
+            ITEM_NAMES[vnum] = pl
+            ITEM_SIZES[vnum] = max(1, min(3, int(r.get("size") or 1)))
+            ITEM_TYPES[vnum] = (int(r.get("type") or 0), int(r.get("subtype") or 0))
+            base = {"type": ITEM_TYPES[vnum][0], "subtype": ITEM_TYPES[vnum][1]}
+            for k in range(6):
+                base["value%d" % k] = int(r.get("value%d" % k) or 0)
+            # The proto's applies are POINT numbers here like the bonus
+            # lines, and the tooltip puts them through the same table.
+            base["apply"] = [{"type": int(r.get("applytype%d" % k) or 0),
+                              "val": int(r.get("applyvalue%d" % k) or 0)}
+                             for k in range(3) if int(r.get("applytype%d" % k) or 0)]
+            # LIMIT_LEVEL is 1 on both engines (item_length.h).
+            level = 0
+            for k in range(2):
+                if int(r.get("limittype%d" % k) or 0) == 1:
+                    level = int(r.get("limitvalue%d" % k) or 0)
+            base["level"] = level
+            ITEM_BASE[vnum] = base
+            items.append({"v": vnum, "n": pl, "k": (pl + " " + en).lower(),
+                          "c": ITEM_CATEGORY_BY_TYPE.get(int(r.get("type") or 0), "other")})
+        ITEMS = items
+        _PROTO["loaded"] = now
+
+# items.json sorts by a category word; the proto only has the type number.
+ITEM_CATEGORY_BY_TYPE = {1: "weapon", 2: "armor", 3: "use", 4: "autouse", 5: "material",
+                         6: "special", 7: "tool", 8: "lottery", 9: "elk", 10: "metin",
+                         11: "container", 12: "fish", 13: "rod", 14: "resource", 15: "campfire",
+                         16: "unique", 17: "skillbook", 18: "quest", 19: "polymorph",
+                         20: "treasure_box", 21: "treasure_key", 22: "skillforget",
+                         23: "giftbox", 24: "pick", 26: "hair", 27: "totem", 28: "blend",
+                         29: "costume", 30: "des", 31: "ring", 32: "belt"}
+
+def item_proto_ready():
+    """On mt2009: the world's tables, loaded on first use and refreshed hourly.
+    Called on the request path; a database that is still starting costs one
+    failed query a minute and the r40250 files stand in until it answers."""
+    if not ENGINE_MT2009:
+        return
+    if time.time() - _PROTO["loaded"] > 3600:
+        _load_item_proto()
+
 def localized_item_name(vnum, language=None):
+    item_proto_ready()
     language = language or (lang() if has_request_context() else "en")
     if language == "pl" and int(vnum or 0) in ITEM_NAMES_PL:
         return ITEM_NAMES_PL[int(vnum or 0)]
     name = ITEM_NAMES.get(vnum, "")
     if not name:
         return ("Przedmiot #%d" if language == "pl" else "Item #%d") % int(vnum or 0)
+    if ENGINE_MT2009:
+        return name          # the package's own name, in the package's language
     return translate_item_name_pl(name) if language == "pl" else name
 
 # ---- UI translations -------------------------------------------------------
@@ -2336,9 +3030,71 @@ T = {
                   "de":"🚀 Schnell — Erfahrung 1000%, Gegenstände 500%, Yang 500%",
                   "tr":"🚀 Hızlı — tecrübe 1000%, eşya 500%, yang 500%"},
  "rates_save":   {"pl":"💾 Zapisz i zrestartuj serwer","en":"💾 Save and restart the server","de":"💾 Speichern und Server neu starten","tr":"💾 Kaydet ve sunucuyu yeniden başlat"},
+ "regen_title": {"pl":"Czas odradzania Metinów, bossów i potworów",
+                 "en":"Respawn time of Metin stones, bosses and monsters"},
+ "regen_help":  {"pl":"Procent zwykłego czasu odradzania: 100 = jak w grze, 50 = dwa razy szybciej, 10 = dziesięć razy szybciej. Działa od razu (przez pomocnika w grze), a po restarcie zostaje. Osobno dla Metinów i bossów, osobno dla zwykłych potworów.",
+                 "en":"Percent of the normal respawn time: 100 = as in the game, 50 = twice as fast, 10 = ten times as fast. Live at once (through the in-game helper) and kept across a restart. Stones and bosses apart from ordinary monsters."},
+ "regen_boss":  {"pl":"Metiny i bossowie (% czasu)", "en":"Metin stones and bosses (% of time)"},
+ "regen_mob":   {"pl":"Zwykłe potwory (% czasu)", "en":"Ordinary monsters (% of time)"},
+ "regen_faster": {"pl":"Szybciej:", "en":"Faster:"},
+ "regen_mult":  {"pl":"≈ ×{n} szybciej niż w grze", "en":"≈ ×{n} faster than the game"},
+ "regen_save":  {"pl":"Zapisz czasy odradzania", "en":"Save the respawn times"},
+ "regen_range": {"pl":"Obie wartości muszą być liczbą całkowitą od 10 do 100. Nic nie zmieniono.",
+                 "en":"Both have to be whole numbers between 10 and 100. Nothing was changed."},
+ "regen_saved_live": {"pl":"✅ Zapisano! Nowe czasy odradzania działają już w grze, bez restartu.",
+                      "en":"✅ Saved! The new respawn times are live in game, no restart needed."},
+ "regen_saved_restart": {"pl":"Zapisano. Nikt nie jest zalogowany, więc pomocnik w grze nie odpowiedział — nowe czasy zadziałają po restarcie serwera (albo zapisz jeszcze raz, gdy ktoś będzie w grze).",
+                         "en":"Saved. Nobody is logged in, so the in-game helper did not answer — the new times apply after a server restart (or save again while somebody is in game)."},
+ "count_title": {"pl":"Liczba potworów w respie", "en":"Monsters per respawn"},
+ "count_help":  {"pl":"Ile potworów stoi w każdym miejscu respu: ×1 = jak w grze, ×2 = dwa razy więcej, aż do ×4. Nie trzeba restartu, a po restarcie ustawienie zostaje; dodatkowe potwory dochodzą przy najbliższym respie danego miejsca (Metiny i bossowie po swoim czasie odradzania, zwykle 15–25 minut). Osobno dla Metinów i bossów, osobno dla zwykłych potworów. Postacie niezależne (także żyły rud i krzaki ziół), portale, lochy i jednorazowe respy z misji zostają bez zmian.",
+                 "en":"How many monsters stand at each spawn point: ×1 = as in the game, ×2 = twice as many, up to ×4. No restart needed and kept across one; the extra monsters come at each spot's next respawn (stones and bosses after their own respawn time, usually 15-25 minutes). Stones and bosses apart from ordinary monsters. NPCs (ore veins and herb bushes too), portals, dungeons and a quest's one-off spawns are left alone."},
+ "count_warn":  {"pl":"Uwaga: ×2 to dwa razy więcej potworów na każdej mapie — serwer i boty mają przez to więcej pracy. Po zmniejszeniu mnożnika nadmiarowe potwory znikają dopiero, gdy ktoś je zabije.",
+                 "en":"Mind: ×2 is twice as many monsters on every map, and the server and the bots work that much harder. After lowering it, the extra monsters go only as they are killed."},
+ "count_boss":  {"pl":"Metiny i bossowie", "en":"Metin stones and bosses"},
+ "count_mob":   {"pl":"Zwykłe potwory", "en":"Ordinary monsters"},
+ "count_save":  {"pl":"Zapisz liczbę potworów", "en":"Save the monster counts"},
+ "count_range": {"pl":"Wybierz mnożnik od ×1 do ×4. Nic nie zmieniono.",
+                 "en":"Pick a multiplier from ×1 to ×4. Nothing was changed."},
+ "count_saved_live": {"pl":"✅ Zapisano! Nowa liczba potworów działa już w grze — dosypie się przy najbliższym respie.",
+                      "en":"✅ Saved! The new counts are live in game and fill in at the next respawn."},
+ "count_saved_restart": {"pl":"Zapisano. Nikt nie jest zalogowany, więc pomocnik w grze nie odpowiedział — nowa liczba potworów zadziała po restarcie serwera (albo zapisz jeszcze raz, gdy ktoś będzie w grze).",
+                         "en":"Saved. Nobody is logged in, so the in-game helper did not answer — the new counts apply after a server restart (or save again while somebody is in game)."},
+ "ch2_title":   {"pl":"Drugi kanał (CH2)", "en":"Second channel (CH2)"},
+ "ch2_help":    {"pl":"Drugi kanał gry. Część botów gra na CH2, więc serwer rozkłada je na dwa rdzenie procesora i udźwignie więcej botów naraz. Wszystkie sklepy (botów i graczy) stoją tylko na CH1: bot z CH2, który chce otworzyć albo obsłużyć swój sklep albo coś kupić, przechodzi na CH1, a wolny bot z CH1 przechodzi na jego miejsce na CH2. Ustawiony udział to najmniej tyle botów na CH2; gdy nikt nie czeka na przejście, CH2 może przejąć do 10 punktów więcej. Domyślnie wyłączony.",
+                 "en":"A second game channel. Some of the bots play on CH2, so the server spreads them over two CPU cores and carries more bots at once. Every shop, bots' and players', stands on CH1: a bot on CH2 that wants to open or serve its shop or to buy something moves to CH1, and a free bot of CH1 moves to CH2 in its place. The share set here is the least CH2 carries; with nobody waiting to move, CH2 may take up to ten points more. Off by default."},
+ "ch2_enable":  {"pl":"Włącz drugi kanał (CH2)", "en":"Switch the second channel on (CH2)"},
+ "ch2_share":   {"pl":"Botów na CH2", "en":"Bots on CH2"},
+ "ch2_save":    {"pl":"Zapisz (zadziała po restarcie serwera)", "en":"Save (applies after a server restart)"},
+ "ch2_now_off": {"pl":"Teraz: CH2 wyłączony - wszystkie boty grają na CH1.", "en":"Now: CH2 is off - every bot plays on CH1."},
+ "ch2_now_on":  {"pl":"Teraz: CH2 włączony, na CH2 gra {share}% botów.", "en":"Now: CH2 is on, {share}% of the bots play on it."},
+ "ch2_ports":   {"pl":"Gracze wejdą na CH2 po najbliższym uruchomieniu serwera z launchera (GRAJ) - launcher otworzy wtedy porty 13010-13012. Boty grają na CH2 już teraz.",
+                 "en":"Players reach CH2 after the next start from the launcher (GRAJ), which opens ports 13010-13012 then. The bots play on CH2 already."},
+ "ch2_pending": {"pl":"Zapisano w panelu: {what}. Zadziała po restarcie serwera.", "en":"Saved in the panel: {what}. Applies after a server restart."},
+ "ch2_on_word": {"pl":"CH2 włączony, {share}% botów", "en":"CH2 on, {share}% of the bots"},
+ "ch2_off_word": {"pl":"CH2 wyłączony", "en":"CH2 off"},
+ "ch2_saved":   {"pl":"✅ Zapisano. Zmiana kanałów zadziała po restarcie serwera (GRAJ w launcherze albo restart kontenera gry).",
+                 "en":"✅ Saved. The channel change applies after a server restart (GRAJ in the launcher or a restart of the game container)."},
+ "ch2_bad":     {"pl":"Udział botów na CH2 musi być liczbą od 10 do 90. Nic nie zmieniono.", "en":"The share of bots on CH2 has to be between 10 and 90. Nothing was changed."},
+ "ch2_failed":  {"pl":"Nie udało się zapisać ustawienia kanałów w katalogu wymiany z serwerem.", "en":"Could not write the channel setting into the spool shared with the server."},
  "rates_range":  {"pl":"Każda z trzech wartości musi być liczbą całkowitą od 1 do 10000. Nic nie zmieniono. 🙂","en":"Each of the three has to be a whole number between 1 and 10000. Nothing was changed. 🙂",
                   "de":"Alle drei müssen ganze Zahlen zwischen 1 und 10000 sein. Es wurde nichts geändert. 🙂",
                   "tr":"Üçü de 1 ile 10000 arasında tam sayı olmalı. Hiçbir şey değiştirilmedi. 🙂"},
+ "rates_saved_live":{"pl":"✅ Zapisano! Nowe mnożniki działają już w grze, bez restartu.",
+                  "en":"✅ Saved! The new rates are live in game, no restart needed.",
+                  "de":"✅ Gespeichert! Die neuen Raten gelten sofort im Spiel, ohne Neustart.",
+                  "tr":"✅ Kaydedildi! Yeni oranlar oyunda hemen geçerli, yeniden başlatma gerekmez."},
+ "rates_intro_mt2009":{"pl":"Te trzy liczby decydują, jak szybko toczy się cały serwer. 100% to dokładnie tak, jak gra została stworzona — wyżej znaczy szybciej. Gdy ktoś jest zalogowany w grze, zapis działa od razu; w przeciwnym razie serwer gry restartuje się sam i grający zostają na chwilę rozłączeni.",
+                  "en":"These three numbers decide how fast the whole server runs. 100% is exactly as the game was made — higher means faster. While somebody is logged in, saving applies at once; otherwise the game server restarts itself and players are briefly disconnected.",
+                  "de":"Diese drei Zahlen bestimmen, wie schnell der ganze Server läuft. 100% ist genau so, wie das Spiel gemacht wurde — höher heißt schneller. Ist jemand eingeloggt, gilt das Speichern sofort; sonst startet der Spielserver von selbst neu und die Spieler werden kurz getrennt.",
+                  "tr":"Bu üç sayı tüm sunucunun ne kadar hızlı ilerlediğini belirler. %100, oyunun yapıldığı haliyle aynıdır — daha yüksek, daha hızlı demektir. Biri oyundaysa kayıt hemen geçerli olur; aksi halde oyun sunucusu kendini yeniden başlatır ve oyuncular kısa süre bağlantıyı kaybeder."},
+ "gm_granted_restart":{"pl":"{name} ma teraz rangę {rank}. Serwer wczyta nowe uprawnienia przy najbliższym restarcie — albo od razu, gdy zalogowany GM wpisze w grze /reload a.",
+                  "en":"{name} is now {rank}. The server reads the new rights at its next restart — or right away when a logged-in GM types /reload a in game.",
+                  "de":"{name} ist jetzt {rank}. Der Server liest die neuen Rechte beim nächsten Neustart — oder sofort, wenn ein eingeloggter GM im Spiel /reload a eingibt.",
+                  "tr":"{name} artık {rank}. Sunucu yeni yetkileri bir sonraki yeniden başlatmada okur — ya da oyundaki bir GM /reload a yazdığında hemen."},
+ "gm_removed_restart":{"pl":"{name} jest znów zwykłym graczem. Komendy zachowuje do najbliższego restartu serwera (albo do /reload a wpisanego przez zalogowanego GM) i ponownego zalogowania.",
+                  "en":"{name} is a normal player again. The commands stay until the next server restart (or /reload a typed by a logged-in GM) and a relogin.",
+                  "de":"{name} ist wieder normaler Spieler. Die Befehle bleiben bis zum nächsten Server-Neustart (oder /reload a eines eingeloggten GM) und einem erneuten Einloggen.",
+                  "tr":"{name} yeniden normal oyuncu. Komutlar bir sonraki sunucu yeniden başlatmasına (ya da oyundaki bir GM /reload a yazana) ve tekrar girişe kadar kalır."},
  "rates_saved":  {"pl":"✅ Zapisano! Serwer gry właśnie się restartuje i powinien wrócić w niecałą minutę. Odśwież tę stronę za chwilę, aby zobaczyć wynik.","en":"✅ Saved! The game server is restarting now and should be back in under a minute. Give this page a reload in a moment to see how it went.",
                   "de":"✅ Gespeichert! Der Spielserver startet gerade neu und sollte in weniger als einer Minute wieder da sein. Lade diese Seite gleich neu, um das Ergebnis zu sehen.",
                   "tr":"✅ Kaydedildi! Oyun sunucusu şimdi yeniden başlıyor, bir dakikadan kısa sürede geri gelmeli. Sonucu görmek için birazdan bu sayfayı yenile."},
@@ -2612,6 +3368,7 @@ T = {
  "pl_check_wait":{"pl":"Sprawdzono przed chwilą — daj temu minutę.","en":"Just checked a moment ago — give it a minute.","de":"Gerade eben schon geprüft — gib ihm eine Minute.","tr":"Az önce kontrol edildi — bir dakika bekle."},
  "pl_open":      {"pl":"📜 Otwórz listę zmian","en":"📜 Open the patch log","de":"📜 Patchlog öffnen","tr":"📜 Sürüm notlarını aç"},
  "upd_none":     {"pl":"To najnowsza opublikowana wersja.","en":"This is the newest published version.","de":"Das ist die neueste veröffentlichte Version.","tr":"Bu, yayımlanan en yeni sürüm."},
+ "upd_next_line": {"pl":"Istnieje też linia 2.x (silnik mt2009, wersja {new}). To osobna paczka z Discorda, nie aktualizacja tej instalacji — ten launcher i klient 1.x z nią nie działają.","en":"There is also the 2.x line (mt2009 engine, version {new}). It is a separate package from the Discord, not an update of this install — this launcher and the 1.x client do not work with it.","de":"Es gibt auch die 2.x-Linie (mt2009-Engine, Version {new}). Das ist ein eigenes Paket vom Discord, kein Update dieser Installation — dieser Launcher und der 1.x-Client funktionieren damit nicht.","tr":"Ayrıca 2.x hattı var (mt2009 motoru, sürüm {new}). Bu, Discord'dan ayrı bir pakettir, bu kurulumun güncellemesi değil — bu başlatıcı ve 1.x istemcisi onunla çalışmaz."},
  "upd_never":    {"pl":"Jeszcze nie sprawdzono — pierwsze sprawdzenie następuje kilka minut po starcie panelu.","en":"Not checked yet — the first check happens a couple of minutes after the panel starts.",
                   "de":"Noch nicht geprüft — die erste Prüfung läuft ein paar Minuten nach dem Start des Panels.",
                   "tr":"Henüz kontrol edilmedi — ilk kontrol panel başladıktan birkaç dakika sonra yapılır."},
@@ -2718,6 +3475,52 @@ T.update({
                   "de":"Zwischen 22:00 und 05:59 Serverzeit (M2_TZ) setzt der Kern die Nacht-Flagge - dieselbe, die ein GM mit /xmas_snow 1 setzt - und nimmt sie morgens zurück. Der Client zeigt den Nachthimmel und, weil es die Weihnachtsflagge ist, Schnee.",
                   "tr":"Sunucu saatine göre (M2_TZ) 22:00-05:59 arasında çekirdek gece bayrağını kaldırır - GM'in /xmas_snow 1 ile ayarladığı bayrağın aynısı - ve sabah indirir. İstemci gece gökyüzünü ve, bayrak Noel bayrağı olduğu için, kar gösterir."},
  "ai_night_on":  {"en":"Enabled","pl":"Włączone","de":"Eingeschaltet","tr":"Açık"},
+ "ai_life":      {"en":"Bots play like people","pl":"Boty grają jak żywi ludzie","de":"Bots spielen wie Menschen","tr":"Botlar insan gibi oynar"},
+ "ai_life_help": {"en":"Experimental. Each bot plays a session of 3-6 hours (the first after a start from half an hour up), logs out, rests 3-9 hours and comes back - about two bots in five are online at any moment. Off, every bot stays in the world as before. Applies within a minute; switching it off brings the resting bots back within a few minutes. A bot in a player's party waits before logging out.",
+                  "pl":"Eksperymentalne. Każdy bot gra sesję 3–6 godzin (pierwszą po starcie serwera od pół godziny wzwyż), wylogowuje się, odpoczywa 3–9 godzin i wraca — w danej chwili online jest około dwóch botów na pięć. Wyłączone: wszystkie boty są w świecie jak dotąd. Działa w ciągu minuty; wyłączenie sprowadza odpoczywające boty z powrotem w kilka minut. Bot w drużynie gracza czeka z wylogowaniem.",
+                  "de":"Experimentell. Jeder Bot spielt eine Sitzung von 3-6 Stunden (die erste nach einem Start ab einer halben Stunde), loggt sich aus, ruht 3-9 Stunden und kommt zurück - etwa zwei von fünf Bots sind jeweils online. Aus: alle Bots bleiben wie bisher in der Welt. Greift innerhalb einer Minute; Ausschalten holt die ruhenden Bots in wenigen Minuten zurück. Ein Bot in der Gruppe eines Spielers wartet mit dem Ausloggen.",
+                  "tr":"Deneysel. Her bot 3-6 saatlik bir oturum oynar (başlangıçtan sonraki ilki yarım saatten itibaren), çıkış yapar, 3-9 saat dinlenir ve geri gelir - her an botların yaklaşık beşte ikisi çevrimiçidir. Kapalıyken tüm botlar eskisi gibi dünyada kalır. Bir dakika içinde uygulanır; kapatmak dinlenen botları birkaç dakika içinde geri getirir. Bir oyuncunun grubundaki bot çıkış yapmadan bekler."},
+ "ai_life_on":   {"en":"Enabled (experimental)","pl":"Włączone (eksperymentalne)","de":"Eingeschaltet (experimentell)","tr":"Açık (deneysel)"},
+ "ai_wars":      {"en":"Guild wars between the bots","pl":"Wojny gildii botów","de":"Gildenkriege der Bots","tr":"Botların lonca savaşları"},
+ "ai_wars_help": {"en":"Every two hours or so two bot guilds of one kingdom fight a field war on that kingdom's guild map: thirty minutes, the game's own declaration and scoring, a notice on the chat when it starts. A guild needs eight bots online to be picked. Off: no new war is declared; one under way is fought to its end.",
+                  "pl":"Mniej więcej co dwie godziny dwie gildie botów z jednego królestwa toczą wojnę polową na mapie gildyjnej tego królestwa: trzydzieści minut, wypowiedzenie i punktacja gry, komunikat na czacie przy starcie. Gildia musi mieć osiem botów online, żeby ją wylosowano. Wyłączone: nowa wojna nie jest wypowiadana; trwająca dobiega końca.",
+                  "de":"Etwa alle zwei Stunden führen zwei Bot-Gilden eines Königreichs einen Feldkrieg auf der Gildenkarte dieses Königreichs: dreißig Minuten, Kriegserklärung und Wertung des Spiels selbst, eine Meldung im Chat beim Start. Eine Gilde braucht acht Bots online, um gewählt zu werden. Aus: kein neuer Krieg wird erklärt; ein laufender wird zu Ende gekämpft.",
+                  "tr":"Yaklaşık iki saatte bir, aynı krallıktan iki bot loncası o krallığın lonca haritasında bir saha savaşı yapar: otuz dakika, oyunun kendi ilanı ve puanlaması, başlangıçta sohbette bir duyuru. Bir loncanın seçilmesi için sekiz botu çevrimiçi olmalı. Kapalı: yeni savaş ilan edilmez; süren savaş sonuna kadar oynanır."},
+ "ai_wars_on":   {"en":"Enabled","pl":"Włączone","de":"Eingeschaltet","tr":"Açık"},
+ "ai_tower":     {"en":"Bot guilds climb the Demon Tower","pl":"Gildie botów chodzą do Wieży Demonów","de":"Bot-Gilden steigen in den Dämonenturm","tr":"Bot loncaları Şeytan Kulesi'ne çıkar"},
+ "ai_tower_help": {"en":"About every hour and a half one bot guild of this core calls its members of level 40 and up to the tower's ground floor (the game says it on the chat), they break the Metin of Toughness together after four minutes and climb the floors: monsters, stones, keys and seals as in the game; from the sixth floor on a bot of 75 is needed, as for players. Whoever stands on the ground floor when the stone breaks - a bot on its errand, a player who came to watch - goes in with them. 'Now' calls a raid on the core's next check when none is under way.",
+                  "pl":"Mniej więcej co półtorej godziny jedna gildia botów tego rdzenia zwołuje członków od 40. poziomu na parter Wieży (ogłoszenie na czacie), po czterech minutach razem rozbijają Metin Twardości i przechodzą piętra: potwory, kamienie, klucze i pieczęcie jak w grze; od 6. piętra potrzebny jest bot z 75. poziomem, tak jak u graczy. Kto stoi na parterze, gdy pęka kamień — bot na własnej misji albo gracz, który przyszedł popatrzeć — wchodzi razem z nimi. „Teraz” zwołuje wyprawę przy najbliższym sprawdzeniu rdzenia, jeśli żadna nie trwa.",
+                  "de":"Etwa alle anderthalb Stunden ruft eine Bot-Gilde dieses Kerns ihre Mitglieder ab Stufe 40 ins Erdgeschoss des Turms (Ansage im Chat), nach vier Minuten zerschlagen sie gemeinsam den Metin der Härte und steigen die Etagen hinauf: Monster, Steine, Schlüssel und Siegel wie im Spiel; ab der sechsten Etage wird ein Bot mit Stufe 75 gebraucht, wie bei Spielern. Wer beim Zerbrechen des Steins im Erdgeschoss steht - ein Bot auf seinem Botengang, ein zuschauender Spieler - geht mit hinein. 'Jetzt' ruft beim nächsten Check des Kerns eine Expedition, wenn keine läuft.",
+                  "tr":"Yaklaşık her bir buçuk saatte bu çekirdeğin bir bot loncası 40 ve üzeri üyelerini kulenin zemin katına çağırır (sohbette duyurulur), dört dakika sonra Sertlik Metini'ni birlikte kırar ve katları çıkarlar: canavarlar, taşlar, anahtarlar ve mühürler oyundaki gibi; 6. kattan itibaren oyuncularda olduğu gibi 75 seviye bir bot gerekir. Taş kırıldığında zemin katta duran herkes - görevindeki bir bot, izlemeye gelen bir oyuncu - onlarla girer. 'Şimdi', hiçbiri sürmüyorsa çekirdeğin bir sonraki kontrolünde bir sefer çağırır."},
+ "ai_tower_on":  {"en":"Enabled","pl":"Włączone","de":"Eingeschaltet","tr":"Açık"},
+ "ai_bots_held_title": {"pl":"Boty czekają przy drzwiach","en":"The bots are waiting at the door",
+  "de":"Die Bots warten an der Tür","tr":"Botlar kapıda bekliyor"},
+ "ai_bots_held_help": {"pl":"Ten świat powstał przed chwilą i nie ma w nim jeszcze ani jednego bota - tak, jak poprosiłeś przy zakładaniu. Ustaw teraz spokojnie stawki, respawny i zachowanie botów, a potem wpuść je. Wejdą stopniowo, tak jak po zwykłym starcie.",
+  "en":"This world was made a moment ago and has not one bot in it yet - as you asked when you made it. Set the rates, the respawns and the bots' behaviour in peace, then let them in. They walk in gradually, as after any start.",
+  "de":"Diese Welt wurde gerade erstellt und hat noch keinen einzigen Bot - so wie gewünscht. Stelle in Ruhe Raten, Respawns und Bot-Verhalten ein und lasse sie dann herein.",
+  "tr":"Bu dünya az önce kuruldu ve içinde henüz tek bir bot yok. Oranları, respawn sürelerini ve bot davranışını rahatça ayarla, sonra onları içeri al."},
+ "ai_bots_release": {"pl":"Wpuść boty do świata","en":"Let the bots in",
+  "de":"Bots hereinlassen","tr":"Botları içeri al"},
+ "ai_bots_released": {"pl":"✅ Boty wchodzą do świata - pojawią się w ciągu kilku minut, tak jak po zwykłym starcie.",
+  "en":"✅ The bots are coming in - they will appear over the next few minutes, as after any start.",
+  "de":"✅ Die Bots kommen herein - sie erscheinen in den nächsten Minuten.",
+  "tr":"✅ Botlar geliyor - birkaç dakika içinde belirecekler."},
+ "ai_tower_now": {"en":"Call a Demon Tower raid now","pl":"Wyprawa do Wieży Demonów teraz","de":"Jetzt eine Turm-Expedition rufen","tr":"Şimdi bir Kule seferi çağır"},
+ "ai_tower_now_done": {"en":"Requested: the core calls a raid on its next check (within a minute) if none is under way.","pl":"Zlecone: rdzeń zwoła wyprawę przy najbliższym sprawdzeniu (do minuty), jeśli żadna nie trwa.","de":"Angefordert: der Kern ruft beim nächsten Check (binnen einer Minute) eine Expedition, wenn keine läuft.","tr":"İstendi: hiçbiri sürmüyorsa çekirdek bir sonraki kontrolde (bir dakika içinde) bir sefer çağırır."},
+ "gl_tower":     {"en":"in the Demon Tower","pl":"w Wieży Demonów","de":"im Dämonenturm","tr":"Şeytan Kulesi'nde"},
+ "ai_ishop":     {"en":"Bots buy in the ItemShop","pl":"Boty kupują w ItemShopie","de":"Bots kaufen im ItemShop","tr":"Botlar ItemShop'tan alır"},
+ "ai_ishop_help":{"en":"A bot cashes the Kupon SM vouchers it finds (Metin stones and bosses drop them, M2_DRAGON_COIN_*_PERMILLE) into its account's Dragon Coins and buys, at most once an hour, only what its own rules would use: a Kamień Duchowy for a Grand Master skill, a change stone for a worn weapon still worth rerolling, with Dragon Marks a Blessing Scroll or the Dragon God's attack potions, and one bot in four a hairstyle, once. No VIP items and no pass: every bot already holds the premium subscription. Off: the vouchers stay in the bags.",
+                  "pl":"Bot wymienia znalezione Kupony SM (dropią z metinów i bossów, M2_DRAGON_COIN_*_PERMILLE) na Smocze Monety swojego konta i kupuje, najwyżej raz na godzinę, tylko to, z czego jego własne reguły korzystają: Kamień Duchowy do umiejętności Wielkiego Mistrza, kamień zmiany bonusów do noszonej broni wartej jeszcze losowania, za Smocze Znaki Zwój Błogosławieństwa albo mikstury ataku Boga Smoków, a jeden bot na czterech fryzurę, raz. Bez przedmiotów VIP i bez przepustki: każdy bot ma już subskrypcję premium. Wyłączone: kupony zostają w torbach.",
+                  "de":"Ein Bot löst die gefundenen Kupon-SM-Gutscheine (Metinsteine und Bosse lassen sie fallen, M2_DRAGON_COIN_*_PERMILLE) in Drachenmünzen seines Kontos ein und kauft höchstens einmal pro Stunde nur, was seine eigenen Regeln nutzen: einen Kamień Duchowy für eine Großmeister-Fertigkeit, einen Bonus-Wechselstein für die getragene Waffe, wenn sie noch neu gewürfelt würde, mit Drachenmarken eine Segensrolle oder die Angriffstränke des Drachengottes, und jeder vierte Bot einmal eine Frisur. Keine VIP-Gegenstände und kein Pass: jeder Bot hat das Premium-Abo bereits. Aus: die Gutscheine bleiben im Inventar.",
+                  "tr":"Bot bulduğu Kupon SM kuponlarını (Metin taşları ve boss'lar düşürür, M2_DRAGON_COIN_*_PERMILLE) hesabının Ejderha Parasına çevirir ve saatte en fazla bir kez, yalnızca kendi kurallarının kullanacağı şeyi alır: Büyük Usta becerisi için Kamień Duchowy, hâlâ yeniden atılmaya değer takılı silah için bonus değiştirme taşı, Ejderha İşaretleriyle Kutsama Parşömeni ya da Ejderha Tanrısı saldırı iksirleri ve dört bottan biri bir kez bir saç modeli. VIP eşya ve geçiş kartı yok: her bot zaten premium aboneliğe sahip. Kapalı: kuponlar çantada kalır."},
+ "ai_ishop_on":  {"en":"Enabled","pl":"Włączone","de":"Eingeschaltet","tr":"Açık"},
+ "ai_persona":   {"en":"Bot personalities (Iwakura v2)","pl":"Osobowości botów (Iwakura v2)","de":"Bot-Persönlichkeiten (Iwakura v2)","tr":"Bot kişilikleri (Iwakura v2)"},
+ "ai_persona_help": {"en":"Iwakura's personality system. A bot's personality follows its situation (Grinder, Conqueror, Trader, Gambler, Perfectionist, Metin slayer, Miner, Fisherman, Mercenary, Companion) and it has a mood (poor, normal, very good) shown on its card. A Grinder holds its level at its tier (15, 23, 30-35, 40-48, 55-62) until it wears a weapon +7, an armour +6 and a shield +6 for its level, and only then may level on as a Conqueror. A bot in a poor mood pauses between packs and goes AFK now and then; only such bots rest in town. Off: the bots play as they did before, with their old personalities.",
+                  "pl":"System osobowości Iwakury. Osobowość bota wynika z jego sytuacji (Grinder, Zdobywca, Handlarz, Hazardzista, Perfekcjonista, Pogromca metinów, Górnik, Rybak, Najemnik, Towarzysz), a bot ma nastrój (słaby, normalny, bardzo dobry) widoczny na jego karcie. Grinder trzyma poziom swojego tieru (15, 23, 30-35, 40-48, 55-62), dopóki nie założy broni +7, zbroi +6 i tarczy +6 na swój poziom - dopiero wtedy może dalej expić jako Zdobywca. Bot w słabym nastroju robi przerwy między grupami mobów i co jakiś czas odchodzi od komputera; tylko takie boty odpoczywają w mieście. Wyłączone: boty grają jak wcześniej, ze starymi osobowościami.",
+                  "de":"Iwakuras Persönlichkeitssystem. Die Persönlichkeit eines Bots folgt seiner Lage (Grinder, Eroberer, Händler, Spieler, Perfektionist, Metinjäger, Bergmann, Fischer, Söldner, Gefährte), und er hat eine Stimmung (schlecht, normal, sehr gut), die auf seiner Karte steht. Ein Grinder hält die Stufe seines Tiers (15, 23, 30-35, 40-48, 55-62), bis er eine Waffe +7, eine Rüstung +6 und einen Schild +6 für seine Stufe trägt, und erst dann darf er als Eroberer weiterleveln. Ein Bot in schlechter Stimmung macht Pausen zwischen den Gruppen und ist ab und zu AFK; nur solche Bots ruhen in der Stadt. Aus: die Bots spielen wie früher, mit ihren alten Persönlichkeiten.",
+                  "tr":"Iwakura'nın kişilik sistemi. Bir botun kişiliği durumuna göre değişir (Grinder, Fatih, Tüccar, Kumarbaz, Mükemmeliyetçi, Metin avcısı, Madenci, Balıkçı, Paralı asker, Yoldaş) ve kartında görünen bir ruh hali vardır (kötü, normal, çok iyi). Bir Grinder, seviyesine uygun +7 silah, +6 zırh ve +6 kalkan giyene kadar kademesinin seviyesinde (15, 23, 30-35, 40-48, 55-62) kalır, ancak ondan sonra Fatih olarak seviye atlayabilir. Kötü ruh halindeki bot gruplar arasında durur ve ara sıra AFK olur; yalnızca bu botlar şehirde dinlenir. Kapalı: botlar eski kişilikleriyle önceki gibi oynar."},
+ "ai_persona_on": {"en":"Enabled","pl":"Włączone","de":"Eingeschaltet","tr":"Açık"},
+ "ai_experimental": {"en":"experimental","pl":"eksperymentalne","de":"experimentell","tr":"deneysel"},
  "ai_scrap":     {"en":"Scrap keepers","pl":"Boty złomiarze","de":"Schrotthändler-Bots","tr":"Hurdacı botlar"},
  "ai_scrap_help":{"en":"The share of stall keepers that put their low refines (+0 to +3) on the counter, cheaply, instead of vendoring them - fodder for burning at the blacksmith, the way the hard servers play. Off by default.",
                   "pl":"Udział straganiarzy, którzy wystawiają na ladę swoje słabe ulepszenia (+0 do +3) za grosze zamiast sprzedawać je NPC - złom do palenia u kowala, jak na serwerach hard. Domyślnie wyłączone.",
@@ -2725,11 +3528,107 @@ T.update({
                   "tr":"Tezgâhçıların, düşük yükseltmelerini (+0 ile +3) NPC'ye satmak yerine ucuza tezgâha koyan payı - demircide yakmalık, hard sunuculardaki gibi. Varsayılan olarak kapalı."},
  "ai_scrap_off": {"en":"off","pl":"wyłączone","de":"aus","tr":"kapalı"},
  "ai_scrap_all": {"en":"every keeper","pl":"każdy straganiarz","de":"jeder Händler","tr":"her tezgâhçı"},
+ "ai_rest":      {"en":"Resting in town","pl":"Odpoczynek w mieście","de":"Ausruhen in der Stadt","tr":"Şehirde dinlenme"},
+ "ai_rest_help": {"en":"The share of bots that stay on the market ring for about three minutes after finishing their business in the first village, strolling between the stalls. 0 - nobody rests: the bots hunt all the time and only come to town on errands. Whatever the slider says, a bot under level 18 never rests, and with no stall open nobody browses stalls. With the bot personalities on, only bots in a poor mood rest, and the slider is the share of them.",
+                  "pl":"Udział botów, które po załatwieniu spraw w pierwszej wiosce zostają na rynku około trzech minut i spacerują między straganami. 0 - nikt nie odpoczywa: boty cały czas expią, a do miasta przychodzą tylko w sprawach. Niezależnie od suwaka bot poniżej 18 poziomu nie odpoczywa nigdy, a bez wystawionego straganu nikt nie ogląda straganów. Przy włączonych osobowościach botów odpoczywają tylko boty w słabym nastroju, a suwak to ich udział.",
+                  "de":"Anteil der Bots, die nach erledigten Besorgungen im ersten Dorf rund drei Minuten auf dem Marktring bleiben und zwischen den Ständen bummeln. 0 - niemand ruht sich aus: die Bots jagen die ganze Zeit und kommen nur für Besorgungen in die Stadt. Unabhängig vom Regler ruht ein Bot unter Stufe 18 nie, und ohne offenen Stand schaut niemand Stände an. Mit eingeschalteten Bot-Persönlichkeiten ruhen nur Bots in schlechter Stimmung, und der Regler ist ihr Anteil.",
+                  "tr":"İlk köydeki işlerini bitirdikten sonra yaklaşık üç dakika pazar halkasında kalıp tezgâhlar arasında dolaşan botların payı. 0 - kimse dinlenmez: botlar sürekli avlanır, şehre yalnızca iş için gelir. Kaydırıcı ne derse desin 18. seviyenin altındaki bot asla dinlenmez, açık tezgâh yokken kimse tezgâhlara bakmaz. Bot kişilikleri açıkken yalnızca kötü ruh halindeki botlar dinlenir ve kaydırıcı onların payıdır."},
+ "ai_rest_off":  {"en":"nobody rests","pl":"nikt nie odpoczywa","de":"niemand ruht","tr":"kimse dinlenmez"},
+ "ai_rest_all":  {"en":"every bot","pl":"każdy bot","de":"jeder Bot","tr":"her bot"},
+ "ai_kpvp":      {"en":"Hostility between kingdoms","pl":"Wrogość między królestwami","de":"Feindschaft zwischen Königreichen","tr":"Krallıklar arası düşmanlık"},
+ "ai_kpvp_help": {"en":"The share of bots that will start a duel with a bot of another kingdom when they meet on shared ground - Orc Valley, the desert, Mount Sohan, the dungeons. Never in a village, never against a player, and never against a bot that is hurt or already fighting one. Which bots are the aggressive ones is fixed per character, so the same ones quarrel after every restart. Off by default.",
+                 "pl":"Udział botów, które zaczepią bota z innego królestwa, gdy spotkają go na wspólnym terenie - w Dolinie Orków, na pustyni, na Górze Sohan, w lochach. Nigdy w wiosce, nigdy na graczu i nigdy na bocie rannym albo już walczącym. To, które boty są agresywne, jest przypisane na stałe do postaci, więc po każdym restarcie zaczepiają te same. Domyślnie wyłączone.",
+                 "de":"Anteil der Bots, die einen Bot eines anderen Königreichs angreifen.","tr":"Başka krallıktan bir botla düello başlatacak botların oranı."},
+ "ai_kpvp_off":  {"en":"peace","pl":"pokój","de":"Frieden","tr":"barış"},
+ "ai_kpvp_all":  {"en":"every bot","pl":"każdy bot","de":"jeder Bot","tr":"her bot"},
+ "ai_scroll":    {"en":"Blessing and Dragon God Scrolls","pl":"Zwoje Błogosławieństwa i Boga Smoków","de":"Segens- und Drachengott-Schriftrollen","tr":"Kutsama ve Ejderha Tanrısı parşömenleri"},
+ "ai_scroll_help":{"en":"The lowest plus a bot upgrades to under a Blessing Scroll or a Dragon God Scroll. At +7 a scroll goes only on the upgrades to +7, +8 and +9, and every lower one is done at the blacksmith without a scroll, like a player who has none - so the item can burn. At +1 nothing is restricted and the bots use scrolls as before: from +7, and earlier on a worn item that could burn and on an item with valuable bonuses. Applies within five seconds.",
+                  "pl":"Najniższy plus, na jaki bot ulepsza pod Zwojem Błogosławieństwa albo Zwojem Boga Smoków. Przy +7 zwój idzie tylko na ulepszenia na +7, +8 i +9, a każde niższe bot robi u kowala bez zwoju, jak gracz, który zwojów nie ma - więc przedmiot może spłonąć. Przy +1 nie ma ograniczenia i boty używają zwojów tak jak dotąd: od +7, a wcześniej na założonym przedmiocie, który mógłby spłonąć, i na przedmiocie z cennymi bonusami. Działa w pięć sekund.",
+                  "de":"Das niedrigste Plus, auf das ein Bot unter einer Segens- oder Drachengott-Schriftrolle verbessert. Bei +7 geht eine Schriftrolle nur auf die Verbesserungen auf +7, +8 und +9; jede niedrigere macht der Bot beim Schmied ohne Schriftrolle, wie ein Spieler ohne Schriftrollen - der Gegenstand kann also verbrennen. Bei +1 gibt es keine Einschränkung. Wirkt innerhalb von fünf Sekunden.",
+                  "tr":"Botun Kutsama veya Ejderha Tanrısı parşömeniyle yükselttiği en düşük artı. +7'de parşömen yalnızca +7, +8 ve +9 yükseltmelerinde kullanılır; daha düşük her yükseltmeyi bot demircide parşömensiz yapar, parşömeni olmayan bir oyuncu gibi - yani eşya yanabilir. +1'de kısıtlama yoktur. Beş saniye içinde uygulanır."},
+ "ai_scroll_off":{"en":"no restriction","pl":"bez ograniczenia","de":"keine Einschränkung","tr":"kısıtlama yok"},
+ "ai_scroll_top":{"en":"only the upgrade to +9","pl":"tylko ulepszenie na +9","de":"nur die Verbesserung auf +9","tr":"yalnızca +9 yükseltmesi"},
  "ai_chest":     {"en":"Moonlight Treasure Chests","pl":"Szkatułki Księżycowe","de":"Mondschein-Schatztruhen","tr":"Ay Işığı Sandıkları"},
- "ai_chest_help":{"en":"How often a chest drops, in thousandths: per monster kill, and per broken Metin stone. The game default is 10‰ (1%) and 300‰ (30%); more chests mean more bonus scrolls, speed potions and Blessing Scrolls for the bots. Applies within five seconds, to bots and players alike.",
-                  "pl":"Jak często wypada szkatułka, w promilach: z zabitego potwora i z rozbitego Metina. Domyślnie w grze 10‰ (1%) i 300‰ (30%); więcej szkatułek to więcej zwojów bonusów, mikstur szybkości i Zwojów Błogosławieństwa u botów. Działa w pięć sekund, dla botów i graczy tak samo.",
-                  "de":"Wie oft eine Truhe fällt, in Promille: pro getötetem Monster und pro zerstörtem Metin. Spielstandard 10‰ (1%) und 300‰ (30%); mehr Truhen heißt mehr Bonusrollen, Tempotränke und Segensrollen bei den Bots. Gilt binnen fünf Sekunden, für Bots wie Spieler.",
-                  "tr":"Sandığın ne sıklıkla düştüğü, binde olarak: öldürülen canavar başına ve kırılan Metin başına. Oyun varsayılanı 10‰ (%1) ve 300‰ (%30); daha çok sandık, botlarda daha çok bonus parşömeni, hız iksiri ve Kutsama Parşömeni demek. Beş saniye içinde, bot ve oyuncu için aynı şekilde uygulanır."},
+ "ai_chest_help":{"en":"How often a chest drops while a chest event runs (the Events page), in thousandths: per monster kill, and per broken Metin stone. Outside an event no chest drops. The game default is 10‰ (1%) and 300‰ (30%); more chests mean more bonus scrolls, speed potions and Blessing Scrolls for the bots. Applies within five seconds, to bots and players alike.",
+                  "pl":"Jak często wypada szkatułka, gdy trwa event szkatułek (strona Eventy), w promilach: z zabitego potwora i z rozbitego Metina. Poza eventem szkatułki nie wypadają. Domyślnie w grze 10‰ (1%) i 300‰ (30%); więcej szkatułek to więcej zwojów bonusów, mikstur szybkości i Zwojów Błogosławieństwa u botów. Działa w pięć sekund, dla botów i graczy tak samo.",
+                  "de":"Wie oft eine Truhe fällt, solange ein Truhen-Event läuft (Seite Events), in Promille: pro getötetem Monster und pro zerstörtem Metin. Außerhalb eines Events fällt keine Truhe. Spielstandard 10‰ (1%) und 300‰ (30%); mehr Truhen heißt mehr Bonusrollen, Tempotränke und Segensrollen bei den Bots. Gilt binnen fünf Sekunden, für Bots wie Spieler.",
+                  "tr":"Bir sandık etkinliği sürerken (Etkinlikler sayfası) sandığın ne sıklıkla düştüğü, binde olarak: öldürülen canavar başına ve kırılan Metin başına. Etkinlik dışında sandık düşmez. Oyun varsayılanı 10‰ (%1) ve 300‰ (%30); daha çok sandık, botlarda daha çok bonus parşömeni, hız iksiri ve Kutsama Parşömeni demek. Beş saniye içinde, bot ve oyuncu için aynı şekilde uygulanır."},
+ "ev_nav":       {"en":"\U0001F389 Events","pl":"\U0001F389 Eventy","de":"\U0001F389 Events","tr":"\U0001F389 Etkinlikler"},
+ "ev_open":      {"en":"\U0001F389 Open events","pl":"\U0001F389 Otw\u00f3rz eventy","de":"\U0001F389 Events \u00f6ffnen","tr":"\U0001F389 Etkinlikleri a\u00e7"},
+ "gl_nav":       {"en":"\U0001F6E1 Guilds","pl":"\U0001F6E1 Gildie","de":"\U0001F6E1 Gilden","tr":"\U0001F6E1 Loncalar"},
+ "gl_open":      {"en":"\U0001F6E1 Open guilds","pl":"\U0001F6E1 Otwórz gildie","de":"\U0001F6E1 Gilden öffnen","tr":"\U0001F6E1 Loncaları aç"},
+ "gl_dash_hint": {"en":"The bot guilds by tier: elite, strong, medium and ordinary, with their level, members, ladder and the war they are in.","pl":"Gildie botów wg klasy: elitarne, silne, średnie i zwykłe, z poziomem, członkami, rankingiem i toczoną wojną.","de":"Die Bot-Gilden nach Stufe: Elite, stark, mittel und gewöhnlich, mit Level, Mitgliedern, Rangliste und laufendem Krieg.","tr":"Bot loncaları kademeye göre: elit, güçlü, orta ve sıradan; seviye, üyeler, sıralama ve süren savaşla."},
+ "gl_intro":     {"en":"A bot guild has a tier. Every bot's strength is one number (level, weapon, skills, horse, armour); every ten minutes each kingdom's bots are cut into percentiles, and a guild is founded at the tier its founder's percentile puts it in: the top 3% found an elite guild, the top 15% a strong one, the top half a medium one, the rest an ordinary one. A master recruits only above its tier's floor, strongest first; a member that outgrows its guild leaves for a better one. Members offer the guild a share of their experience every hour, so a guild levels and its master spends the skill points.",
+                  "pl":"Gildia botów ma klasę. Siła każdego bota to jedna liczba (poziom, broń, umiejętności, koń, zbroja); co dziesięć minut boty każdego królestwa dzielone są na percentyle, a gildia powstaje w klasie, do której trafia percentyl założyciela: górne 3% zakłada gildię elitarną, górne 15% silną, górna połowa średnią, reszta zwykłą. Mistrz rekrutuje tylko powyżej progu swojej klasy, od najsilniejszych; członek, który przerósł gildię, odchodzi do lepszej. Członkowie co godzinę oddają gildii część zdobytego expa, więc gildia wbija poziomy, a mistrz wydaje punkty umiejętności.",
+                  "de":"Eine Bot-Gilde hat eine Stufe. Die Stärke jedes Bots ist eine Zahl (Level, Waffe, Fertigkeiten, Pferd, Rüstung); alle zehn Minuten werden die Bots jedes Königreichs in Perzentile geteilt, und eine Gilde wird in der Stufe gegründet, in die das Perzentil ihres Gründers fällt: die oberen 3% gründen eine Elite-Gilde, die oberen 15% eine starke, die obere Hälfte eine mittlere, der Rest eine gewöhnliche. Ein Meister rekrutiert nur über der Schwelle seiner Stufe, die Stärksten zuerst; ein Mitglied, das seiner Gilde entwachsen ist, wechselt in eine bessere. Mitglieder geben der Gilde stündlich einen Teil ihrer Erfahrung, so steigt die Gilde auf und der Meister verteilt die Fertigkeitspunkte.",
+                  "tr":"Bir bot loncasının kademesi vardır. Her botun gücü tek bir sayıdır (seviye, silah, beceriler, at, zırh); her on dakikada bir her krallığın botları yüzdelik dilimlere ayrılır ve lonca, kurucusunun dilimine denk gelen kademede kurulur: en üst %3 elit, en üst %15 güçlü, üst yarı orta, geri kalanı sıradan bir lonca kurar. Usta yalnızca kademesinin eşiğinin üzerinden, en güçlülerden başlayarak üye alır; loncasını aşan üye daha iyisine geçer. Üyeler her saat tecrübelerinin bir kısmını loncaya verir, böylece lonca seviye atlar ve usta beceri puanlarını harcar."},
+ "gl_stale":     {"en":"No game core has written a guild status yet (it does so within a minute of starting with this version).","pl":"Żaden rdzeń gry nie zapisał jeszcze statusu gildii (robi to w ciągu minuty od startu z tą wersją).","de":"Noch kein Spielkern hat einen Gildenstatus geschrieben (er tut es binnen einer Minute nach dem Start mit dieser Version).","tr":"Henüz hiçbir oyun çekirdeği lonca durumu yazmadı (bu sürümle başladıktan bir dakika içinde yazar)."},
+ "gl_summary":   {"en":"Bot guilds","pl":"Gildie botów","de":"Bot-Gilden","tr":"Bot loncaları"},
+ "gl_tier_elite":    {"en":"Elite","pl":"Elitarna","de":"Elite","tr":"Elit"},
+ "gl_tier_strong":   {"en":"Strong","pl":"Silna","de":"Stark","tr":"Güçlü"},
+ "gl_tier_medium":   {"en":"Medium","pl":"Średnia","de":"Mittel","tr":"Orta"},
+ "gl_tier_ordinary": {"en":"Ordinary","pl":"Zwykła","de":"Gewöhnlich","tr":"Sıradan"},
+ "gl_empire_shinsoo":{"en":"Shinsoo","pl":"Shinsoo","de":"Shinsoo","tr":"Shinsoo"},
+ "gl_empire_chunjo": {"en":"Chunjo","pl":"Chunjo","de":"Chunjo","tr":"Chunjo"},
+ "gl_empire_jinno":  {"en":"Jinno","pl":"Jinno","de":"Jinno","tr":"Jinno"},
+ "gl_empire_unknown":{"en":"?","pl":"?","de":"?","tr":"?"},
+ "gl_col_name":  {"en":"Guild","pl":"Gildia","de":"Gilde","tr":"Lonca"},
+ "gl_col_kingdom":{"en":"Kingdom","pl":"Królestwo","de":"Königreich","tr":"Krallık"},
+ "gl_col_tier":  {"en":"Tier","pl":"Klasa","de":"Stufe","tr":"Kademe"},
+ "gl_col_level": {"en":"Level","pl":"Poziom","de":"Level","tr":"Seviye"},
+ "gl_col_members":{"en":"Members","pl":"Członkowie","de":"Mitglieder","tr":"Üyeler"},
+ "gl_col_online":{"en":"Online","pl":"Online","de":"Online","tr":"Çevrimiçi"},
+ "gl_col_master":{"en":"Master","pl":"Mistrz","de":"Meister","tr":"Usta"},
+ "gl_col_strength":{"en":"Avg. strength","pl":"Śr. siła","de":"Ø Stärke","tr":"Ort. güç"},
+ "gl_col_ladder":{"en":"Ladder","pl":"Ranking","de":"Rangliste","tr":"Sıralama"},
+ "gl_col_record":{"en":"W/D/L","pl":"Z/R/P","de":"S/U/N","tr":"G/B/M"},
+ "gl_col_exp":   {"en":"Exp received","pl":"Otrzymany exp","de":"Erhaltene Erfahrung","tr":"Alınan tecrübe"},
+ "gl_col_war":   {"en":"War","pl":"Wojna","de":"Krieg","tr":"Savaş"},
+ "gl_war_with":  {"en":"vs","pl":"z","de":"gegen","tr":"vs"},
+ "gl_next_war":  {"en":"Next bot guild war","pl":"Następna wojna gildii botów","de":"Nächster Bot-Gildenkrieg","tr":"Sonraki bot lonca savaşı"},
+ "gl_next_war_now": {"en":"under way now (guild map)","pl":"trwa teraz (mapa gildyjna)","de":"läuft jetzt (Gildenkarte)","tr":"şu anda sürüyor (lonca haritası)"},
+ "gl_next_war_off": {"en":"not scheduled","pl":"niezaplanowana","de":"nicht geplant","tr":"planlanmadı"},
+ "gl_next_war_in": {"en":"in about","pl":"za ok.","de":"in etwa","tr":"yaklaşık"},
+ "gl_exp_note":  {"en":"Exp received counts what the bots have offered since the cores started; the guild's own exp column in the game is the same number, kept by the DB.","pl":"„Otrzymany exp” liczy, co boty oddały od startu rdzeni; kolumna expa gildii w grze to ta sama liczba, trzymana przez bazę.","de":"„Erhaltene Erfahrung“ zählt, was die Bots seit dem Start der Kerne gegeben haben; die Erfahrungsspalte der Gilde im Spiel ist dieselbe Zahl, von der Datenbank geführt.","tr":"„Alınan tecrübe“ çekirdekler başladığından beri botların verdiğini sayar; oyundaki lonca tecrübe sütunu veritabanının tuttuğu aynı sayıdır."},
+ "ev_dash_hint": {"en":"Timed windows: Moonlight chests drop only while their event runs; more experience, drop or yang at chosen hours. \u201cActivate now\u201d switches an event on for a number of minutes.","pl":"Okna czasowe: Szkatu\u0142ki Blasku Ksi\u0119\u017cyca dropi\u0105 tylko wtedy, gdy trwa ich event; wi\u0119cej expa, dropu albo yang o wybranych porach. \u201eAktywuj teraz\u201d w\u0142\u0105cza event na podan\u0105 liczb\u0119 minut.","de":"Zeitfenster: Mondschein-Truhen fallen nur w\u00e4hrend ihres Events; mehr Erfahrung, Drop oder Yang zu gew\u00e4hlten Stunden. \u201eJetzt aktivieren\u201c schaltet ein Event f\u00fcr einige Minuten ein.","tr":"Zaman pencereleri: Ay I\u015f\u0131\u011f\u0131 Sand\u0131klar\u0131 yaln\u0131zca etkinlik s\u00fcrerken d\u00fc\u015fer; se\u00e7ilen saatlerde daha fazla tecr\u00fcbe, drop veya yang. \u201c\u015eimdi etkinle\u015ftir\u201d bir etkinli\u011fi belirli dakika a\u00e7ar."},
+ "ev_intro":     {"en":"A row is a weekly window: which days, from what hour to what hour, and for a rate how many percent over the server's own rates (50 = +50%). The game core reads this within five seconds; nothing restarts. A window past midnight (22:00-02:00) runs into the next day.","pl":"Wiersz to okno tygodniowe: w jakie dni, od kt\u00f3rej do kt\u00f3rej, a dla rat o ile procent ponad ustawione raty serwera (50 = +50%). Rdze\u0144 gry odczytuje to w pi\u0119\u0107 sekund; nic si\u0119 nie restartuje. Okno przez p\u00f3\u0142noc (22:00-02:00) trwa do nast\u0119pnego dnia.","de":"Eine Zeile ist ein w\u00f6chentliches Fenster: welche Tage, von wann bis wann, und bei einer Rate wie viel Prozent \u00fcber den Serverraten (50 = +50%). Der Spielkern liest das binnen f\u00fcnf Sekunden; nichts startet neu. Ein Fenster \u00fcber Mitternacht (22:00-02:00) l\u00e4uft in den n\u00e4chsten Tag.","tr":"Bir sat\u0131r haftal\u0131k bir penceredir: hangi g\u00fcnler, saat ka\u00e7tan ka\u00e7a ve oran i\u00e7in sunucu oranlar\u0131n\u0131n y\u00fczde ka\u00e7 \u00fcst\u00fc (50 = +%50). Oyun \u00e7ekirde\u011fi bunu be\u015f saniyede okur; hi\u00e7bir \u015fey yeniden ba\u015flamaz. Gece yar\u0131s\u0131n\u0131 ge\u00e7en pencere (22:00-02:00) ertesi g\u00fcne sarkar."},
+ "ev_chest_note":{"en":"Once a single chest window is in the schedule, the chests drop only inside the windows; the two sliders on the bot behaviour page say how often they drop then.","pl":"Gdy w harmonogramie jest cho\u0107 jedno okno szkatu\u0142ek, poza oknami szkatu\u0142ki nie dropi\u0105 wcale; dwa suwaki na stronie zachowania bot\u00f3w m\u00f3wi\u0105, jak cz\u0119sto dropi\u0105 w oknie.","de":"Sobald ein Truhenfenster im Plan steht, fallen die Truhen nur innerhalb der Fenster; die zwei Regler auf der Seite Bot-Verhalten sagen, wie oft sie dann fallen.","tr":"Planda tek bir sand\u0131k penceresi bile varsa sand\u0131klar yaln\u0131zca pencereler i\u00e7inde d\u00fc\u015fer; bot davran\u0131\u015f\u0131 sayfas\u0131ndaki iki kayd\u0131r\u0131c\u0131 o s\u0131rada ne s\u0131kl\u0131kta d\u00fc\u015ft\u00fc\u011f\u00fcn\u00fc s\u00f6yler."},
+ "ev_notice_note":{"en":"The chat gets a notice when an event starts, every fifteen minutes while it runs, and when it ends.","pl":"Na czacie pojawia si\u0119 og\u0142oszenie na pocz\u0105tku eventu, co pi\u0119tna\u015bcie minut w jego trakcie i na ko\u0144cu.","de":"Der Chat bekommt eine Meldung zum Start eines Events, alle f\u00fcnfzehn Minuten w\u00e4hrenddessen und zum Ende.","tr":"Etkinlik ba\u015flad\u0131\u011f\u0131nda, s\u00fcrerken her on be\u015f dakikada ve bitti\u011finde sohbete duyuru d\u00fc\u015fer."},
+ "ev_status_title":{"en":"Right now","pl":"Teraz","de":"Gerade jetzt","tr":"\u015eu anda"},
+ "ev_status_stale":{"en":"The game core has not written an event status yet (it does so within a minute of starting with this version).","pl":"Rdze\u0144 gry nie zapisa\u0142 jeszcze statusu event\u00f3w (robi to w ci\u0105gu minuty od startu z t\u0105 wersj\u0105).","de":"Der Spielkern hat noch keinen Event-Status geschrieben (er tut es binnen einer Minute nach dem Start mit dieser Version).","tr":"Oyun \u00e7ekirde\u011fi hen\u00fcz etkinlik durumu yazmad\u0131 (bu s\u00fcr\u00fcmle ba\u015flad\u0131ktan bir dakika i\u00e7inde yazar)."},
+ "ev_active":    {"en":"Active until","pl":"Aktywny do","de":"Aktiv bis","tr":"\u015eu saate kadar aktif:"},
+ "ev_next":      {"en":"Next","pl":"Nast\u0119pny","de":"N\u00e4chstes","tr":"Sonraki"},
+ "ev_inactive":  {"en":"Not running","pl":"Nieaktywny","de":"L\u00e4uft nicht","tr":"\u00c7al\u0131\u015fm\u0131yor"},
+ "ev_none":      {"en":"No window scheduled","pl":"Brak zaplanowanych okien","de":"Kein Fenster geplant","tr":"Planlanm\u0131\u015f pencere yok"},
+ "ev_kind_chest":{"en":"Moonlight chests","pl":"Szkatu\u0142ki Blasku Ksi\u0119\u017cyca","de":"Mondschein-Truhen","tr":"Ay I\u015f\u0131\u011f\u0131 Sand\u0131klar\u0131"},
+ "ev_kind_exp":  {"en":"Experience","pl":"Do\u015bwiadczenie","de":"Erfahrung","tr":"Tecr\u00fcbe"},
+ "ev_kind_drop": {"en":"Item drop","pl":"Drop przedmiot\u00f3w","de":"Item-Drop","tr":"E\u015fya d\u00fc\u015fmesi"},
+ "ev_kind_yang": {"en":"Yang","pl":"Yang","de":"Yang","tr":"Yang"},
+ "ev_schedule":  {"en":"Schedule","pl":"Harmonogram","de":"Zeitplan","tr":"Zaman \u00e7izelgesi"},
+ "ev_col_kind":  {"en":"Event","pl":"Event","de":"Event","tr":"Etkinlik"},
+ "ev_col_days":  {"en":"Days","pl":"Dni","de":"Tage","tr":"G\u00fcnler"},
+ "ev_col_from":  {"en":"From","pl":"Od","de":"Von","tr":"Ba\u015flang\u0131\u00e7"},
+ "ev_col_to":    {"en":"To","pl":"Do","de":"Bis","tr":"Biti\u015f"},
+ "ev_col_value": {"en":"+% (rates)","pl":"+% (raty)","de":"+% (Raten)","tr":"+% (oranlar)"},
+ "ev_col_on":    {"en":"On","pl":"W\u0142.","de":"An","tr":"A\u00e7\u0131k"},
+ "ev_col_del":   {"en":"Delete","pl":"Usu\u0144","de":"L\u00f6schen","tr":"Sil"},
+ "ev_days":      {"en":"Mo,Tu,We,Th,Fr,Sa,Su","pl":"Pn,Wt,\u015ar,Cz,Pt,Sb,Nd","de":"Mo,Di,Mi,Do,Fr,Sa,So","tr":"Pt,Sa,\u00c7a,Pe,Cu,Ct,Pz"},
+ "ev_save":      {"en":"Save the schedule","pl":"Zapisz harmonogram","de":"Zeitplan speichern","tr":"Zaman \u00e7izelgesini kaydet"},
+ "ev_saved":     {"en":"Schedule saved; the game core reads it within five seconds.","pl":"Harmonogram zapisany; rdze\u0144 gry odczyta go w pi\u0119\u0107 sekund.","de":"Zeitplan gespeichert; der Spielkern liest ihn binnen f\u00fcnf Sekunden.","tr":"Zaman \u00e7izelgesi kaydedildi; oyun \u00e7ekirde\u011fi be\u015f saniyede okur."},
+ "ev_failed":    {"en":"Could not write the events file.","pl":"Nie uda\u0142o si\u0119 zapisa\u0107 pliku event\u00f3w.","de":"Die Event-Datei konnte nicht geschrieben werden.","tr":"Etkinlik dosyas\u0131 yaz\u0131lamad\u0131."},
+ "ev_bad_row":   {"en":"Row %d: the hours must be HH:MM (the start before 24:00) and the value 0-1000.","pl":"Wiersz %d: godziny musz\u0105 by\u0107 HH:MM (pocz\u0105tek przed 24:00), a warto\u015b\u0107 0-1000.","de":"Zeile %d: die Stunden m\u00fcssen HH:MM sein (Beginn vor 24:00), der Wert 0-1000.","tr":"Sat\u0131r %d: saatler SS:DD olmal\u0131 (ba\u015flang\u0131\u00e7 24:00 \u00f6ncesi), de\u011fer 0-1000."},
+ "ev_value_help":{"en":"The value is a percentage over the server's rates (50 = +50% experience); the chest rows ignore it. Untick every day to keep a row without running it.","pl":"Warto\u015b\u0107 to procent ponad raty serwera (50 = +50% expa); wiersze szkatu\u0142ek j\u0105 ignoruj\u0105. Odznacz wszystkie dni, by zachowa\u0107 wiersz bez uruchamiania.","de":"Der Wert ist ein Prozentsatz \u00fcber den Serverraten (50 = +50% Erfahrung); Truhenzeilen ignorieren ihn. Alle Tage abw\u00e4hlen, um eine Zeile zu behalten, ohne sie laufen zu lassen.","tr":"De\u011fer, sunucu oranlar\u0131n\u0131n \u00fcst\u00fcndeki y\u00fczdedir (50 = +%50 tecr\u00fcbe); sand\u0131k sat\u0131rlar\u0131 bunu yok sayar. Bir sat\u0131r\u0131 \u00e7al\u0131\u015ft\u0131rmadan saklamak i\u00e7in t\u00fcm g\u00fcnlerin i\u015faretini kald\u0131r\u0131n."},
+ "ev_now_minutes":{"en":"for minutes","pl":"na minut","de":"f\u00fcr Minuten","tr":"dakika boyunca"},
+ "ev_now_value": {"en":"+%","pl":"+%","de":"+%","tr":"+%"},
+ "ev_now_go":    {"en":"Activate now","pl":"Aktywuj teraz","de":"Jetzt aktivieren","tr":"\u015eimdi etkinle\u015ftir"},
+ "ev_now_started":{"en":"Event switched on for %d minutes; the chat is told within seconds.","pl":"Event w\u0142\u0105czony na %d minut; czat dowie si\u0119 w kilka sekund.","de":"Event f\u00fcr %d Minuten eingeschaltet; der Chat erf\u00e4hrt es binnen Sekunden.","tr":"Etkinlik %d dakikal\u0131\u011f\u0131na a\u00e7\u0131ld\u0131; sohbet saniyeler i\u00e7inde \u00f6\u011frenir."},
+ "ev_stop":      {"en":"End now","pl":"Zako\u0144cz","de":"Jetzt beenden","tr":"\u015eimdi bitir"},
+ "ev_stopped":   {"en":"The event switched on by hand is over.","pl":"Event w\u0142\u0105czony r\u0119cznie zako\u0144czony.","de":"Das von Hand eingeschaltete Event ist beendet.","tr":"Elle a\u00e7\u0131lan etkinlik bitti."},
+ "ai_chest_off":  {"en":"Turn the Moonlight chest drop off","pl":"Wyłącz drop Szkatułek Blasku Księżyca","de":"Mondschein-Truhen nicht fallen lassen","tr":"Ay Işığı Sandığı düşmesini kapat"},
+ "ai_chest_off_help":{"en":"Ticked and saved, no chest drops from monsters or Metin stones (both figures go to 0‰); the sliders keep what you set and come back when you untick. Unticking is not the same as chests falling: outside a chest event none drops whatever these say, so what brings them back is a window on the Events page. Applies within five seconds.",
+                  "pl":"Zaznaczone i zapisane: żadna szkatułka nie wypada z potworów ani z Metinów (obie wartości idą na 0‰); suwaki pamiętają Twoje ustawienie i wracają po odznaczeniu. Odznaczenie to jeszcze nie szkatułki: poza eventem szkatułek nie wypada żadna, cokolwiek mówią te suwaki — żeby leciały, potrzebne jest okno na stronie Eventy. Działa w pięć sekund.",
+                  "de":"Angehakt und gespeichert fällt keine Truhe mehr von Monstern oder Metins (beide Werte auf 0‰); die Regler behalten deine Werte und kommen nach dem Abhaken zurück. Gilt binnen fünf Sekunden.",
+                  "tr":"İşaretleyip kaydedince canavarlardan ve Metinlerden sandık düşmez (iki değer de 0‰ olur); kaydırıcılar ayarını hatırlar ve işareti kaldırınca geri gelir. Beş saniye içinde uygulanır."},
  "ai_chest_kill": {"en":"per monster kill","pl":"z zabitego potwora","de":"pro getötetem Monster","tr":"öldürülen canavar başına"},
  "ai_chest_stone":{"en":"per broken Metin stone","pl":"z rozbitego Metina","de":"pro zerstörtem Metin","tr":"kırılan Metin başına"},
  "ai_chest_note": {"en":"Saving writes both values; until then the game keeps what .env says.",
@@ -2745,6 +3644,15 @@ T.update({
                   "de":"Datei konnte nicht geschrieben werden \u2014 das gemeinsame Spool-Verzeichnis ist in diesem Container nicht eingebunden.",
                   "tr":"Dosya yazılamadı \u2014 paylaşılan spool dizini bu kapsayıcıda bağlı değil."},
  "ai_save":      {"en":"Save","pl":"Zapisz","de":"Speichern","tr":"Kaydet"},
+ "ai_items_open": {"en":"📦 What the bots may sell","pl":"📦 Co boty mogą sprzedawać"},
+ "ai_items_nav":  {"en":"📦 Item policy: merchant or stall","pl":"📦 Polityka przedmiotów: handlarz czy stragan"},
+ "ai_items_intro":{"en":"One line per item: the item number (vnum) or a whole type (type:19), a space or tab, and one word. keep - never leaves the bag; stall - counter goods, ahead of everything else, but at most three lines of one item on a counter (marbles: three, each of another monster) while the rest waits in the bag; merchant - sold to the NPC merchant on the next town visit; drop - thrown away at the merchant visit without a sale. Anything not listed here follows the bots' own rules. Saved, it reaches every bot within five seconds.",
+                  "pl":"Jedna linia na przedmiot: numer przedmiotu (vnum) albo cały typ (type:19), spacja lub tabulator i jedno słowo. keep (zostaw) - nigdy nie opuszcza plecaka; stall (stragan) - towar na ladę, przed wszystkim innym, ale najwyżej 3 linie jednego przedmiotu na ladzie (marmury: 3, każdy innego potwora), a reszta czeka w plecaku; merchant (handlarz) - sprzedany handlarzowi NPC przy najbliższej wizycie w mieście; drop (wyrzuc) - wyrzucony przy wizycie u handlarza, bez sprzedaży. Czego tu nie ma, podlega własnym regułom botów. Po zapisie dociera do każdego bota w ciągu pięciu sekund."},
+ "ai_items_format":{"en":"Item numbers: the item search on the give-item page shows them; item types: 5 materials, 18 quest items, 19 polymorph marbles, 17 skill books, 3 usable items (scrolls, stones). A # starts a comment.",
+                  "pl":"Numery przedmiotów pokazuje wyszukiwarka na stronie nadawania przedmiotów; typy: 5 materiały, 18 przedmioty questowe, 19 marmury polimorfii, 17 księgi, 3 przedmioty użytkowe (zwoje, kamienie). Znak # zaczyna komentarz."},
+ "ai_items_bad":  {"en":"Not saved: line(s) {n} are not '<vnum or type:N> <keep|stall|merchant|drop>'.",
+                  "pl":"Nie zapisano: linie {n} nie mają postaci '<vnum albo type:N> <keep|stall|merchant|drop>'."},
+ "ai_items_live": {"en":"Saved. The bots read the file within five seconds.","pl":"Zapisano. Boty czytają plik w ciągu pięciu sekund."},
  "ai_reset":     {"en":"Everything back to 100","pl":"Wszystko z powrotem na 100","de":"Alles zurück auf 100","tr":"Hepsini 100'e döndür"},
  "ai_rare":      {"en":"rarely","pl":"rzadko","de":"selten","tr":"nadiren"},
  "ai_often":     {"en":"often","pl":"często","de":"oft","tr":"sık"},
@@ -2801,10 +3709,10 @@ T.update({
                   "de":"Wie viele Bots überhaupt angeln. Einmal pro Bot entschieden, eine Änderung trifft also die nächsten Angler.",
                   "tr":"Kaç botun balık tuttuğu. Bot başına bir kez belirlenir, değişiklik sonraki balıkçılara işler."},
  "aiw_TRADE":    {"en":"Market stalls","pl":"Stragany","de":"Marktstände","tr":"Pazar tezgahları"},
- "aih_TRADE":    {"en":"How many bots keep a private shop open. Merchants always do, whatever this says.",
-                  "pl":"Ilu botów trzyma otwarty stragan. Handlarze robią to zawsze, niezależnie od tego suwaka.",
-                  "de":"Wie viele Bots einen Laden offen halten. Händler tun es immer, egal was hier steht.",
-                  "tr":"Kaç botun tezgahı açık tuttuğu. Tüccarlar bundan bağımsız olarak hep açar."},
+ "aih_TRADE":    {"en":"How many bots keep a private shop open. Four cases ignore this slider: a Merchant personality, a bot that cannot afford its potions, a full bag, and a dropper under bag pressure (the counter is how they empty it). The slider moves the rest: the surplus-books stall, the dropper's roll and the one-in-ten. Stalls already standing re-check within five minutes of a change; the status says why each one is open.",
+                  "pl":"Ilu botów trzyma otwarty stragan. Cztery przypadki nie słuchają tego suwaka: osobowość Handlarz, bot bez yang na mikstury, pełny plecak i dropper pod presją plecaka (lada to jedyny sposób, żeby go opróżnić). Suwak rusza resztę: stragan z nadmiaru ksiąg, los droppera i „jeden na dziesięciu”. Stojące już stragany sprawdzają się ponownie do pięciu minut po zmianie; status mówi, dlaczego każdy jest otwarty.",
+                  "de":"Wie viele Bots einen Laden offen halten. Vier Fälle ignorieren den Regler: die Händler-Persönlichkeit, ein Bot ohne Yang für Tränke, ein voller Beutel und ein Dropper unter Beuteldruck. Der Regler bewegt den Rest: den Bücher-Stand, den Dropper-Wurf und den Einen-von-zehn. Stehende Läden prüfen sich binnen fünf Minuten neu; der Status sagt, warum jeder offen ist.",
+                  "tr":"Kaç botun tezgahı açık tuttuğu. Dört durum bu kaydırıcıyı dinlemez: Tüccar kişiliği, iksir parası olmayan bot, dolu çanta ve çanta baskısındaki dropper. Kaydırıcı gerisini oynatır: fazla kitap tezgahı, dropper zarı ve onda bir. Açık tezgahlar değişiklikten sonra beş dakika içinde yeniden bakar; durum her birinin neden açık olduğunu söyler."},
 })
 
 
@@ -2855,6 +3763,37 @@ CATS = ["all","weapon","armor","usable","ds","metin","special","other"]
 # mistake this panel has made most often, and a bare 71 in a loop says nothing.
 APPLY_SKILL_DAMAGE_BONUS = 71
 APPLY_NORMAL_HIT_DAMAGE_BONUS = 72
+
+# Which engine this panel is looking at. The mt2009 (martysama0134) engine
+# keeps an item's bonus lines as POINT_* numbers - player.item.attrtype is
+# a point, world.item_attr.apply is an enum of POINT_ names - so the two
+# damage lines are 121 and 122 there, and every attrtype has to go through
+# POINT_TO_APPLY before APPLY_META can name it. account.account carries no
+# empire column on that schema either; player_index.empire is the only one.
+# PANEL_ENGINE / ENGINE_MT2009 are read near the top of the file now.
+if ENGINE_MT2009:
+    APPLY_SKILL_DAMAGE_BONUS = 121
+    APPLY_NORMAL_HIT_DAMAGE_BONUS = 122
+POINT_TO_APPLY = {6: 1, 8: 2, 13: 3, 15: 4, 12: 5, 14: 6, 17: 7, 19: 8, 21: 9, 32: 10, 33: 11,
+ 37: 12, 38: 13, 39: 14, 40: 15, 41: 16, 43: 17, 44: 18, 45: 19, 46: 20, 47: 21,
+ 48: 22, 63: 23, 64: 24, 65: 25, 66: 26, 67: 27, 68: 28, 69: 29, 70: 30, 71: 31,
+ 72: 32, 73: 33, 74: 34, 75: 35, 76: 36, 77: 37, 78: 38, 79: 39, 81: 41, 82: 42,
+ 83: 43, 84: 44, 85: 45, 86: 46, 87: 47, 88: 48, 89: 49, 90: 50, 28: 51, 34: 52,
+ 95: 53, 96: 54, 22: 55, 23: 56, 42: 57, 10: 58, 54: 59, 55: 60, 56: 61, 57: 62,
+ 53: 63, 114: 64, 115: 65, 116: 66, 117: 67, 118: 68, 119: 69, 120: 70, 121: 71,
+ 122: 72, 123: 73, 124: 74, 125: 75, 126: 76, 59: 78, 60: 79, 61: 80, 62: 81,
+ 128: 82, 16: 83, 130: 84, 131: 85, 132: 86, 133: 87, 134: 88, 135: 89, 136: 90,
+ 137: 91,
+ # mt2009 points with no APPLY id at all (length.h 138..168 - the engine
+ # applies them straight from the item). A pseudo key of 1000 + point, so
+ # the label tables can name them; without it the panel wrote "Bonus #139".
+ 138: 1138, 139: 1139, 140: 1140, 141: 1141, 142: 1142, 143: 1143, 144: 1144, 145: 1145, 146: 1146, 147: 1147, 148: 1148, 149: 1149, 150: 1150, 151: 1151, 152: 1152, 153: 1153, 154: 1154, 155: 1155, 156: 1156, 157: 1157, 158: 1158, 159: 1159, 160: 1160, 161: 1161, 162: 1162, 163: 1163, 164: 1164, 165: 1165, 166: 1166, 167: 1167, 168: 1168}
+
+
+def apply_key(attr_type):
+    """The APPLY_META key for an attribute type, on either engine."""
+    t = int(attr_type or 0)
+    return POINT_TO_APPLY.get(t, t) if ENGINE_MT2009 else t
 
 
 def lang():
@@ -3001,6 +3940,14 @@ def inject_i18n():
             "has_accounts": accounts_exist(),
             "pp_min": PASSPHRASE_MIN,
             "max_level": MAX_LEVEL,
+            # Empty on r40250; on mt2009 the POINT->APPLY table the JS
+            # side puts every attrtype through before APPLY_META.
+            "point_to_apply": POINT_TO_APPLY if ENGINE_MT2009 else {},
+            # For cache-busting the item table: /static/item_defs.json is
+            # served with a ten-minute max-age, so a panel update that
+            # changed what it carries (2.0.14: the base stats) was invisible
+            # to a browser that had the old answer until the cache ran out.
+            "panel_version": PANEL_VERSION,
             # The language the GAME is in -- see the note above GAME_LANGS. The
             # front page uses it too, next to the download button, so it goes in
             # the shared context rather than into one route.
@@ -3049,6 +3996,12 @@ WARP_LOC = [  # (emoji, {lang:name}, coords)
   ("🏮", {"en":"Chunjo City","pl":"Miasto Chunjo","de":"Chunjo-Stadt","tr":"Chunjo Şehri"}, "65900 155600"),
   ("⛩️", {"en":"Jinno City","pl":"Miasto Jinno","de":"Jinno-Stadt","tr":"Jinno Şehri"}, "963500 279700"),
   ("🏘️", {"en":"Bokjung (M2)","pl":"Bokjung (M2)","de":"Bokjung (M2)","tr":"Bokjung (M2)"}, "145500 240000"),
+  # The other two second villages, at their market pitch (GetTownPitch in
+  # playerbot_empire_rules.h: standable ground inside the safe zone, the way
+  # Bokjung's row above is Bokjung's pitch). Only Chunjo's was listed, so a
+  # Shinsoo or Jinno M2 could not be reached from here (Pabloo, 14 September).
+  ("🏘️", {"en":"Jayang (M2)","pl":"Jayang (M2)","de":"Jayang (M2)","tr":"Jayang (M2)"}, "353987 880012"),
+  ("🏘️", {"en":"Bakra (M2)","pl":"Bakra (M2)","de":"Bakra (M2)","tr":"Bakra (M2)"}, "865500 244975"),
   ("⚔️", {"en":"Orc Valley","pl":"Dolina Orków","de":"Orktal","tr":"Ork Vadisi"}, "270400 739900"),
   ("🏜️", {"en":"Yongbi Desert","pl":"Pustynia Yongbi","de":"Yongbi-Wüste","tr":"Yongbi Çölü"}, "221900 502700"),
   ("❄️", {"en":"Mount Sohan","pl":"Góra Sohan","de":"Sohan-Berg","tr":"Sohan Dağı"}, "375200 174900"),
@@ -3101,6 +4054,46 @@ def clean_rate(raw):
         return None
     return v if RATE_MIN <= v <= RATE_MAX else None
 
+def read_rates_mt2009(cur):
+    """The operator's own three percentages, read from what the engine reads.
+
+    On this line a rate is an event flag (a player.quest row with dwPID = 0)
+    and everything else - this table, the advanced panel's, the spool's
+    rates.status - is somebody's copy of it. Four things write the flags (both
+    panels, the in-game RATES helper and the timed events) and only some of
+    them refresh every copy, so the copies drift: measured on the test world on
+    20 September, rates.status said drop 150 / yang 120 while the flags and the
+    world ran 200 / 200, and the advanced panel - which reads that file first -
+    showed the stale pair and would have written it back the moment anybody
+    pressed Save there ("jak ustawialem wczesniej raty u tiera to u sebana
+    narzucal poprzednie", NerrVoVy; "ustawilem 10000% a boty dzialaja jakby
+    mialy x3/5", marcol_).
+
+    While a rate event runs the live flag holds the boosted number and
+    m2_event_*_base holds what the operator set, so the base wins when it is
+    there: a page must show the setting, not the boost, or saving during an
+    event would bake the boost in as the new normal.
+    """
+    vals = {}
+    for name, flags in MT2009_RATE_FLAGS.items():
+        cur.execute("SELECT szName, lValue FROM player.quest WHERE dwPID=0 AND szName IN (%s, %s)",
+                    (flags[0], MT2009_RATE_BASE_FLAGS[name][0]))
+        live = base = 0
+        for row in cur.fetchall():
+            try:
+                value = int(row["lValue"])
+            except (TypeError, ValueError):
+                continue
+            if row["szName"] == flags[0]:
+                live = value
+            else:
+                base = value
+        if base > 0:
+            vals[name] = base
+        elif live > 0:
+            vals[name] = live
+    return vals
+
 def read_rates():
     """The three percentages as they stand in the database."""
     vals = {n: 100 for n in RATE_NAMES}
@@ -3112,6 +4105,13 @@ def read_rates():
                     vals[row["name"]] = int(row["value"])
                 except (TypeError, ValueError):
                     pass
+        if ENGINE_MT2009:
+            # The table above is this panel's own mirror and is kept only so a
+            # world whose flags were never written still shows something.
+            try:
+                vals.update(read_rates_mt2009(cur))
+            except Exception:
+                pass
     return vals
 
 def rates_status():
@@ -3127,14 +4127,145 @@ def rates_status():
         pass
     return out
 
-def write_rates_status(state):
-    """Say 'it is running' right away, so reloading straight after saving is honest."""
+def write_rates_status(state, vals=None, message=""):
+    """Say 'it is running' right away, so reloading straight after saving is honest.
+
+    With `vals` the three numbers go in too, in the shape m2-rates publishes
+    them -- the advanced panel reads its current rates from this file first."""
     try:
         with open(RATES_STATUS, "w", encoding="utf-8") as f:
             f.write("state=%s\ntime=%d\n" % (state, int(time.time())))
+            if vals:
+                f.write("exp=%s\ndrop=%s\nyang=%s\n" % (vals["exp"], vals["drop"], vals["yang"]))
+            if message:
+                f.write("message=%s\n" % message)
         os.chmod(RATES_STATUS, 0o600)
     except OSError:
         pass
+
+# ---- rates on the mt2009 line ------------------------------------------------
+# r40250 has no rate setting, so its m2-rates rewrites mob_proto.txt and the
+# drop tables and restarts the cores. The mt2009 engine keeps the protos in
+# the database and has server-wide multipliers of its own: CHARACTER_MANAGER
+# multiplies experience, drops and yang by m_iMobExpRate / m_iMobItemRate /
+# m_iMobGoldAmountRate, and CQuestManager::SetEventFlag() sets those from the
+# event flags below (the "_buyer" twin is what a premium account reads, so
+# both carry the same number). An event flag is a row of player.quest with
+# dwPID = 0: the db core loads them at boot and pushes them to every game
+# core (ClientManagerEventFlag.cpp), so writing the rows is what survives a
+# restart, and the in-game helper's RATES command (game.set_event_flag) is
+# what makes them live without one. 2.0.x shipped the r40250 page unchanged
+# on this line: it saved, said the server was restarting, and nothing read
+# the request -- "panel na zielono informuje o zmianie, a nic się nie zmienia".
+MT2009_RATE_FLAGS = {
+    "exp":  ("mob_exp",  "mob_exp_buyer"),
+    "drop": ("mob_item", "mob_item_buyer"),
+    "yang": ("mob_gold", "mob_gold_buyer"),
+}
+# What the operator set, kept aside while a timed event boosts the live flag
+# (playerbot_events.h). Zero means no event is running on that kind.
+MT2009_RATE_BASE_FLAGS = {
+    "exp":  ("m2_event_exp_base",  "m2_event_exp_base_buyer"),
+    "drop": ("m2_event_drop_base", "m2_event_drop_base_buyer"),
+    "yang": ("m2_event_yang_base", "m2_event_yang_base_buyer"),
+}
+# Respawn time, as a percent of the regen line's own delay: the engine's
+# regen_event scales the next spawn by the event flags fastBossSpawn and
+# fastMobSpawn (0 = untouched, 1..100 = that share of the delay; playerbotify
+# adds the map-less names as the fallback to Seban's per-map ones). The page
+# shows 100 for "normal", the flag carries 0 for it.
+MT2009_REGEN_FLAGS = {"regen_boss": "fastBossSpawn", "regen_mob": "fastMobSpawn"}
+REGEN_MIN_PERCENT = 10
+# How many a respawn line keeps standing: regen_spawn tops each line up to
+# its own count times m2_boss_count / m2_mob_count percent (playerbotify's
+# regen_target_count; 100 = as written, 400 at most). Kiciamol, 18 September:
+# his own edit of regen.cpp was undone by every update.
+MT2009_REGEN_COUNT_FLAGS = {"count_boss": "m2_boss_count", "count_mob": "m2_mob_count"}
+REGEN_COUNT_CHOICES = (100, 150, 200, 250, 300, 400)
+
+def read_regen_mt2009():
+    """The two flags as the page shows them (100 = normal), from player.quest."""
+    out = {name: 100 for name in MT2009_REGEN_FLAGS}
+    with db() as c, c.cursor() as cur:
+        for name, flag in MT2009_REGEN_FLAGS.items():
+            cur.execute("SELECT lValue FROM player.quest WHERE dwPID=0 AND szName=%s LIMIT 1", (flag,))
+            row = cur.fetchone()
+            if row:
+                value = int(row["lValue"] if isinstance(row, dict) else row[0])
+                if REGEN_MIN_PERCENT <= value < 100:
+                    out[name] = value
+    return out
+
+def read_regen_count_mt2009():
+    """The two multipliers as percents (100 = as the game has it), from player.quest."""
+    out = {name: 100 for name in MT2009_REGEN_COUNT_FLAGS}
+    with db() as c, c.cursor() as cur:
+        for name, flag in MT2009_REGEN_COUNT_FLAGS.items():
+            cur.execute("SELECT lValue FROM player.quest WHERE dwPID=0 AND szName=%s LIMIT 1", (flag,))
+            row = cur.fetchone()
+            if row:
+                value = int(row["lValue"] if isinstance(row, dict) else row[0])
+                if 100 < value <= max(REGEN_COUNT_CHOICES):
+                    out[name] = value
+    return out
+
+def persist_regen_count_mt2009(cur, vals):
+    for name, flag in MT2009_REGEN_COUNT_FLAGS.items():
+        value = int(vals[name])
+        cur.execute("REPLACE INTO player.quest (dwPID, szName, szState, lValue) "
+                    "VALUES (0, %s, '', %s)", (flag, 0 if value <= 100 else value))
+
+def persist_regen_mt2009(cur, vals):
+    for name, flag in MT2009_REGEN_FLAGS.items():
+        value = int(vals[name])
+        cur.execute("REPLACE INTO player.quest (dwPID, szName, szState, lValue) "
+                    "VALUES (0, %s, '', %s)", (flag, 0 if value >= 100 else value))
+RATES_LIVE_WAIT = 12.0     # the helper's server timer ticks every 5 s
+GM_RELOAD_WAIT = 8.0       # a player timer ticks every 3 s
+
+def persist_rates_mt2009(cur, vals):
+    """The six event-flag rows the db core reads at its next start."""
+    for name, flags in MT2009_RATE_FLAGS.items():
+        for flag in flags:
+            cur.execute("REPLACE INTO player.quest (dwPID, szName, szState, lValue) "
+                        "VALUES (0, %s, '', %s)", (flag, int(vals[name])))
+
+def gm_reload_mt2009():
+    """Ask an online IMPLEMENTOR to run /reload a for us. True when one did.
+
+    This engine has no admin socket, so m2-gm cannot exist here; what re-reads
+    common.gmlist is the db core on HEADER_GD_RELOAD_ADMIN, which /reload a
+    sends -- and the helper runs a command as the player whose timer it is, so
+    only a character that already holds the rank can carry it. One row per
+    IMPLEMENTOR; the first 'done' is enough and the rest are withdrawn."""
+    try:
+        with db() as c, c.cursor() as cur:
+            cur.execute("SELECT mName FROM common.gmlist WHERE mAuthority='IMPLEMENTOR' LIMIT 8")
+            names = [r["mName"] for r in cur.fetchall() if r["mName"]]
+            qids = []
+            for n in names:
+                cur.execute("INSERT INTO player.web_admin_queue (player_name,cmd,arg1,arg2) "
+                            "VALUES (%s,'GM_RELOAD','','')", (n,))
+                qids.append(cur.lastrowid)
+    except Exception:
+        return False
+    if not qids:
+        return False
+    done = False
+    deadline = time.time() + GM_RELOAD_WAIT
+    try:
+        while time.time() < deadline and not done:
+            time.sleep(0.6)
+            with db() as c, c.cursor() as cur:
+                cur.execute("SELECT status FROM player.web_admin_queue WHERE id IN (%s)"
+                            % ",".join("%s" for _ in qids), qids)
+                done = any(r["status"] == "done" for r in cur.fetchall())
+        with db() as c, c.cursor() as cur:
+            cur.execute("UPDATE player.web_admin_queue SET status='cancelled' WHERE status='pending' AND id IN (%s)"
+                        % ",".join("%s" for _ in qids), qids)
+    except Exception:
+        pass
+    return done
 
 def gold_presets_i18n():
     return GOLD_PRESETS
@@ -3349,6 +4480,35 @@ def api_checkname():
 
 FAVICON = _env_path("M2PANEL_FAVICON", os.path.join(_HERE, "favicon.png"))
 
+@app.route("/static/item_defs.json")
+def item_defs_json():
+    """What the inventory grid draws with: a cell size per vnum, and the icon
+    name the static table carries. On mt2009 the sizes come from the world's
+    item_proto, so a two-cell dagger is two cells; the static file stays the
+    source of icons, and the whole answer for r40250."""
+    static_path = os.path.join(_HERE, "static", "item_defs.json")
+    defs = {}
+    try:
+        with open(static_path, encoding="utf-8") as f:
+            defs = json.load(f) or {}
+    except Exception:
+        defs = {}
+    item_proto_ready()
+    if ENGINE_MT2009 and ITEM_SIZES:
+        for vnum, size in ITEM_SIZES.items():
+            entry = defs.get(str(vnum))
+            if not isinstance(entry, dict):
+                entry = defs[str(vnum)] = {}
+            entry["size"] = size
+            entry["name"] = ITEM_NAMES_PL.get(vnum, entry.get("name", ""))
+            # The tooltip's base lines (attack, defence, the fixed applies,
+            # the level) come from this world's proto too - the static
+            # file's are the other engine's numbers for the same vnum.
+            entry.update(ITEM_BASE.get(vnum, {}))
+    resp = jsonify(defs)
+    resp.headers["Cache-Control"] = "public, max-age=600"
+    return resp
+
 @app.route("/favicon.ico")
 def favicon():
     """The icon out of Metin2Release.exe, extracted once at packaging time."""
@@ -3373,7 +4533,33 @@ def local_open():
     local_only flag rather than guessing from the bind address, where a public
     server behind nginx also looks like 127.0.0.1.
     """
-    return bool(CONF.get("local_only", False))
+    explicit = os.environ.get("M2PANEL_LOCAL_ONLY", "").strip().lower()
+    if explicit:
+        return explicit in ("1", "true", "yes", "on")
+    if bool(CONF.get("local_only", False)):
+        return True
+    # The installer's nginx mode binds the panel to loopback and puts the
+    # proxy in front: public, whatever the address says.
+    if bool(CONF.get("trust_proxy", False)):
+        return False
+    # The mt2009 line is the single-player suite: one player at their own
+    # machine, no passphrase to invent or lose ("wylacz wymog wpisywania
+    # hasla, to projekt singleplayer" - Tieru, 13 September). An operator who
+    # exposes it sets M2_PANEL_LOCAL_ONLY=0 or runs it behind the proxy,
+    # both handled above.
+    if ENGINE_MT2009:
+        return True
+    return _LOCAL_BY_BIND
+
+# Said only where the installer said nothing: the 2.x package has no
+# installer, its launcher writes M2_HOST_BIND_ADDRESS=127.0.0.1 into .env
+# for a single-player world, and the panel then asked that player for a
+# passphrase they had never set ("nie wiem gdzie mam haslo admin"). The
+# bind address the panel was published on comes in as M2PANEL_BIND_ADDRESS;
+# loopback means nobody but this machine can reach it. A server behind a
+# proxy also binds to loopback and IS public - that operator sets
+# M2_PANEL_LOCAL_ONLY=0 in .env, which is the explicit answer above.
+_LOCAL_BY_BIND = os.environ.get("M2PANEL_BIND_ADDRESS", "").strip() in ("127.0.0.1", "localhost", "::1")
 
 def login_required(fn):
     @wraps(fn)
@@ -3959,6 +5145,7 @@ TPL_DASH = BASE.replace("__BODY__", """
 {% else %}
 <p class="muted">{{t('ver_label')}} <b>{{ panel_version if panel_version else t('ver_unknown') }}</b>.
 {% if not upd.enabled %}{{t('upd_off_t')}}.{% elif upd.error %}{{t('upd_failed')}}{% elif not upd.checked %}{{t('upd_never')}}{% else %}{{t('upd_none')}}{% endif %}</p>
+{% if upd.next_line %}<p class="muted">{{ t('upd_next_line').replace('{new}', upd.next_line) }}</p>{% endif %}
 <a class="btn" href="{{url_for('patchlog')}}" title="{{t('tip_patchlog')}}">{{t('pl_open')}}</a>
 {% endif %}
 </div>
@@ -3976,6 +5163,16 @@ TPL_DASH = BASE.replace("__BODY__", """
 <h3 class="help">{{t('ai_nav')}}</h3>
 <p class="muted">{{t('ai_dash_hint')}}</p>
 <a class="btn" href="{{url_for('ai_weights')}}">{{t('ai_open')}}</a>
+</div>
+<div class="card">
+<h3 class="help">{{t('ev_nav')}}</h3>
+<p class="muted">{{t('ev_dash_hint')}}</p>
+<a class="btn" href="{{url_for('events_page')}}">{{t('ev_open')}}</a>
+</div>
+<div class="card">
+<h3 class="help">{{t('gl_nav')}}</h3>
+<p class="muted">{{t('gl_dash_hint')}}</p>
+<a class="btn" href="{{url_for('guilds_page')}}">{{t('gl_open')}}</a>
 </div>
 <div class="card">
 <h3 class="help" title="{{t('tip_reset')}}">🔗 {{t('reset_title')}}</h3>
@@ -4201,7 +5398,7 @@ TPL_RATES = BASE.replace("__BODY__", """
 <p><a href="{{url_for('dash')}}">{{t('back_players')}}</a></p>
 <div class="card">
 <h3>{{t('rates_nav')}}</h3>
-<p class="muted">{{t('rates_intro')}}</p>
+<p class="muted">{{t(intro_key)}}</p>
 <p><span class="badge">⭐ {{t('rates_exp')}} {{cur['exp']}}%</span>
    <span class="badge">🎁 {{t('rates_drop')}} {{cur['drop']}}%</span>
    <span class="badge">💰 {{t('rates_yang')}} {{cur['yang']}}%</span></p>
@@ -4239,7 +5436,63 @@ function m2rates(e,d,y){
   document.getElementById('r_drop').value=d;
   document.getElementById('r_yang').value=y;
 }
-</script>""")
+</script>
+{% if regen %}
+<div class="card">
+<form method="post" action="{{url_for('rates_regen')}}">
+<input type="hidden" name="_csrf" value="{{csrf_token}}">
+<h3>⏱️ {{t('regen_title')}}</h3>
+<p class="muted">{{t('regen_help')}}</p>
+{% for key, icon in (("regen_boss", "🪨"), ("regen_mob", "👾")) %}
+<h3 style="margin-top:{{ 12 if loop.first else 18 }}px">{{icon}} {{t(key)}}</h3>
+<input id="{{key}}" name="{{key}}" type="number" min="10" max="100" step="1" value="{{regen[key]}}" required oninput="regenLabel('{{key}}')">
+<div class="muted" style="margin-top:6px">{{t('regen_faster')}}
+{% for m in (1, 2, 3, 4, 5, 10) %}<button type="button" class="small" style="margin:2px" onclick="regenSet('{{key}}', {{ (100 / m) | round(0) | int }})">×{{m}}</button>{% endfor %}
+<span id="{{key}}_mult" style="margin-left:8px"></span></div>
+{% endfor %}
+<script>
+function regenLabel(k){var v=parseInt(document.getElementById(k).value||"100",10);if(!(v>0))v=100;
+  var m=Math.round(100/v*10)/10;var s=(m%1===0)?String(m):m.toFixed(1);
+  document.getElementById(k+"_mult").textContent={{ t('regen_mult') | tojson }}.replace("{n}", s);}
+function regenSet(k,v){document.getElementById(k).value=v;regenLabel(k);}
+regenLabel("regen_boss");regenLabel("regen_mob");
+</script>
+<button class="big" style="margin-top:18px">{{t('regen_save')}}</button>
+</form></div>
+{% endif %}
+{% if regen_count %}
+<div class="card">
+<form method="post" action="{{url_for('rates_regen_count')}}">
+<input type="hidden" name="_csrf" value="{{csrf_token}}">
+<h3>👥 {{t('count_title')}}</h3>
+<p class="muted">{{t('count_help')}}</p>
+<p class="muted">⚠️ {{t('count_warn')}}</p>
+{% for key, icon in (("count_boss", "🪨"), ("count_mob", "👾")) %}
+<h3 style="margin-top:{{ 12 if loop.first else 18 }}px">{{icon}} {{t(key)}}</h3>
+<select id="{{key}}" name="{{key}}">
+{% for p in count_choices %}<option value="{{p}}"{% if regen_count[key] == p %} selected{% endif %}>×{{ (p / 100) | round(1) | replace(".0", "") | replace(".", ",") }}</option>{% endfor %}
+</select>
+{% endfor %}
+<button class="big" style="margin-top:18px">{{t('count_save')}}</button>
+</form></div>
+{% endif %}
+{% if channels %}
+<div class="card">
+<form method="post" action="{{url_for('rates_channels')}}">
+<input type="hidden" name="_csrf" value="{{csrf_token}}">
+<h3>🔀 {{t('ch2_title')}}</h3>
+<p class="muted">{{t('ch2_help')}}</p>
+<p>{% if channels.on %}{{ t('ch2_now_on').replace('{share}', channels.share|string) }}{% else %}{{t('ch2_now_off')}}{% endif %}</p>
+{% if channels.on and not channels.ports_open %}<p class="muted">⚠️ {{t('ch2_ports')}}</p>{% endif %}
+{% if channels.pending %}<p class="muted">🕓 {{ t('ch2_pending').replace('{what}', channels.pending) }}</p>{% endif %}
+<label><input type="checkbox" name="ch2" value="1"{% if channels.want_on %} checked{% endif %}> {{t('ch2_enable')}}</label>
+<h3 style="margin-top:12px">{{t('ch2_share')}}</h3>
+<select name="share">
+{% for p in channels.choices %}<option value="{{p}}"{% if channels.want_share == p %} selected{% endif %}>{{p}}%</option>{% endfor %}
+</select>
+<button class="big" style="margin-top:18px">{{t('ch2_save')}}</button>
+</form></div>
+{% endif %}""")
 
 # every state apply_rates.sh can leave behind has a sentence of its own
 RATE_STATES = ("running", "ok", "unsupported", "failed", "no_restart")
@@ -4306,11 +5559,138 @@ TPL_SEASON = BASE.replace("__BODY__", """
 # that says what it actually changes -- an unlabelled slider called "BIOLOG" is
 # a number, not a control. No %-formatting anywhere in here: BASE is full of
 # CSS percentages and would eat it.
+TPL_EVENTS = BASE.replace("__BODY__", """
+<p><a href="{{url_for('dash')}}">{{t('back_players')}}</a></p>
+<div class="card">
+<h3>{{t('ev_nav')}}</h3>
+<p class="muted">{{t('ev_intro')}}</p>
+<p class="muted">{{t('ev_chest_note')}}</p>
+<p class="muted">{{t('ev_notice_note')}}</p>
+</div>
+
+<div class="card">
+<h3>{{t('ev_status_title')}}</h3>
+{% if not status %}<p class="muted">{{t('ev_status_stale')}}</p>{% endif %}
+<table>
+{% for k in kinds %}{% set s = status.get(k) %}
+<tr>
+<td><b>{{t('ev_kind_' + k)}}</b></td>
+<td>
+{% if s and s.active %}<span class="badge">{{t('ev_active')}} {{s.until_text}}{% if s.value and k != 'chest' %} (+{{s.value}}%){% endif %}</span>
+{% elif s and s.next_start %}{{t('ev_next')}}: {{s.next_start_text}}{% if s.next_value and k != 'chest' %} (+{{s.next_value}}%){% endif %}
+{% elif s and s.scheduled %}{{t('ev_inactive')}}
+{% elif s %}{{t('ev_none')}}
+{% else %}-{% endif %}
+</td>
+<td>
+<form method="post" style="display:inline">
+<input type="hidden" name="_csrf" value="{{csrf_token}}">
+<input type="hidden" name="action" value="now">
+<input type="hidden" name="kind" value="{{k}}">
+{{t('ev_now_minutes')}}
+<select name="minutes">{% for m in minutes %}<option value="{{m}}" {% if m == 60 %}selected{% endif %}>{{m}}</option>{% endfor %}</select>
+{% if k != 'chest' %}{{t('ev_now_value')}} <input type="number" name="value" min="1" max="1000" value="50" style="width:70px">{% endif %}
+<button class="btn" type="submit">{{t('ev_now_go')}}</button>
+</form>
+{% if nows.get(k) and nows[k].until > now_epoch %}
+<form method="post" style="display:inline">
+<input type="hidden" name="_csrf" value="{{csrf_token}}">
+<input type="hidden" name="action" value="stop">
+<input type="hidden" name="kind" value="{{k}}">
+<button class="btn" type="submit">{{t('ev_stop')}}</button>
+</form>
+{% endif %}
+</td>
+</tr>
+{% endfor %}
+</table>
+</div>
+
+<div class="card">
+<h3>{{t('ev_schedule')}}</h3>
+<p class="muted">{{t('ev_value_help')}}</p>
+<form method="post">
+<input type="hidden" name="_csrf" value="{{csrf_token}}">
+<input type="hidden" name="action" value="save">
+<table>
+<tr><th>{{t('ev_col_kind')}}</th><th>{{t('ev_col_days')}}</th><th>{{t('ev_col_from')}}</th><th>{{t('ev_col_to')}}</th><th>{{t('ev_col_value')}}</th><th>{{t('ev_col_on')}}</th><th>{{t('ev_col_del')}}</th></tr>
+{% for r in rows %}{% set i = loop.index0 %}
+<tr>
+<td><select name="r{{i}}_kind"><option value="">-</option>{% for k in kinds %}<option value="{{k}}" {% if r.kind == k %}selected{% endif %}>{{t('ev_kind_' + k)}}</option>{% endfor %}</select></td>
+<td>{% for d in range(1, 8) %}<label style="margin-right:6px"><input type="checkbox" name="r{{i}}_d{{d}}" value="1" {% if d in r.days %}checked{% endif %}>{{day_names[d - 1]}}</label>{% endfor %}</td>
+<td><input type="text" name="r{{i}}_start" value="{{r.start}}" size="5" placeholder="20:00"></td>
+<td><input type="text" name="r{{i}}_end" value="{{r.end}}" size="5" placeholder="21:00"></td>
+<td><input type="number" name="r{{i}}_value" value="{{r.value}}" min="0" max="1000" style="width:70px"></td>
+<td><input type="checkbox" name="r{{i}}_on" value="1" {% if r.on %}checked{% endif %}></td>
+<td>{% if r.kind %}<input type="checkbox" name="r{{i}}_del" value="1">{% endif %}</td>
+</tr>
+{% endfor %}
+</table>
+<p><button class="btn" type="submit">{{t('ev_save')}}</button></p>
+</form>
+</div>
+""")
+
+TPL_GUILDS = BASE.replace("__BODY__", """
+<p><a href="{{url_for('dash')}}">{{t('back_players')}}</a></p>
+<div class="card">
+<h3>{{t('gl_nav')}}</h3>
+<p class="muted">{{t('gl_intro')}}</p>
+<p class="muted">{{t('gl_exp_note')}}</p>
+</div>
+
+<div class="card">
+<h3>{{t('gl_summary')}}{% if guilds %}: {{guilds|length}}
+  {% for key in tier_keys %}{% set n = guilds|selectattr('tier_key', 'equalto', key)|list|length %}{% if n %}<span class="badge">{{t(key)}}: {{n}}</span> {% endif %}{% endfor %}{% endif %}</h3>
+{% if not guilds %}<p class="muted">{{t('gl_stale')}}</p>{% else %}
+{% if next_wars %}<p>\u2694 {{t('gl_next_war')}}: {% for key, s in next_wars %}<b>{{t(key)}}</b>: {% if s == 0 %}{{t('gl_next_war_now')}}{% elif s < 0 %}{{t('gl_next_war_off')}}{% else %}{{t('gl_next_war_in')}} {{(s // 60) + 1}} min{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+<div style="overflow-x:auto">
+<table>
+<tr><th>{{t('gl_col_name')}}</th><th>{{t('gl_col_kingdom')}}</th><th>{{t('gl_col_tier')}}</th>
+    <th>{{t('gl_col_level')}}</th><th>{{t('gl_col_members')}}</th><th>{{t('gl_col_online')}}</th>
+    <th>{{t('gl_col_master')}}</th><th>{{t('gl_col_strength')}}</th><th>{{t('gl_col_ladder')}}</th>
+    <th>{{t('gl_col_record')}}</th><th>{{t('gl_col_exp')}}</th><th>{{t('gl_col_war')}}</th></tr>
+{% for g in guilds %}
+<tr>
+  <td><b>{{g.name}}</b></td>
+  <td>{{t(g.empire_key)}}</td>
+  <td>{{t(g.tier_key)}}</td>
+  <td>{{g.level}}</td>
+  <td>{{g.members}}</td>
+  <td>{{g.online}}</td>
+  <td>{{g.master}}</td>
+  <td>{{g.avg_strength}}</td>
+  <td>{{g.ladder}}</td>
+  <td>{{g.wins}}/{{g.draws}}/{{g.losses}}</td>
+  <td>{{g.exp_offered}}</td>
+  <td>{% if g.war_with %}\u2694 {{t('gl_war_with')}} <b>{{g.war_with}}</b> {{g.war_score}}:{{g.war_enemy_score}}{% endif %}{% if g.tower_raid %} \u26e9 {{t('gl_tower')}}{% endif %}</td>
+</tr>
+{% endfor %}
+</table>
+</div>
+{% endif %}
+</div>
+""")
+
 TPL_AI = BASE.replace("__BODY__", """
+{% if bots_held %}
+<div class="card" style="border-color:#f59e0b">
+  <h2 style="color:#fbbf24">{{ t('ai_bots_held_title') }}</h2>
+  <p>{{ t('ai_bots_held_help') }}</p>
+  <form method="post" action="{{ url_for('ai_release_bots') }}">
+    <input type="hidden" name="_csrf" value="{{csrf_token}}">
+    <button type="submit" class="primary">{{ t('ai_bots_release') }}</button>
+  </form>
+</div>
+{% endif %}
+
 <p><a href="{{url_for('dash')}}">{{t('back_players')}}</a></p>
 <div class="card">
 <h3>{{t('ai_nav')}}</h3>
 <p class="muted">{{t('ai_intro')}}</p>
+<p><a class="btn" href="{{url_for('ai_item_policy')}}">{{t('ai_items_open')}}</a>
+   <a class="btn" href="{{url_for('events_page')}}">{{t('ev_open')}}</a>
+   <a class="btn" href="{{url_for('guilds_page')}}">{{t('gl_open')}}</a></p>
 </div>
 
 <div class="card">
@@ -4320,6 +5700,11 @@ TPL_AI = BASE.replace("__BODY__", """
   <h3 style="margin:0 0 2px">💬 {{t('ai_chat')}}</h3>
   <p class="muted" style="margin:0 0 6px">{{t('ai_chat_help')}}</p>
   <label><input type="checkbox" name="CHAT" value="1" {% if cur.get('CHAT', 1) %}checked{% endif %}> {{t('ai_chat_on')}}</label>
+</div>
+<div style="margin-bottom:18px">
+  <h3 style="margin:0 0 2px">🎭 {{t('ai_persona')}}</h3>
+  <p class="muted" style="margin:0 0 6px">{{t('ai_persona_help')}}</p>
+  <label><input type="checkbox" name="PERSONA" value="1" {% if cur.get('PERSONA', 1) %}checked{% endif %}> {{t('ai_persona_on')}}</label>
 </div>
 <div style="margin-bottom:18px">
   <h3 style="margin:0 0 2px">📚 {{t('ai_books')}}</h3>
@@ -4332,6 +5717,27 @@ TPL_AI = BASE.replace("__BODY__", """
   <label><input type="checkbox" name="NIGHT" value="1" {% if cur.get('NIGHT', 1) %}checked{% endif %}> {{t('ai_night_on')}}</label>
 </div>
 <div style="margin-bottom:18px">
+  <h3 style="margin:0 0 2px">🧑‍💻 {{t('ai_life')}} <span class="badge">{{t('ai_experimental')}}</span></h3>
+  <p class="muted" style="margin:0 0 6px">{{t('ai_life_help')}}</p>
+  <label><input type="checkbox" name="LIFE" value="1" {% if cur.get('LIFE', 0) %}checked{% endif %}> {{t('ai_life_on')}}</label>
+</div>
+<div style="margin-bottom:18px">
+  <h3 style="margin:0 0 2px">🛡 {{t('ai_wars')}}</h3>
+  <p class="muted" style="margin:0 0 6px">{{t('ai_wars_help')}}</p>
+  <label><input type="checkbox" name="WARS" value="1" {% if cur.get('WARS', 1) %}checked{% endif %}> {{t('ai_wars_on')}}</label>
+</div>
+<div style="margin-bottom:18px">
+  <h3 style="margin:0 0 2px">⛩ {{t('ai_tower')}}</h3>
+  <p class="muted" style="margin:0 0 6px">{{t('ai_tower_help')}}</p>
+  <label><input type="checkbox" name="TOWER" value="1" {% if cur.get('TOWER', 1) %}checked{% endif %}> {{t('ai_tower_on')}}</label>
+  <div style="margin-top:6px"><button type="submit" formaction="{{url_for('ai_tower_now')}}" formmethod="post">{{t('ai_tower_now')}}</button></div>
+</div>
+<div style="margin-bottom:18px">
+  <h3 style="margin:0 0 2px">🛒 {{t('ai_ishop')}}</h3>
+  <p class="muted" style="margin:0 0 6px">{{t('ai_ishop_help')}}</p>
+  <label><input type="checkbox" name="ISHOP" value="1" {% if cur.get('ISHOP', 1) %}checked{% endif %}> {{t('ai_ishop_on')}}</label>
+</div>
+<div style="margin-bottom:18px">
   <h3 style="margin:0 0 2px">♻️ {{t('ai_scrap')}}
       <span class="badge" id="v_SCRAP">{{cur.get('SCRAP', 0)}}%</span></h3>
   <p class="muted" style="margin:0 0 6px">{{t('ai_scrap_help')}}</p>
@@ -4342,8 +5748,42 @@ TPL_AI = BASE.replace("__BODY__", """
   </div>
 </div>
 <div style="margin-bottom:18px">
+  <h3 style="margin:0 0 2px">🛋️ {{t('ai_rest')}}
+      <span class="badge" id="v_REST">{{cur.get('REST', 100)}}%</span></h3>
+  <p class="muted" style="margin:0 0 6px">{{t('ai_rest_help')}}</p>
+  <input type="range" name="REST" id="s_REST" min="0" max="100" step="5" value="{{cur.get('REST', 100)}}" style="width:100%"
+         oninput="document.getElementById('v_REST').textContent=this.value+'%'">
+  <div class="muted" style="display:flex;justify-content:space-between;font-size:12px">
+    <span>0 — {{t('ai_rest_off')}}</span><span>100 — {{t('ai_rest_all')}}</span>
+  </div>
+</div>
+<div style="margin-bottom:18px">
+  <h3 style="margin:0 0 2px">⚔️ {{t('ai_kpvp')}}
+      <span class="badge" id="v_KINGDOMPVP">{{cur.get('KINGDOMPVP', 0)}}%</span></h3>
+  <p class="muted" style="margin:0 0 6px">{{t('ai_kpvp_help')}}</p>
+  <input type="range" name="KINGDOMPVP" id="s_KINGDOMPVP" min="0" max="100" step="5" value="{{cur.get('KINGDOMPVP', 0)}}" style="width:100%"
+         oninput="document.getElementById('v_KINGDOMPVP').textContent=this.value+'%'">
+  <div class="muted" style="display:flex;justify-content:space-between;font-size:12px">
+    <span>0 — {{t('ai_kpvp_off')}}</span><span>100 — {{t('ai_kpvp_all')}}</span>
+  </div>
+</div>
+<div style="margin-bottom:18px">
+  <h3 style="margin:0 0 2px">📜 {{t('ai_scroll')}}
+      <span class="badge" id="v_SCROLL_FROM">+{{cur.get('SCROLL_FROM', 1)}}</span></h3>
+  <p class="muted" style="margin:0 0 6px">{{t('ai_scroll_help')}}</p>
+  <input type="range" name="SCROLL_FROM" id="s_SCROLL_FROM" min="1" max="9" step="1" value="{{cur.get('SCROLL_FROM', 1)}}" style="width:100%"
+         oninput="document.getElementById('v_SCROLL_FROM').textContent='+'+this.value">
+  <div class="muted" style="display:flex;justify-content:space-between;font-size:12px">
+    <span>+1 — {{t('ai_scroll_off')}}</span><span>+9 — {{t('ai_scroll_top')}}</span>
+  </div>
+</div>
+<div style="margin-bottom:18px">
   <h3 style="margin:0 0 2px">🎁 {{t('ai_chest')}}</h3>
   <p class="muted" style="margin:0 0 6px">{{t('ai_chest_help')}}</p>
+  <label style="display:block;margin:6px 0 8px;font-weight:bold">
+    <input type="checkbox" name="CHEST_OFF" value="1" {% if chest_off %}checked{% endif %}> {{t('ai_chest_off')}}
+  </label>
+  <div class="muted" style="font-size:12px;margin-bottom:6px">{{t('ai_chest_off_help')}}</div>
   {% set chest = cur.get('CHEST') if cur.get('CHEST') is not none else 10 %}
   {% set stone = cur.get('CHEST_STONE') if cur.get('CHEST_STONE') is not none else 300 %}
   <div style="margin:6px 0 2px">{{t('ai_chest_kill')}} <span class="badge" id="v_CHEST">{{chest}}‰</span></div>
@@ -4383,46 +5823,65 @@ function m2aiReset(){
 
 
 
+TPL_AI_ITEMS = BASE.replace("__BODY__", """
+<p><a href="{{url_for('ai_weights')}}">{{t('ai_nav')}}</a></p>
+<div class="card">
+<h3>{{t('ai_items_nav')}}</h3>
+<p class="muted">{{t('ai_items_intro')}}</p>
+<p class="muted">{{t('ai_items_format')}}</p>
+</div>
+<div class="card">
+<form method="post">
+<input type="hidden" name="_csrf" value="{{csrf_token}}">
+<textarea name="policy" rows="18" spellcheck="false" style="width:100%;font-family:monospace;font-size:13px"
+          placeholder="30048	stall	# Kawalek Lodu&#10;type:19	stall	# marmury polimorfii&#10;50703	drop	# Kwiat Kaki">{{policy}}</textarea>
+<button class="big" style="margin-top:10px">{{t('ai_save')}}</button>
+</form></div>""")
+
+
+
 MAP_I18N = {
  "pl": {
   "title":"Mapa świata na żywo — Chunjo","live":"NA ŻYWO (1,5 s)","subtitle":"Interaktywny podgląd pozycji i rozwoju botów w czasie rzeczywistym",
   "player_panel":"Panel graczy","play_browser":"Graj w przeglądarce","show_bots":"Pokaż boty","names_levels":"Nicki i poziomy","pt_only":"Tylko w grupie (PT)",
-  "level":"Poziom","all":"Wszystkie","map":"Mapa","m1":"M1 — Joan (Chunjo)","m2":"M2 — Bokjung (Chunjo)","m3":"Ziemia Klanu Chunjo","s1":"M1 — Yongan (Shinsoo)","s2":"M2 — Jayang (Shinsoo)","s3":"Ziemia Klanu Shinsoo","smonkey":"Loch Małp Shinsoo","j1":"M1 — Pyongmoo (Jinno)","j2":"M2 — Bakra (Jinno)","j3":"Ziemia Klanu Jinno","jmonkey":"Loch Małp Jinno","monkey":"Łatwy Loch Małp","monkey_medium":"Średni Loch Małp","monkey_hard":"Trudny Loch Małp","orc":"Dolina Orków","desert":"Pustynia Yongbi","sohan":"Góra Sohan","spider":"Loch Pająków V1","spider_v2":"Loch Pająków V2","hwang":"Świątynia Hwang","heat":"Mapa cieplna","heat_deaths":"Zgony botów","heat_metins":"Rozbite metiny","heat_skills":"Awanse umiejętności","search":"🔍 Szukaj bota (np. botarek)...",
+  "level":"Poziom","all":"Wszystkie","map":"Mapa","m1":"M1 — Joan (Chunjo)","m2":"M2 — Bokjung (Chunjo)","m3":"Ziemia Klanu Chunjo","s1":"M1 — Yongan (Shinsoo)","s2":"M2 — Jayang (Shinsoo)","s3":"Ziemia Klanu Shinsoo","smonkey":"Loch Małp Shinsoo","j1":"M1 — Pyongmoo (Jinno)","j2":"M2 — Bakra (Jinno)","j3":"Ziemia Klanu Jinno","jmonkey":"Loch Małp Jinno","monkey":"Łatwy Loch Małp","monkey_medium":"Średni Loch Małp","monkey_hard":"Trudny Loch Małp","orc":"Dolina Orków","desert":"Pustynia Yongbi","sohan":"Góra Sohan","spider":"Loch Pająków V1","spider_v2":"Loch Pająków V2","hwang":"Świątynia Hwang","forest":"Las","red_forest":"Czerwony Las","demon_tower":"Wieża Demonów","heat":"Mapa cieplna","heat_deaths":"Zgony botów","heat_metins":"Rozbite metiny","heat_skills":"Awanse umiejętności","search":"🔍 Szukaj bota (np. botarek)...",
   "solo_bot":"Bot solo","party_bot":"W grupie (PT)","metin_fight":"Walka z Metinem","loading":"Ładowanie...","world_stats":"Statystyki świata","active_bots":"Aktywne boty",
   "in_parties":"W grupach (PT)","avg_level":"Średni poziom","max_level":"Maks. poziom","rankings":"Rankingi botów","rank_level":"Poziom","rank_weapon":"Broń","rank_armor":"Zbroja",
   "rank_weapon30":"Bronie 30 Lv","rank_items":"Przedmioty","rank_horse":"Koń","rank_biologist":"Biolog","rank_hunting":"Polowanie","rank_shops":"Otwarte sklepy","rank_skills":"Umiejętności","rank_plus9":"Przedmiot +9","rank_stall_open":"Stragan otwarty","rank_empty":"Brak danych rankingu.","rank_show":"Pokaż","rank_search":"Szukaj w rankingu...","none":"Brak","items_short":"przedm.",
-  "horse_lv":"Koń Lv","visible":"Widocznych","characters":"postaci","in_group":"W grupie [PT]","solo":"Solo","player":"GRACZ","bot":"Bot","class":"Klasa","action":"Akcja","status":"Status","personality":"Osobowość","ambition":"Ambicja","current_goal":"Aktualny cel",
+  "horse_lv":"Koń Lv","visible":"Widocznych","characters":"postaci","in_group":"W grupie [PT]","solo":"Solo","player":"GRACZ","bot":"Bot","class":"Klasa","action":"Akcja","status":"Status","personality":"Osobowość","mood":"Nastrój","charakter":"Charakter","ambition":"Ambicja","current_goal":"Aktualny cel",
   "coordinates":"Koordynaty","open_inventory":"Kliknij, aby otworzyć ekwipunek i EQ","loading_character":"Ładowanie ekwipunku i statystyk postaci","error":"Błąd","not_found":"Nie znaleziono danych",
   "teleport_me":"Teleportuj moją postać w grze (1 klik)","position":"Pozycja","horse":"Koń","biologist":"Biolog","bio_stage":"Etap Biologa","hunting":"Polowanie","no_data":"Brak danych",
-  "stats":"Statystyki","unspent_stats":"Nierozdane: {n} pkt statystyk","skills":"Umiejętności","profession_none":"Nie wybrano","profession_pending":"Profesja nie została jeszcze wybrana.","depot":"Magazyn","depot_empty":"Magazyn jest pusty.",
+  "stats":"Statystyki","unspent_stats":"Nierozdane: {n} pkt statystyk","skills":"Umiejętności","profession_none":"Nie wybrano","profession_pending":"Profesja nie została jeszcze wybrana.","depot":"Magazyn","depot_empty":"Magazyn jest pusty.","shop":"Sklep","shop_none":"Ten bot nie ma otwartego sklepu.","shop_empty":"Lada jest pusta.","shop_price":"Cena","shop_premium":"premium",
   "unspent_skills":"Nierozdane: {n} pkt umiejętności","equipped":"Założony ekwipunek (EQ)","weapon":"Broń","armor":"Zbroja","helmet":"Hełm","shield":"Tarcza","bracelet":"Bransoleta",
   "boots":"Buty","necklace":"Naszyjnik","earrings":"Kolczyki","empty":"Puste","inventory":"Zawartość ekwipunku","items_count":"przedmiotów","inventory_empty":"Ekwipunek jest pusty.","quantity":"Ilość",
   "gear_history":"Historia ekwipunku","gear_history_hint":"Ulepszenia, spalenia, założenia, prezenty, sprzedaż, magazyn — z log.log","gear_history_loading":"Ładowanie historii...","gear_history_empty":"Brak wpisów o ekwipunku tej postaci.","gear_history_more":"Pokaż starsze",
   "event_log":"Dziennik zdarzeń bota (logi na żywo)","track_live":"Śledź na żywo","copy_logs":"Kopiuj logi","loading_logs":"Ładowanie logów postaci","no_logs":"Brak najświeższych wpisów w logach dla tej postaci.",
   "log_error":"Błąd odczytu logów","network_error":"Błąd sieci","teleporting":"Teleportowanie Twojej postaci w grze...","teleported":"Przeteleportowano {name} do bota w grze!","you":"Cię","failure":"Niepowodzenie",
   "copied":"Skopiowano","paste":"wklej w grze [Enter] → Ctrl+V → [Enter]","solo_exp":"Solo — zdobywanie doświadczenia","party_exp":"[PT] Zdobywanie doświadczenia w grupie","metin_hunt":"Polowanie na Metiny",
-  "character_missing":"Postać nie znaleziona","bio_not_started":"Pierwsza misja jeszcze nierozpoczęta","bio_completed":"Ukończono: {name}","bio_next":"Następna misja od Lv {level}: {name}",
-  "bio_all":"Wszystkie podstawowe misje ukończone","bio_complete":"komplet","bio_in_progress":"w toku"
+  "character_missing":"Postać nie znaleziona","bio_next":"Następna misja od Lv {level}: {name}","bio_key":"{name}{sep}{have}/{need}, czeka na: {key}",
+  "bio_all":"Wszystkie podstawowe misje ukończone","bio_complete":"komplet","bio_done":"ukończone","bio_skipped":"za niskie dla bota, pominięte: {n}","bio_dropper":"nie dotyczy — dropper nie robi Biologa",
+  "bio_rank_now":"{done}/{total} ukończone • teraz: {stage}","bio_rank_next":"{done}/{total} ukończone • {stage}"
  },
  "en": {
   "title":"Live world map — Chunjo","live":"LIVE (1.5 s)","subtitle":"Interactive real-time view of bot positions and progression",
   "player_panel":"Player panel","play_browser":"Play in browser","show_bots":"Show bots","names_levels":"Names and levels","pt_only":"Party only (PT)",
-  "level":"Level","all":"All","map":"Map","m1":"M1 — Joan (Chunjo)","m2":"M2 — Bokjung (Chunjo)","m3":"Chunjo guild map","s1":"M1 — Yongan (Shinsoo)","s2":"M2 — Jayang (Shinsoo)","s3":"Shinsoo guild map","smonkey":"Shinsoo Monkey Dungeon","j1":"M1 — Pyongmoo (Jinno)","j2":"M2 — Bakra (Jinno)","j3":"Jinno guild map","jmonkey":"Jinno Monkey Dungeon","monkey":"Easy Monkey Dungeon","monkey_medium":"Medium Monkey Dungeon","monkey_hard":"Hard Monkey Dungeon","orc":"Orc Valley","desert":"Yongbi Desert","sohan":"Mount Sohan","spider":"Spider Dungeon V1","spider_v2":"Spider Dungeon V2","hwang":"Hwang Temple","heat":"Heatmap","heat_deaths":"Bot deaths","heat_metins":"Metins broken","heat_skills":"Skill-ups","search":"🔍 Find a bot (e.g. botarek)...",
+  "level":"Level","all":"All","map":"Map","m1":"M1 — Joan (Chunjo)","m2":"M2 — Bokjung (Chunjo)","m3":"Chunjo guild map","s1":"M1 — Yongan (Shinsoo)","s2":"M2 — Jayang (Shinsoo)","s3":"Shinsoo guild map","smonkey":"Shinsoo Monkey Dungeon","j1":"M1 — Pyongmoo (Jinno)","j2":"M2 — Bakra (Jinno)","j3":"Jinno guild map","jmonkey":"Jinno Monkey Dungeon","monkey":"Easy Monkey Dungeon","monkey_medium":"Medium Monkey Dungeon","monkey_hard":"Hard Monkey Dungeon","orc":"Orc Valley","desert":"Yongbi Desert","sohan":"Mount Sohan","spider":"Spider Dungeon V1","spider_v2":"Spider Dungeon V2","hwang":"Hwang Temple","forest":"Forest","red_forest":"Red Forest","demon_tower":"Demon Tower","heat":"Heatmap","heat_deaths":"Bot deaths","heat_metins":"Metins broken","heat_skills":"Skill-ups","search":"🔍 Find a bot (e.g. botarek)...",
   "solo_bot":"Solo bot","party_bot":"In party (PT)","metin_fight":"Fighting a Metin","loading":"Loading...","world_stats":"World statistics","active_bots":"Active bots",
   "in_parties":"In parties (PT)","avg_level":"Average level","max_level":"Max level","rankings":"Bot rankings","rank_level":"Level","rank_weapon":"Weapon","rank_armor":"Armour",
   "rank_weapon30":"Lv 30 Weapons","rank_items":"Items","rank_horse":"Horse","rank_biologist":"Biologist","rank_hunting":"Hunting","rank_shops":"Open shops","rank_skills":"Skills","rank_plus9":"Item +9","rank_stall_open":"Stall open","rank_empty":"No ranking data.","rank_show":"Show","rank_search":"Search ranking...","none":"None","items_short":"items",
-  "horse_lv":"Horse Lv","visible":"Visible","characters":"characters","in_group":"In party [PT]","solo":"Solo","player":"PLAYER","bot":"Bot","class":"Class","action":"Action","status":"Status","personality":"Personality","ambition":"Ambition","current_goal":"Current goal",
+  "horse_lv":"Horse Lv","visible":"Visible","characters":"characters","in_group":"In party [PT]","solo":"Solo","player":"PLAYER","bot":"Bot","class":"Class","action":"Action","status":"Status","personality":"Personality","mood":"Mood","charakter":"Character","ambition":"Ambition","current_goal":"Current goal",
   "coordinates":"Coordinates","open_inventory":"Click to open inventory and equipment","loading_character":"Loading character equipment and statistics","error":"Error","not_found":"No data found",
   "teleport_me":"Teleport my in-game character (one click)","position":"Position","horse":"Horse","biologist":"Biologist","bio_stage":"Biologist stage","hunting":"Hunting","no_data":"No data",
-  "stats":"Statistics","unspent_stats":"Unspent: {n} stat points","skills":"Skills","profession_none":"Not selected","profession_pending":"The profession has not been selected yet.","depot":"Depot","depot_empty":"The depot is empty.",
+  "stats":"Statistics","unspent_stats":"Unspent: {n} stat points","skills":"Skills","profession_none":"Not selected","profession_pending":"The profession has not been selected yet.","depot":"Depot","depot_empty":"The depot is empty.","shop":"Shop","shop_none":"This bot has no stall open.","shop_empty":"The counter is empty.","shop_price":"Price","shop_premium":"premium",
   "unspent_skills":"Unspent: {n} skill points","equipped":"Equipped items","weapon":"Weapon","armor":"Armour","helmet":"Helmet","shield":"Shield","bracelet":"Bracelet",
   "boots":"Boots","necklace":"Necklace","earrings":"Earrings","empty":"Empty","inventory":"Inventory contents","items_count":"items","inventory_empty":"The inventory is empty.","quantity":"Quantity",
   "gear_history":"Equipment history","gear_history_hint":"Refines, burns, equips, gifts, sales, safebox — from log.log","gear_history_loading":"Loading history...","gear_history_empty":"No equipment entries for this character.","gear_history_more":"Show older",
   "event_log":"Bot event log (live)","track_live":"Track live","copy_logs":"Copy logs","loading_logs":"Loading logs for","no_logs":"No recent log entries for this character.",
   "log_error":"Log read error","network_error":"Network error","teleporting":"Teleporting your in-game character...","teleported":"Teleported {name} to the bot in game!","you":"you","failure":"Failure",
   "copied":"Copied","paste":"paste in game [Enter] → Ctrl+V → [Enter]","solo_exp":"Solo levelling","party_exp":"[PT] Party levelling","metin_hunt":"Hunting Metins",
-  "character_missing":"Character not found","bio_not_started":"The first mission has not started yet","bio_completed":"Completed: {name}","bio_next":"Next mission at Lv {level}: {name}",
-  "bio_all":"All basic missions completed","bio_complete":"complete","bio_in_progress":"in progress"
+  "character_missing":"Character not found","bio_next":"Next mission at Lv {level}: {name}","bio_key":"{name}{sep}{have}/{need}, waiting for: {key}",
+  "bio_all":"All basic missions completed","bio_complete":"complete","bio_done":"done","bio_skipped":"outgrown, skipped: {n}","bio_dropper":"does not apply — a dropper does not do the Biologist",
+  "bio_rank_now":"{done}/{total} done • now: {stage}","bio_rank_next":"{done}/{total} done • {stage}"
  }
 }
 
@@ -4440,6 +5899,7 @@ BIOLOGIST_NAMES_EN = {
  "make_herb_lv4":"Peach Blossom","make_herb_lv7":"Bellflower",
  "make_herb_lv10":"Kaki Blossom","make_herb_lv15":"Gango Root",
  "make_herb_lv20":"Lilac","make_herb_lv25":"Tue Mushroom","collect_quest_lv30":"Orc Tooth",
+ "collect_quest_lv40":"Curse Book","collect_quest_lv50":"Demon Souvenir",
 }
 
 def localized_job_name(job, language=None):
@@ -4450,6 +5910,86 @@ def localized_job_name(job, language=None):
 def localized_biologist_name(quest_name, polish_name, language=None):
     language = language or (lang() if has_request_context() else "en")
     return polish_name if language == "pl" else BIOLOGIST_NAMES_EN.get(quest_name, polish_name)
+
+
+def biologist_progress(level, quest_flags, held, map_index, language=None):
+    """The Biologist as the core plays it for one bot: (completed, stage, skipped).
+
+    The card and the ranking both ask this, so they cannot disagree. The row is
+    the one GetActivePlayerBotBiologistMission picks (playerbot_missions.h): a row
+    whose specimens the bot carries, then one whose monster stands on its map,
+    then the first it has not outgrown, then the highest one left. The ranking
+    used to name the row at the position of the count instead, which is the last
+    row finished only when rows are finished in order, and they are not.
+
+    ``quest_flags`` maps (quest, flag) to its value, ``held`` a vnum to what the
+    bag holds, ``map_index`` is the live map or None. ``stage`` is None when every
+    row is done, ("next", level, name) while the next row waits for a level, and
+    ("row", name, accepted, needed, key_name) otherwise, key_name set when the row
+    waits for its key alone. ``skipped`` counts the open rows the bot has outgrown
+    and is not on - how a bot of seventy reads 1/9 beside the Demon Souvenir."""
+    level = int(level or 1)
+    completed = 0
+    carrying = here = first = last = upcoming = None
+    outgrown_rows = []
+    for index, (quest_name, required_level, _, required_count) in enumerate(BIOLOGIST_REACHABLE):
+        status = quest_flags.get((quest_name, "__status"))
+        if status == BIOLOGIST_COMPLETE_STATE:
+            completed += 1
+            continue
+        if level < required_level:
+            if upcoming is None:
+                upcoming = index
+            continue
+        previous = BIOLOGIST_CHAIN_PREVIOUS.get(quest_name)
+        if previous and quest_flags.get((previous, "__status")) != BIOLOGIST_COMPLETE_STATE:
+            continue
+        last = index
+        # 2.0.60: no row is "too low" - the core does them in order at any
+        # level, so nothing is skipped and nothing is reported as skipped.
+        outgrown = False
+        if first is None:
+            first = index
+        key_phase = quest_name in BIOLOGIST_KEY_VNUMS and status == BIOLOGIST_KEY_ITEM_STATE
+        wanted = BIOLOGIST_KEY_VNUMS[quest_name] if key_phase else BIOLOGIST_ITEM_VNUMS.get(quest_name, 0)
+        carried = held.get(wanted, 0)
+        if carrying is None and carried > 0 and (
+                not outgrown or carried >= (1 if key_phase else required_count)
+                or required_level >= BIOLOGIST_COLLECT_QUEST_LEVEL):
+            carrying = index
+        if (here is None and not outgrown and map_index is not None and
+                int(map_index) in BIOLOGIST_MOB_MAPS.get(quest_name, BIOLOGIST_VILLAGE_MAPS)):
+            here = index
+    pick = next((i for i in (carrying, here, first, last) if i is not None), None)
+    skipped = sum(1 for index in outgrown_rows if index != pick)
+    if pick is None:
+        if upcoming is None:
+            return completed, None, skipped
+        quest_name, required_level, polish_name, _ = BIOLOGIST_REACHABLE[upcoming]
+        return (completed, ("next", required_level,
+                            localized_biologist_name(quest_name, polish_name, language)), skipped)
+    quest_name, _, polish_name, required_count = BIOLOGIST_REACHABLE[pick]
+    key_name = None
+    if (quest_name in BIOLOGIST_KEY_VNUMS and
+            quest_flags.get((quest_name, "__status")) == BIOLOGIST_KEY_ITEM_STATE):
+        key_name = localized_item_name(BIOLOGIST_KEY_VNUMS[quest_name], language)
+    stage = ("row", localized_biologist_name(quest_name, polish_name, language),
+             quest_flags.get((quest_name, "collect_count"), 0), required_count, key_name)
+    return completed, stage, skipped
+
+
+def biologist_stage_text(stage, messages, separator):
+    """A stage from biologist_progress in words; ``separator`` stands between the
+    name and the count - ": " on the card, a space in the ranking."""
+    if stage is None:
+        return messages["bio_all"]
+    if stage[0] == "next":
+        return messages["bio_next"].format(level=stage[1], name=stage[2])
+    _, name, accepted, needed, key_name = stage
+    if key_name:
+        return messages["bio_key"].format(name=name, sep=separator, have=accepted,
+                                          need=needed, key=key_name)
+    return "%s%s%d/%d" % (name, separator, accepted, needed)
 
 
 TPL_LIVE_MAP = BASE.replace("__BODY__", """
@@ -4509,6 +6049,7 @@ TPL_LIVE_MAP = BASE.replace("__BODY__", """
           <option value="44">{{m.j3}}</option><option value="45">{{m.jmonkey}}</option>
           <option value="108">{{m.monkey_medium}}</option><option value="109">{{m.monkey_hard}}</option>
           <option value="64">{{m.orc}}</option><option value="63">{{m.desert}}</option><option value="61">{{m.sohan}}</option><option value="104">{{m.spider}}</option><option value="65">{{m.hwang}}</option><option value="71">{{m.spider_v2}}</option>
+          <option value="67">{{m.forest}}</option><option value="68">{{m.red_forest}}</option><option value="66">{{m.demon_tower}}</option>
         </select>
       </div>
 
@@ -4593,7 +6134,8 @@ TPL_LIVE_MAP = BASE.replace("__BODY__", """
           <button type="button" class="btn btn-sm rank-tab" onclick="setRankCategory('items', this)" style="font-size:11px;padding:3px 6px">🎒 {{m.rank_items}}</button>
           <button type="button" class="btn btn-sm rank-tab" onclick="setRankCategory('horse', this)" style="font-size:11px;padding:3px 6px">🐴 {{m.rank_horse}}</button>
           <button type="button" class="btn btn-sm rank-tab" onclick="setRankCategory('biologist', this)" style="font-size:11px;padding:3px 6px">🌿 {{m.rank_biologist}}</button>
-          <button type="button" class="btn btn-sm rank-tab" onclick="setRankCategory('hunting', this)" style="font-size:11px;padding:3px 6px">🎯 {{m.rank_hunting}}</button>
+{% if not engine_mt2009 %}          <button type="button" class="btn btn-sm rank-tab" onclick="setRankCategory('hunting', this)" style="font-size:11px;padding:3px 6px">🎯 {{m.rank_hunting}}</button>
+{% endif %}
           <button type="button" class="btn btn-sm rank-tab" onclick="setRankCategory('shops', this)" style="font-size:11px;padding:3px 6px">🏪 {{m.rank_shops}}</button>
           <button type="button" class="btn btn-sm rank-tab" onclick="setRankCategory('skills', this)" style="font-size:11px;padding:3px 6px">✨ {{m.rank_skills}}</button>
           <button type="button" class="btn btn-sm rank-tab" onclick="setRankCategory('plus9', this)" style="font-size:11px;padding:3px 6px">🔥 {{m.rank_plus9}}</button>
@@ -4868,6 +6410,28 @@ TPL_LIVE_MAP = BASE.replace("__BODY__", """
   text-align: center;
   padding: 10px 0;
 }
+/* The stall window is the depot window one size up: the counter's lines carry
+   a price, so they are a list rather than a grid. Same chrome, same drag. */
+.m2-shop-window { width: 272px; }
+.m2-shop-where {
+  color: #8a7b5c;
+  font-size: 10px;
+  margin-bottom: 6px;
+  word-break: break-word;
+}
+.m2-shop-list { max-height: 320px; overflow-y: auto; }
+.m2-shop-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 2px;
+  border-bottom: 1px solid #2a2114;
+}
+.m2-shop-row:last-child { border-bottom: none; }
+.m2-shop-row img { width: 24px; height: 24px; image-rendering: pixelated; }
+.m2-shop-name { flex: 1; color: #d8c9a3; font-size: 11px; line-height: 1.2; }
+.m2-shop-count { color: #8a7b5c; font-size: 10px; }
+.m2-shop-price { color: var(--gold); font-size: 11px; white-space: nowrap; }
 .m2-grid-frame {
   position: relative;
   width: 170px;
@@ -5054,6 +6618,17 @@ TPL_LIVE_MAP = BASE.replace("__BODY__", """
   <div id="m2SafeboxEmpty" class="m2-safebox-empty" style="display:none">{{m.depot_empty}}</div>
 </div>
 
+<!-- The bot's own offline stall (IkarusShop), floating like the depot above. -->
+<div id="m2ShopWindow" class="m2-safebox-window m2-shop-window">
+  <div class="m2-safebox-header" id="m2ShopHeader">
+    <span>🏪 <span id="m2ShopTitle">{{m.shop}}</span></span>
+    <button type="button" class="m2-safebox-close" onclick="closeShopWindow()">&times;</button>
+  </div>
+  <div id="m2ShopWhere" class="m2-shop-where"></div>
+  <div id="m2ShopList" class="m2-shop-list"></div>
+  <div id="m2ShopEmpty" class="m2-safebox-empty" style="display:none">{{m.shop_none}}</div>
+</div>
+
 <div id="botModal" class="modal-overlay" onclick="if(event.target===this)closeBotModal()">
   <div class="modal-box">
     <button class="modal-close-btn" onclick="closeBotModal()">&times;</button>
@@ -5191,6 +6766,16 @@ function fetchBotPositions() {
     .catch(function(err) { console.error('Map fetch error:', err); });
 }
 
+// A refused answer has to reach the page. The list opened on the loading
+// text and was only ever replaced by a successful answer, so an API error -
+// or a world whose positions had not arrived yet, which is the only thing
+// that used to trigger the first fetch - left "Ladowanie..." on screen for
+// good, and that was read as "the ranking does not load bots".
+function showRankingNote(text) {
+  var listEl = document.getElementById('topBotsList');
+  if (listEl) listEl.innerHTML = '<p class="muted" style="font-size:12px;text-align:center">' + text + '</p>';
+}
+
 function fetchRankings() {
   fetch('/api/bot_rankings?type=' + encodeURIComponent(g_selectedRankCategory) +
         '&limit=' + g_rankLimit)
@@ -5199,9 +6784,14 @@ function fetchRankings() {
       if (data && data.ok) {
         g_rankData = data.rankings || [];
         renderRankings();
+      } else {
+        showRankingNote(I18N.error + ': ' + ((data && data.error) || I18N.rank_empty));
       }
     })
-    .catch(function(err) { console.error('Ranking fetch error:', err); });
+    .catch(function(err) {
+      console.error('Ranking fetch error:', err);
+      showRankingNote(I18N.error + ': ' + err);
+    });
 }
 
 function updateStats() {
@@ -5251,7 +6841,7 @@ function renderRankings() {
       var winBadge = b.item_window === 'EQUIPMENT' ? '<span style="background:#15803d;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px">EQ</span>'
                                                    : '<span style="background:#374151;color:#bbb;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px">Plecak</span>';
       var iconUrl = b.weapon_vnum ? getItemIconUrl(b.weapon_vnum) : null;
-      var iconImg = iconUrl ? '<img src="' + iconUrl + '" style="width:16px;height:16px;vertical-align:middle;margin-right:4px;image-rendering:pixelated">' : '';
+      var iconImg = iconUrl ? '<img src="' + iconUrl + '" onerror="' + ICON_ONERROR + '" style="width:16px;height:16px;vertical-align:middle;margin-right:4px;image-rendering:pixelated">' : '';
       detailStr = '<div>' + iconImg + '<span style="color:#ffd700;font-weight:700">' + (b.weapon_name || 'Broń 30 Lv') + '</span> ' + winBadge + '</div><div>' + srStr + umStr + '</div>';
     } else if (g_selectedRankCategory === 'weapon') {
       detailStr = '<span style="color:#38bdf8;font-weight:700">' + (b.weapon_name || I18N.none) + '</span>';
@@ -5280,7 +6870,7 @@ function renderRankings() {
       var p9win = b.item_window === 'EQUIPMENT'
           ? '<span style="background:#15803d;color:#fff;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px">EQ</span>'
           : '<span style="background:#374151;color:#bbb;font-size:9px;padding:1px 4px;border-radius:3px;margin-left:4px">Plecak</span>';
-      var p9icon = b.weapon_vnum ? '<img src="' + getItemIconUrl(b.weapon_vnum) + '" style="width:16px;height:16px;vertical-align:middle;margin-right:4px;image-rendering:pixelated">' : '';
+      var p9icon = b.weapon_vnum ? '<img src="' + getItemIconUrl(b.weapon_vnum) + '" onerror="' + ICON_ONERROR + '" style="width:16px;height:16px;vertical-align:middle;margin-right:4px;image-rendering:pixelated">' : '';
       detailStr = p9icon + '<span style="color:#f97316;font-weight:700">' + (b.weapon_name || '+9') + '</span>' + p9win;
     } else {
       detailStr = '<span style="color:var(--gold);font-weight:700">Lv ' + b.level + '</span>';
@@ -5370,7 +6960,10 @@ function showTooltip(pid, ev) {
   tt.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">' +
                  '<b style="font-size:14px;color:var(--gold2)">' + escapeHtml(bot.name) + '</b> ' + statusBadge + '</div>' +
                  '<div style="color:#ddd;margin-bottom:4px"><b>' + I18N.class + ':</b> ' + escapeHtml(bot.job) + ' &nbsp;|&nbsp; <b>' + I18N.level + ':</b> ' + bot.level + '</div>' +
-                 '<div style="color:#c084fc;margin-bottom:4px"><b>' + I18N.personality + ':</b> ' + escapeHtml(bot.personality) + '</div>' +
+                 '<div style="color:#c084fc;margin-bottom:4px"><b>' + I18N.personality + ':</b> ' + escapeHtml(bot.personality) +
+                   (bot.charakter ? ' <span style="color:#9ca3af">(' + I18N.charakter + ': ' + escapeHtml(bot.charakter) + ')</span>' : '') + '</div>' +
+                 (bot.mood ? '<div style="color:#fbbf24;margin-bottom:4px"><b>' + I18N.mood + ':</b> ' + escapeHtml(bot.mood) +
+                   (bot.hold ? ' &nbsp;|&nbsp; ' + escapeHtml(bot.hold) : '') + '</div>' : '') +
                  '<div style="color:#86efac;margin-bottom:4px"><b>' + I18N.ambition + ':</b> ' + escapeHtml(bot.ambition) + ' &nbsp;|&nbsp; <b>' + I18N.current_goal + ':</b> ' + escapeHtml(bot.goal) + '</div>' +
                  '<div style="color:#ffd700;margin-bottom:4px"><b>' + I18N.action + ':</b> ' + actionStr + '</div>' +
                  '<div style="color:#ddd;margin-bottom:4px"><b>' + I18N.status + ':</b> ' + ptStr + '</div>' +
@@ -5396,7 +6989,7 @@ var g_currentInvData = null;
 var g_currentInvTab = 0;
 
 // Preload item definitions and icons lookup table
-fetch('/static/item_defs.json')
+fetch('/static/item_defs.json?v={{ panel_version|urlencode }}')
   .then(function(res) { return res.json(); })
   .then(function(data) { g_itemDefs = data; })
   .catch(function(err) { console.warn('Could not load item_defs.json:', err); });
@@ -5420,6 +7013,12 @@ fetch('/static/item_icons.json')
 // print the value: %d%% is a percentage, %d a plain number, %.1f a
 // multiplier, and no placeholder at all means the client shows the line with no
 // number after it. Ids the client has no text for are absent on purpose.
+// The mt2009 engine numbers these lines as POINT_* (player.item.attrtype
+// carries a point there); APPLY_META is keyed by the APPLY_* numbers both
+// clients use, so a type goes through this table first. Empty on r40250.
+var POINT_TO_APPLY = {{ point_to_apply|tojson }};
+function applyKey(type) { var k = POINT_TO_APPLY[type]; return k === undefined ? type : k; }
+
 var APPLY_META = {
   1: {pl: "Max PŻ: +%d", en: "Max. HP +%d", f: "flat"},
   2: {pl: "Max PE: +%d", en: "Max. SP +%d", f: "flat"},
@@ -5507,7 +7106,38 @@ var APPLY_META = {
   88: {pl: "Odporność na ziemię +%d%%", en: "Earth resistance +%d%%", f: "percent"},
   89: {pl: "Odporność na mrok +%d%%", en: "Resistance against darkness +%d%%", f: "percent"},
   90: {pl: "Odporność na cios krytyczny +%d%%", en: "Resistance against critical hits +%d%%", f: "percent"},
-  91: {pl: "Odporność na przeszywający cios +%d%%", en: "Resistance against piercing hits +%d%%", f: "percent"}
+  91: {pl: "Odporność na przeszywający cios +%d%%", en: "Resistance against piercing hits +%d%%", f: "percent"},
+  1138: {pl: "Terror +%d%%", en: "Terror +%d%%", f: "percent"},
+  1139: {pl: "Regeneracja wytrzymałości +%d%%", en: "Stamina regeneration +%d%%", f: "percent"},
+  1140: {pl: "Atak sztyletem przeciw potworom +%d", en: "Dagger attack against monsters +%d", f: "flat"},
+  1141: {pl: "Wartość ataku przeciw potworom +%d", en: "Attack value against monsters +%d", f: "flat"},
+  1142: {pl: "Odporność na potwory +%d‰", en: "Resistance against monsters +%d‰", f: "flat"},
+  1143: {pl: "Pochłanianie obrażeń +%d%%", en: "Damage absorption +%d%%", f: "percent"},
+  1144: {pl: "Pochłanianie obrażeń od potworów +%d%%", en: "Damage absorption from monsters +%d%%", f: "percent"},
+  1145: {pl: "Przełamanie odporności na ogłuszenie", en: "Breaks stun immunity", f: "boolean"},
+  1146: {pl: "Przełamanie klątwy świątyni", en: "Breaks the temple curse", f: "boolean"},
+  1147: {pl: "Czas trwania umiejętności +%d%%", en: "Skill duration +%d%%", f: "percent"},
+  1148: {pl: "Silny przeciw potworom z Doliny Orków +%d%%", en: "Strong against Orc Valley monsters +%d%%", f: "percent"},
+  1149: {pl: "Silny przeciw Metinom +%d%%", en: "Strong against Metin stones +%d%%", f: "percent"},
+  1150: {pl: "Silny przeciw bossom +%d%%", en: "Strong against bosses +%d%%", f: "percent"},
+  1151: {pl: "Magiczny atak przeciw potworom +%d%%", en: "Magic attack against monsters +%d%%", f: "percent"},
+  1152: {pl: "Przełamanie odporności na miecz +%d%%", en: "Breaks sword resistance +%d%%", f: "percent"},
+  1153: {pl: "Przełamanie odporności na broń dwuręczną +%d%%", en: "Breaks two-handed resistance +%d%%", f: "percent"},
+  1154: {pl: "Przełamanie odporności na sztylet +%d%%", en: "Breaks dagger resistance +%d%%", f: "percent"},
+  1155: {pl: "Przełamanie odporności na dzwonek +%d%%", en: "Breaks bell resistance +%d%%", f: "percent"},
+  1156: {pl: "Przełamanie odporności na wachlarz +%d%%", en: "Breaks fan resistance +%d%%", f: "percent"},
+  1157: {pl: "Przełamanie odporności na łuk +%d%%", en: "Breaks bow resistance +%d%%", f: "percent"},
+  1158: {pl: "Szansa na zbieranie +%d%%", en: "Collecting chance +%d%%", f: "percent"},
+  1159: {pl: "Szansa na naukę +%d%%", en: "Learning chance +%d%%", f: "percent"},
+  1160: {pl: "Odporność na ludzi +%d%%", en: "Resistance against humans +%d%%", f: "percent"},
+  1161: {pl: "Magiczny atak +%d", en: "Magic attack +%d", f: "flat"},
+  1162: {pl: "Szansa na podpalenie +%d%%", en: "Chance of burning +%d%%", f: "percent"},
+  1163: {pl: "Zamiana obrażeń na PE +%d%%", en: "Damage converted to SP +%d%%", f: "percent"},
+  1164: {pl: "Szansa na rzadki łup +%d%%", en: "Rare drop chance +%d%%", f: "percent"},
+  1165: {pl: "Magiczna wartość ataku przeciw potworom +%d", en: "Magic attack value against monsters +%d", f: "flat"},
+  1166: {pl: "Szansa na unieruchomienie +%d%%", en: "Chance of rooting +%d%%", f: "percent"},
+  1167: {pl: "Atak specjalny +%d", en: "Special attack +%d", f: "flat"},
+  1168: {pl: "Kara za śmierć +%d%%", en: "Death penalty +%d%%", f: "percent"}
 };
 
 // One formatter for both the fixed bonuses an item is made with and the random
@@ -5516,7 +7146,7 @@ var APPLY_META = {
 // "+" the value is meant to read as a gain, so a negative value drops that "+"
 // instead of printing "+-10".
 function formatApply(type, val, lg) {
-  var meta = APPLY_META[type];
+  var meta = APPLY_META[applyKey(type)];
   if (!meta) return 'Bonus #' + type + ': ' + (val > 0 ? '+' : '') + val;
   var text = meta[lg] || meta.en;
   if (meta.f === 'boolean') return text;
@@ -5533,7 +7163,7 @@ function formatApply(type, val, lg) {
   }).replace(/%%/g, '%');
 }
 
-function applyIsHidden(type) { return !APPLY_META[type]; }
+function applyIsHidden(type) { return !APPLY_META[applyKey(type)]; }
 
 function skillIconImg(vnum, rank, size) {
   // A rank beginning with M, G or P means the skill is trained past normal, and
@@ -5585,6 +7215,7 @@ function renderSafeboxGrid(items) {
     el.style.height = (size * 34) + 'px';
 
     var img = document.createElement('img');
+    img.onerror = iconFallback;
     img.src = getItemIconUrl(it.vnum);
     img.style.maxWidth = '32px';
     img.style.maxHeight = (size * 32) + 'px';
@@ -5614,6 +7245,127 @@ function toggleBotSafeboxFromEl(el) {
   toggleBotSafebox(pid, el.getAttribute('data-botname'));
 }
 
+// The stall. What a bot sells stands in its own offline shop, not in its bag,
+// so the depot and the equipment windows never showed it: player.item with
+// window IKASHOP_OFFLINESHOP is the counter and each line's price is in that
+// item's ikashop_data (see /api/bot_shop).
+var g_currentShopPid = null;
+
+function toggleBotShopFromEl(el) {
+  var pid = parseInt(el.getAttribute('data-botpid'), 10);
+  toggleBotShop(pid, el.getAttribute('data-botname'));
+}
+
+function closeShopWindow() {
+  var win = document.getElementById('m2ShopWindow');
+  if (win) win.style.display = 'none';
+  g_currentShopPid = null;
+}
+
+function renderShopWindow(shop) {
+  var list = document.getElementById('m2ShopList');
+  var where = document.getElementById('m2ShopWhere');
+  var empty = document.getElementById('m2ShopEmpty');
+  if (!list || !where || !empty) return;
+  if (!shop) {
+    list.innerHTML = '';
+    where.textContent = '';
+    empty.textContent = I18N.shop_none || 'Ten bot nie ma otwartego sklepu.';
+    empty.style.display = 'block';
+    return;
+  }
+  var offers = shop.offers || [];
+  where.textContent = (shop.name || '') +
+      ' · ' + (I18N.map || 'Mapa') + ' ' + shop.map_index +
+      ' (' + shop.x + ', ' + shop.y + ')' +
+      (shop.is_premium ? ' · ' + (I18N.shop_premium || 'premium') : '');
+  if (!offers.length) {
+    list.innerHTML = '';
+    empty.textContent = I18N.shop_empty || 'Lada jest pusta.';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+  var html = '';
+  offers.forEach(function(offer) {
+    html += '<div class="m2-shop-row">' +
+            '<img src="' + getItemIconUrl(offer.vnum) + '" onerror="' + ICON_ONERROR + '" draggable="false">' +
+            '<span class="m2-shop-name">' + escapeHtml(offer.name) +
+            (offer.count > 1 ? ' <span class="m2-shop-count">x' + offer.count + '</span>' : '') +
+            '</span>' +
+            '<span class="m2-shop-price">' + (offer.price || 0).toLocaleString() + '</span>' +
+            '</div>';
+  });
+  list.innerHTML = html;
+}
+
+function toggleBotShop(pid, name) {
+  var win = document.getElementById('m2ShopWindow');
+  if (!win) return;
+
+  if (win.style.display !== 'none' && win.style.display !== '' && g_currentShopPid === pid) {
+    closeShopWindow();
+    return;
+  }
+
+  win.style.display = 'block';
+  g_currentShopPid = pid;
+  var titleEl = document.getElementById('m2ShopTitle');
+  if (titleEl) titleEl.textContent = (I18N.shop || 'Sklep') + (name ? ' — ' + name : '');
+  renderShopWindow(null);
+
+  fetch('/api/bot_shop/' + pid, {cache:'no-store'})
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+      // Another bot may have been clicked while this was in flight.
+      if (g_currentShopPid !== pid) return;
+      if (!data || !data.ok) return;
+      renderShopWindow(data.shop);
+    })
+    .catch(function() {});
+}
+
+// The depot window's drag, asked for by id so the stall can have it too.
+function initFloatingWindowDrag(winId, headerId) {
+  var header = document.getElementById(headerId);
+  if (!header) return;
+  var win = null, dragging = false, offsetX = 0, offsetY = 0;
+
+  function onPointerDown(ev) {
+    win = document.getElementById(winId);
+    if (!win) return;
+    dragging = true;
+    var rect = win.getBoundingClientRect();
+    var point = ev.touches ? ev.touches[0] : ev;
+    offsetX = point.clientX - rect.left;
+    offsetY = point.clientY - rect.top;
+    win.style.left = rect.left + 'px';
+    win.style.top = rect.top + 'px';
+    win.style.right = 'auto';
+    ev.preventDefault();
+  }
+
+  function onPointerMove(ev) {
+    if (!dragging || !win) return;
+    var point = ev.touches ? ev.touches[0] : ev;
+    var maxLeft = window.innerWidth - win.offsetWidth;
+    var maxTop = window.innerHeight - win.offsetHeight;
+    win.style.left = Math.min(Math.max(0, point.clientX - offsetX), Math.max(0, maxLeft)) + 'px';
+    win.style.top = Math.min(Math.max(0, point.clientY - offsetY), Math.max(0, maxTop)) + 'px';
+  }
+
+  function onPointerUp() { dragging = false; }
+
+  header.addEventListener('mousedown', onPointerDown);
+  header.addEventListener('touchstart', onPointerDown, {passive: false});
+  document.addEventListener('mousemove', onPointerMove);
+  document.addEventListener('touchmove', onPointerMove, {passive: false});
+  document.addEventListener('mouseup', onPointerUp);
+  document.addEventListener('touchend', onPointerUp);
+}
+
+initFloatingWindowDrag('m2ShopWindow', 'm2ShopHeader');
+
 function closeSafeboxWindow() {
   var win = document.getElementById('m2SafeboxWindow');
   if (win) win.style.display = 'none';
@@ -5636,7 +7388,7 @@ function toggleBotSafebox(pid, name) {
   if (titleEl) titleEl.textContent = (I18N.depot || 'Magazyn') + (name ? ' — ' + name : '');
 
   renderSafeboxGrid([]);
-  fetch('/api/bot_safebox/' + pid)
+  fetch('/api/bot_safebox/' + pid, {cache:'no-store'})
     .then(function(res) { return res.json(); })
     .then(function(data) {
       // The window may have been pointed at a different bot while this was in
@@ -5689,6 +7441,15 @@ function toggleBotSafebox(pid, name) {
     document.addEventListener('touchend', onPointerUp);
   }
 })();
+
+// An item with no icon in the set shows a grey box, not the browser's broken
+// image. The set is generated from the client's icon pack (port/iconify.py)
+// and 741 of the world's 6001 vnums have no per-item TGA there.
+var ICON_ONERROR = "this.onerror=null;this.src='/static/icons/_unknown.png'";
+function iconFallback() {
+  this.onerror = null;
+  this.src = '/static/icons/_unknown.png';
+}
 
 function getItemIconUrl(vnum) {
   var vStr = String(vnum);
@@ -5871,6 +7632,7 @@ function renderInventoryGrid(invItems) {
 
     var iconUrl = getItemIconUrl(it.vnum);
     var img = document.createElement('img');
+    img.onerror = iconFallback;
     img.src = iconUrl;
     img.style.maxWidth = '32px';
     img.style.maxHeight = (size * 32) + 'px';
@@ -5918,7 +7680,7 @@ function openBotModal(pid) {
   modal.style.display = 'flex';
   content.innerHTML = '<p class="muted" style="text-align:center;padding:20px">' + I18N.loading_character + ' #' + pid + '...</p>';
 
-  fetch('/api/bot_inventory/' + pid)
+  fetch('/api/bot_inventory/' + pid, {cache:'no-store'})
     .then(function(res) { return res.json(); })
     .then(function(data) {
       if (!data || !data.ok) {
@@ -5927,6 +7689,9 @@ function openBotModal(pid) {
       }
 
       g_currentInvData = data;
+      // Every bot opens on page I, whichever page the last one was left on:
+      // the tab strip below is built with I active.
+      g_currentInvTab = 0;
       var p = data.player;
       var eq = data.equipment || {};
       var inv = data.inventory || [];
@@ -5968,14 +7733,24 @@ function openBotModal(pid) {
               '<div><b>HP:</b> <span style="color:#ef4444">' + (p.hp || 0) + '</span> / <b>MP:</b> <span style="color:#38bdf8">' + (p.mp || 0) + '</span></div>' +
               '<div><b>Yang:</b> <span style="color:#eab308;font-weight:700">' + (p.gold || 0).toLocaleString() + '</span></div>' +
               '<div><b>' + I18N.position + ':</b> (' + p.x + ', ' + p.y + ')</div>' +
-              '<div><b>' + I18N.personality + ':</b> <span style="color:#c084fc;font-weight:700">' + escapeHtml(p.personality) + '</span></div>' +
+              '<div><b>' + I18N.personality + ':</b> <span style="color:#c084fc;font-weight:700">' + escapeHtml(p.personality) + '</span>' +
+                (p.charakter ? ' <span style="color:#9ca3af">(' + I18N.charakter + ': ' + escapeHtml(p.charakter) + ')</span>' : '') + '</div>' +
               '<div><b>' + I18N.ambition + ':</b> <span style="color:#86efac;font-weight:700">' + escapeHtml(p.ambition) + '</span></div>' +
+              // Iwakura's Bot Mood System: "Aktualny nastroj powinien byc zawsze
+              // widoczny w panelu danego bota". Empty while the switch is off.
+              (p.mood ? '<div style="grid-column:1 / -1"><b>' + I18N.mood + ':</b> <span style="color:#fbbf24;font-weight:700">' + escapeHtml(p.mood) + '</span>' +
+                (p.hold ? ' &nbsp;|&nbsp; <span style="color:#9ca3af">' + escapeHtml(p.hold) + '</span>' : '') + '</div>' : '') +
               '<div style="grid-column:1 / -1"><b>' + I18N.current_goal + ':</b> <span style="color:#60a5fa;font-weight:700">' + escapeHtml(p.goal) + '</span></div>' +
               '<div style="grid-column:1 / -1"><b>' + I18N.action + ':</b> <span style="color:#ffd700">' + escapeHtml(p.action) + '</span></div>' +
               '<div><b>' + I18N.horse + ':</b> <span style="color:#c084fc;font-weight:700">Lv ' + (p.horse_level || 0) + '</span></div>' +
-              '<div><b>' + I18N.biologist + ':</b> <span style="color:#4ade80;font-weight:700">' + (p.biologist_completed || 0) + '/7</span></div>' +
+              '<div><b>' + I18N.biologist + ':</b> <span style="color:#4ade80;font-weight:700">' + (p.biologist_completed || 0) + '/' + (p.biologist_total || 7) + (I18N.bio_done ? ' ' + I18N.bio_done : '') + '</span></div>' +
               '<div style="grid-column:1 / -1"><b>' + I18N.bio_stage + ':</b> <span style="color:#86efac">' + (p.biologist_label || I18N.no_data) + '</span></div>' +
-              '<div style="grid-column:1 / -1"><b>' + I18N.hunting + ':</b> <span style="color:#fb923c">' + (p.hunting_label || I18N.no_data) + '</span></div>' +
+              // Only when there is a hunt to report. On the mt2009 line
+              // levelup.quest ships in quest/_unused, so hunting_progress_label
+              // returns "" and this row said "Polowanie: Brak danych" to every
+              // bot on every card (Tieru, 13 September). A row that can only
+              // ever say "no data" is not a row.
+              (p.hunting_label ? '<div style="grid-column:1 / -1"><b>' + I18N.hunting + ':</b> <span style="color:#fb923c">' + p.hunting_label + '</span></div>' : '') +
               '</div>';
 
       // Character build: stats & skills
@@ -6087,13 +7862,35 @@ function openBotModal(pid) {
               ' data-botpid="' + p.id + '" data-botname="' + p.name + '"' +
               ' onclick="toggleBotSafeboxFromEl(this)">\U0001F4E6</div>';
 
+      // And the stall beside it: what the bot sells lives in its offline shop,
+      // which is neither the bag nor the depot (Tieru, 17 September).
+      html += '<div class="m2-equip-slot" title="' + (I18N.shop || 'Sklep') +
+              '" style="left:150px;top:46px;width:34px;height:34px;cursor:pointer;' +
+              'display:flex;align-items:center;justify-content:center;font-size:19px"' +
+              ' data-botpid="' + p.id + '" data-botname="' + p.name + '"' +
+              ' onclick="toggleBotShopFromEl(this)">\U0001F3EA</div>';
+
+      // No refresh button: opening a character is the refresh. openBotModal
+      // reads /api/bot_inventory every time it runs, and the three fetches of
+      // this window ask the browser for no cached copy, so what the card shows
+      // is what the database held the moment it was opened (Tieru, 20
+      // September - "jak wchodzi sie w jakas postac niech sie odswieza").
+      // What is left of the old caveat is the core's own delay, not ours: a
+      // bot's items are written on the cache cycle, an equip at once since
+      // 2.0.70, so a swap made seconds ago can still be missing whatever this
+      // window does.
+
       html += '</div>'; // End Equipment Section
 
-      // Inventory Tabs (Tab I & Tab II)
+      // Inventory tabs: two pages on r40250, four on the mt2009 line since
+      // 2.0.74 (cells 90-179). What lies past the bag - the horse's page, the
+      // belt's cells - is on no tab.
       html += '<div class="m2-inv-tabs">' +
               '<button type="button" class="m2-tab-btn active" onclick="switchInvTab(0)">I</button>' +
               '<button type="button" class="m2-tab-btn" onclick="switchInvTab(1)">II</button>' +
-              '</div>';
+{% if engine_mt2009 %}              '<button type="button" class="m2-tab-btn" onclick="switchInvTab(2)">III</button>' +
+              '<button type="button" class="m2-tab-btn" onclick="switchInvTab(3)">IV</button>' +
+{% endif %}              '</div>';
 
       // 5x9 Inventory Grid Frame
       html += '<div class="m2-grid-frame">' +
@@ -6319,6 +8116,12 @@ def live_map():
                                   langs=LANGS,
                                   curlang=language,
                                   tile_version=PLAYERBOT_MAP_TILE_VERSION,
+                                  # The hunting ranking exists only where the
+                                  # level-up hunt runs. On mt2009 levelup.quest
+                                  # sits in quest/_unused, so every bot scores
+                                  # zero and the tab is a hundred rows of
+                                  # nothing - hidden there, kept on r40250.
+                                  engine_mt2009=ENGINE_MT2009,
                                   is_admin=bool(session.get("auth")))
 
 # ---------------------------------------------------------------------------
@@ -6361,6 +8164,10 @@ def _bot_identity(alias, pct):
 # wrote a literal 2 into it for the whole cohort.
 def _empire_of(alias):
     ref = (alias + ".") if alias else ""
+    if ENGINE_MT2009:
+        # No account.empire on this schema; the index is the only source.
+        return ("COALESCE(NULLIF((SELECT bpi.empire FROM player.player_index bpi"
+                " WHERE bpi.id = " + ref + "account_id), 0), 0)")
     return ("COALESCE(NULLIF((SELECT bpi.empire FROM player.player_index bpi"
             " WHERE bpi.id = " + ref + "account_id), 0),"
             " (SELECT bea.empire FROM account.account bea"
@@ -6394,20 +8201,67 @@ def api_admin_warp_me():
         target_y = int(data.get("y", 0))
         gm_name = data.get("player_name") or "auto"
 
-        # Fallback to the latest active human player
+        # "auto": whoever is in the game right now. The panel cannot ask the
+        # database that - last_play is written when the character is saved,
+        # minutes after a login - so picking the newest last_play chose the
+        # character who played BEFORE the one sitting in the game, queued the
+        # WARP for somebody offline, answered "timeout", and left the row
+        # pending to teleport that other character on their next login
+        # (reproduced: Tieru in the game, the queue row for AdminSura). The
+        # quest serves a row only to the character it names while that
+        # character is online, so the honest way to find the online one is to
+        # ask every recent human character at once, take the first answer,
+        # and withdraw the rest.
         if gm_name == "auto":
             with db() as c, c.cursor() as cur:
-                cur.execute(bot_sql("SELECT name FROM player.player WHERE <<BOT_NOT_1>> ORDER BY last_play DESC LIMIT 1"))
-                r = cur.fetchone()
-                if not r:
+                cur.execute(bot_sql("SELECT name FROM player.player WHERE <<BOT_NOT_1>>"
+                                    " AND last_play >= NOW() - INTERVAL 7 DAY"
+                                    " ORDER BY last_play DESC LIMIT 8"))
+                names = [r["name"] for r in cur.fetchall()]
+                if not names:
                     # Naming a character that may not exist would queue a command
                     # nothing ever answers, and the caller would be told the
                     # teleport succeeded. Say what is actually wrong instead.
                     return jsonify({"ok": False, "error": "no_human_player"}), 404
-                gm_name = r["name"]
+                cur.executemany("INSERT INTO player.web_admin_queue (player_name,cmd,arg1,arg2) VALUES (%s,%s,%s,%s)",
+                                [(n, "WARP", str(target_x), str(target_y)) for n in names])
+                cur.execute("SELECT id, player_name FROM player.web_admin_queue WHERE cmd='WARP' AND status='pending'"
+                            " AND arg1=%s AND arg2=%s AND player_name IN ({})".format(",".join(["%s"] * len(names))),
+                            (str(target_x), str(target_y)) + tuple(names))
+                rows = {r["id"]: r["player_name"] for r in cur.fetchall()}
+            moved, st = None, "timeout"
+            deadline = time.time() + 6.0
+            while time.time() < deadline and moved is None:
+                time.sleep(0.6)
+                with db() as c, c.cursor() as cur:
+                    cur.execute("SELECT id, player_name, status FROM player.web_admin_queue WHERE id IN ({})".format(
+                        ",".join(["%s"] * len(rows))), tuple(rows.keys()))
+                    for r in cur.fetchall():
+                        if r["status"] not in ("pending", None):
+                            moved, st = r["player_name"], r["status"]
+                            break
+            # Nobody else gets teleported later for a click made now.
+            with db() as c, c.cursor() as cur:
+                cur.execute("DELETE FROM player.web_admin_queue WHERE status='pending' AND id IN ({})".format(
+                    ",".join(["%s"] * len(rows))), tuple(rows.keys()))
+            # Written down every time. The button moves whichever human character
+            # is in the game, wherever its player happens to be looking, and "I
+            # stood AFK and was suddenly in the Demon Tower" (sizowski, 14
+            # September) could not be told apart from a click without a line.
+            app.logger.warning("teleport me (auto): tried=%s moved=%s status=%s to=(%d, %d)",
+                               ",".join(names), moved, st, target_x, target_y)
+            if moved is None:
+                return jsonify({"ok": False, "status": "player_offline", "error": "player_offline",
+                                "tried": names, "x": target_x, "y": target_y})
+            return jsonify({"ok": st == "done", "status": st, "name": moved, "x": target_x, "y": target_y})
 
         st, qid = queue_and_wait(gm_name, "WARP", target_x, target_y, wait=5.0)
-        return jsonify({"ok": True, "status": st, "name": gm_name, "x": target_x, "y": target_y})
+        if st == "timeout":
+            # A WARP nobody answered must not wait for the next login.
+            with db() as c, c.cursor() as cur:
+                cur.execute("DELETE FROM player.web_admin_queue WHERE id=%s AND status='pending'", (qid,))
+        app.logger.warning("teleport me: %s status=%s to=(%d, %d)", gm_name, st, target_x, target_y)
+        return jsonify({"ok": st == "done", "status": st, "name": gm_name, "x": target_x, "y": target_y})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -6419,6 +8273,20 @@ def api_admin_warp_me():
 # wear slot (PLAYERBOT_EQUIP), both ends of a gift, the keeper's side of a
 # stall sale and the storekeeper deposit. Asked for by a player who wanted to
 # know why his top Sura "suddenly flies without her +8".
+def log_text(value):
+    """A text column of log.log as a str. On mt2009 `type`, `how`, `hint` and
+    `ip` are VARBINARY and the driver hands them over as bytes; the game writes
+    CP1250 into them. r40250's big5 columns come back as str already."""
+    if isinstance(value, (bytes, bytearray)):
+        for encoding in ("cp1250", "utf-8", "latin1"):
+            try:
+                return bytes(value).decode(encoding)
+            except UnicodeDecodeError:
+                pass
+        return bytes(value).decode("cp1250", "replace")
+    return value or ""
+
+
 GEAR_HISTORY_HOWS = {
     "REFINE SUCCESS":        ("refine_ok",   {"pl": "Ulepszenie udane",   "en": "Refine succeeded"}),
     "REFINE FAIL":           ("refine_fail", {"pl": "Ulepszenie nieudane", "en": "Refine failed"}),
@@ -6432,12 +8300,91 @@ GEAR_HISTORY_HOWS = {
     "SHOP_BUY":              ("bought",      {"pl": "Kupione na straganie", "en": "Bought at a stall"}),
     "PLAYERBOT_SHOP_SELL":   ("vendor",      {"pl": "Sprzedane handlarzowi", "en": "Sold to merchant"}),
     "PLAYERBOT_BONUS":       ("bonus",       {"pl": "Zużyte na przemianę bonusów", "en": "Used for a bonus reroll"}),
+    "PLAYERBOT_BONUS_ADD":   ("bonus",       {"pl": "Dodano bonus (Wzmocnienie)", "en": "Bonus line added"}),
+    "PLAYERBOT_BONUS_CHANGE":("bonus",       {"pl": "Zmieniono bonusy (Zmiana)",  "en": "Bonus lines rerolled"}),
+    "PLAYERBOT_BONUS_MARBLE":("bonus",       {"pl": "Dodano 5. bonus (Marmur)",   "en": "Fifth line added (marble)"}),
     "SAFEBOX PUT":           ("safebox",     {"pl": "Do magazynu",        "en": "Into the safebox"}),
     "SAFEBOX GET":           ("safebox",     {"pl": "Z magazynu",         "en": "Out of the safebox"}),
     "MOONLIGHT_GET":         ("get",         {"pl": "Ze Szkatułki Blasku", "en": "From a Moonlight chest"}),
     "EXCHANGE_TAKE":         ("gift_in",     {"pl": "Z wymiany",          "en": "From a trade"}),
     "EXCHANGE_GIVE":         ("gift_out",    {"pl": "Oddane w wymianie",  "en": "Given in a trade"}),
 }
+
+# The way a refine was made, from log.refinelog, which the engine writes beside
+# each REFINE row of log.log: POWER for a blacksmith, GUILD for a guild's,
+# DEVILTOWER for the Demon Tower smith and SCROLL:<vnum> for a scroll (the last
+# two since playerbotify's apply_refine_log_way; before that either smith said
+# POWER and every scroll SCROLL, or nothing when the SET column dropped its
+# name). Tieru, 15.09: "w nawiasie pisz (Kowal, Zwoj Blogoslawienstwa, ...)".
+REFINE_WAY_LABELS = {
+    "POWER":      {"pl": "Kowal",                 "en": "Blacksmith"},
+    "GUILD":      {"pl": "Kowal gildii",          "en": "Guild blacksmith"},
+    "DEVILTOWER": {"pl": "Kowal w Wieży Demonów", "en": "Demon Tower blacksmith"},
+    "SCROLL":     {"pl": "zwój",                  "en": "scroll"},
+    # The names r40250's DoRefineWithScroll writes into the same column.
+    "HYUNIRON":      {"pl": "Magiczny Kamień",    "en": "Magic Stone"},
+    "GOD_SCROLL":    {"pl": "Zwój Boga Smoków",   "en": "Dragon God scroll"},
+    "MUSIN_SCROLL":  {"pl": "Zwój Boga Wojny",    "en": "War God scroll"},
+    "YAGONG_SCROLL": {"pl": "Podręcznik Kowala",  "en": "Blacksmith's handbook"},
+    "SOCKET":        {"pl": "gniazdo",            "en": "socket"},
+}
+REFINE_HOWS = ("REFINE SUCCESS", "REFINE FAIL", "REMOVE (REFINE FAIL)")
+
+
+def refine_way_label(way, language):
+    lang_key = "pl" if language == "pl" else "en"
+    kind, _, vnum = (way or "").strip().partition(":")
+    if vnum.isdigit():
+        name = localized_item_name(int(vnum), language)
+        if name:
+            return name
+    labels = REFINE_WAY_LABELS.get(kind or "SCROLL")
+    if not labels:
+        return kind
+    return labels.get(lang_key, labels["en"])
+
+
+def match_refine_ways(cur, pid, rows):
+    """{index into rows: log.refinelog setType} for the refine rows of log.log.
+
+    A refinelog row belongs to a log row of the same character written within
+    two seconds with the same outcome; among several, the one whose grade is
+    the grade the attempt started from (a success's result is one above it, a
+    scroll's downgrade one below it, a burned piece is it). Anything the query
+    cannot answer - an old world without the table, say - leaves no way."""
+    import datetime as _dt
+    refines = [(i, r) for i, r in enumerate(rows)
+               if log_text(r.get("how")) in REFINE_HOWS and hasattr(r.get("time"), "strftime")]
+    if not refines:
+        return {}
+    slack = _dt.timedelta(seconds=3)
+    try:
+        cur.execute(
+            "SELECT time, is_success, step, setType FROM log.refinelog "
+            "WHERE pid = %s AND time BETWEEN %s AND %s",
+            (pid, min(r["time"] for _, r in refines) - slack, max(r["time"] for _, r in refines) + slack),
+        )
+        candidates = [w for w in cur.fetchall() if hasattr(w.get("time"), "strftime")]
+    except Exception:
+        return {}
+    ways = {}
+    for i, r in refines:
+        how = log_text(r.get("how"))
+        grade = int(r.get("vnum") or 0) % 10
+        succeeded = how == "REFINE SUCCESS"
+        start = grade - 1 if succeeded else (grade + 1 if how == "REFINE FAIL" else grade)
+        best, best_score = None, None
+        for w in candidates:
+            seconds = abs((w["time"] - r["time"]).total_seconds())
+            if seconds > 2 or (int(w.get("is_success") or 0) == 1) != succeeded:
+                continue
+            step = log_text(w.get("step")).strip()
+            score = seconds * 10 + (0 if step.isdigit() and int(step) == start else 5)
+            if best_score is None or score < best_score:
+                best, best_score = w, score
+        if best is not None:
+            ways[i] = log_text(best.get("setType"))
+    return ways
 
 
 @app.route("/api/bot_gear_history/<int:pid>")
@@ -6460,13 +8407,25 @@ def api_bot_gear_history(pid):
                 "ORDER BY time DESC LIMIT %s",
                 tuple([pid] + hows + [limit]),
             )
+            raw = list(cur.fetchall())
+            ways = match_refine_ways(cur, pid, raw)
+            # A scroll that fails hands the piece back a grade down, and the
+            # engine removes the old piece under the same reason as a burn: a
+            # REFINE FAIL row one grade lower beside it is the whole story, and
+            # "Spalone" over a sword that is now +2 was not true.
+            downgrades = [(r["time"], int(r.get("vnum") or 0)) for r in raw
+                          if log_text(r.get("how")) == "REFINE FAIL" and hasattr(r.get("time"), "strftime")]
             rows = []
-            for r in cur.fetchall():
-                how = r.get("how") or ""
+            for index, r in enumerate(raw):
+                how = log_text(r.get("how"))
+                if how == "REMOVE (REFINE FAIL)" and hasattr(r.get("time"), "strftime") and any(
+                        abs((t - r["time"]).total_seconds()) <= 2 and v == int(r.get("vnum") or 0) - 1
+                        for t, v in downgrades):
+                    continue
                 kind, labels = GEAR_HISTORY_HOWS.get(how, ("other", {"pl": how, "en": how}))
                 vnum = int(r.get("vnum") or 0)
                 item = localized_item_name(vnum, language) if vnum else ""
-                hint = (r.get("hint") or "").strip()
+                hint = log_text(r.get("hint")).strip()
                 detail = ""
                 if how in ("PLAYERBOT_GIFT_OUT",):
                     detail = ("→ " if lang_key == "en" else "→ ") + hint
@@ -6483,8 +8442,9 @@ def api_bot_gear_history(pid):
                         detail = ("instead of " if lang_key == "en" else "zamiast ") + localized_item_name(int(parts[3]), language)
                 elif how.startswith("REFINE") or how.startswith("REMOVE"):
                     # The engine's hint is the item's own name with its grade,
-                    # which the item column already shows.
-                    detail = ""
+                    # which the item column already shows; how the refine was
+                    # made comes from log.refinelog.
+                    detail = "(" + refine_way_label(ways[index], language) + ")" if index in ways else ""
                 elif how in ("SAFEBOX PUT", "SAFEBOX GET"):
                     parts = hint.rsplit(" ", 1)
                     if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > 1:
@@ -6509,7 +8469,10 @@ def api_bot_logs(bot_name):
         log_files = [
             "/opt/metin2/var/channel1/game1/syslog",
             "/opt/metin2/var/channel1/first/syslog",
-            "/opt/metin2/var/channel1/game2/syslog"
+            "/opt/metin2/var/channel1/game2/syslog",
+            "/opt/metin2/var/channel2/game1/syslog",
+            "/opt/metin2/var/channel2/first/syslog",
+            "/opt/metin2/var/channel2/game2/syslog",
         ]
         matched_lines = []
         # The whole name and not a prefix of one: "botgrom" used to match
@@ -6560,6 +8523,13 @@ PLAYERBOT_MAP_BOUNDS = {
     104: (51200, 486400, 76800, 76800),     # Spider Dungeon V1
     71: (665600, 435200, 102400, 102400),   # Spider Dungeon V2 (metin2_map_spiderdungeon_02)
     65: (537600, 51200, 102400, 102400),    # Hwang Temple (metin2_map_milgyo)
+    # Moved onto the bots' own core in 2.0.39. The extents are the server_attr
+    # sector counts (8x8, 12x12, 12x12) times a sector's 6400 units, which is
+    # the same number as Setting.txt's MapSize x 128 x 200 and agrees with map
+    # 64 to the unit.
+    66: (128000, 793600, 76800, 76800),     # Demon Tower (metin2_map_deviltower1)
+    67: (281600, 0, 51200, 51200),          # Forest (metin2_map_trent)
+    68: (1049600, 0, 76800, 76800),         # Red Forest (metin2_map_trent02)
 }
 
 
@@ -9665,6 +11635,506 @@ PLAYERBOT_MAP_TILES = {
         "AAAAAAAAAAAAPUZfQzSkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         "AAAAAKB1/APFlzLNc7KcTwAAAABJRU5ErkJggg=="
     ),
+    66: (
+        "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"
+    ),
+    67: (
+        "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"
+    ),
+    68: (
+        "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"
+    ),
 }
 # Six Monkey Dungeons, one picture. The three easy ones - 5, 25 and 45, one per
 # kingdom - are the same server_attr byte for byte at three different bases, and
@@ -9852,6 +12322,9 @@ def api_bot_positions():
                     "is_bot": is_bot,
                     "action": live_labels["action"],
                     "personality": live_labels["personality"],
+                    "charakter": live_labels["charakter"],
+                    "mood": live_labels["mood"],
+                    "hold": live_labels["hold"],
                     "ambition": live_labels["ambition"],
                     "goal": live_labels["goal"],
                     "live": bool(live),
@@ -9889,6 +12362,9 @@ def api_bot_inventory(pid):
                 player["hp"] = live.get("hp", player.get("hp"))
             player["action"] = live_labels["action"]
             player["personality"] = live_labels["personality"]
+            player["charakter"] = live_labels["charakter"]
+            player["mood"] = live_labels["mood"]
+            player["hold"] = live_labels["hold"]
             player["ambition"] = live_labels["ambition"]
             player["goal"] = live_labels["goal"]
             player["live"] = bool(live)
@@ -9919,47 +12395,29 @@ def api_bot_inventory(pid):
                 (row["szName"], row["szState"]): int(row.get("lValue") or 0)
                 for row in quest_rows
             }
-            # What the bot carries of each specimen: the one thing that lets an
-            # outgrown row still be the right answer.
-            vnum_list = tuple(BIOLOGIST_ITEM_VNUMS.values())
+            # What the bag holds of each specimen and key: CountSpecifyItem, which
+            # is what the core asks when it chooses the row, counts nothing else.
+            vnum_list = tuple(BIOLOGIST_ITEM_VNUMS.values()) + tuple(BIOLOGIST_KEY_VNUMS.values())
             cur.execute(
                 "SELECT vnum, COALESCE(SUM(count),0) AS n FROM player.item "
-                "WHERE owner_id = %s AND vnum IN ({}) GROUP BY vnum".format(
+                "WHERE owner_id = %s AND window = 'INVENTORY' AND vnum IN ({}) GROUP BY vnum".format(
                     ",".join(["%s"] * len(vnum_list))),
                 (pid,) + vnum_list)
             held = {int(r["vnum"]): int(r.get("n") or 0) for r in cur.fetchall()}
-            bot_level = int(player.get("level") or 1)
-            completed = 0
-            biologist_label = messages["bio_not_started"]
-            chosen = None
-            fallback = None
-            for quest_name, required_level, item_name, required_count in BIOLOGIST_MISSIONS:
-                item_name = localized_biologist_name(quest_name, item_name, language)
-                if quest_flags.get((quest_name, "__status")) == BIOLOGIST_COMPLETE_STATE:
-                    completed += 1
-                    biologist_label = messages["bio_completed"].format(name=item_name)
-                    continue
-                if bot_level < required_level:
-                    if chosen is None and fallback is None:
-                        chosen = ("next", quest_name, required_level, item_name, required_count)
-                    break
-                outgrown = bot_level > required_level + BIOLOGIST_OUTGROWN_LEVELS
-                carries_all = held.get(BIOLOGIST_ITEM_VNUMS.get(quest_name, 0), 0) >= required_count
-                # The highest row left is what the game falls back to when
-                # every row still open has been outgrown.
-                fallback = ("row", quest_name, required_level, item_name, required_count)
-                if chosen is None and (not outgrown or carries_all):
-                    chosen = fallback
-            if chosen is None:
-                chosen = fallback
-            if chosen is None:
-                biologist_label = messages["bio_all"]
-            elif chosen[0] == "next":
-                biologist_label = messages["bio_next"].format(level=chosen[2], name=chosen[3])
-            else:
-                accepted = quest_flags.get((chosen[1], "collect_count"), 0)
-                biologist_label = "%s: %d/%d" % (chosen[3], accepted, chosen[4])
+            completed, stage, skipped = biologist_progress(
+                player.get("level"), quest_flags, held,
+                live.get("map_index") if live else None, language)
+            biologist_label = biologist_stage_text(stage, messages, ": ")
+            if skipped:
+                biologist_label += " • " + messages["bio_skipped"].format(n=skipped)
+            if live and live.get("personality_id") in BOT_DROPPER_PERSONALITIES:
+                biologist_label = messages["bio_dropper"]
             player["biologist_completed"] = completed
+            # How many rows there are, so the card does not carry the number in
+            # its own markup. It said "/7" outright, and a chain that grew a row
+            # would have reported 8/7 to everybody. Rows the world cannot host
+            # are not counted, or every bot would sit at 8/9 for ever.
+            player["biologist_total"] = len(BIOLOGIST_REACHABLE)
             player["biologist_label"] = biologist_label
 
             cur.execute("""
@@ -10006,7 +12464,7 @@ def api_bot_inventory(pid):
 
             for it in items:
                 vnum = it.get("vnum") or 0
-                name = localized_item_name(vnum, language)
+                name = item_full_name(vnum, it.get("socket0"), language)
                 count = it.get("count") or 1
                 pos = it.get("pos") or 0
                 win = it.get("window") or ""
@@ -10082,7 +12540,7 @@ def api_bot_safebox(pid):
                 items.append({
                     "id": it.get("id"),
                     "vnum": vnum,
-                    "name": localized_item_name(vnum, language),
+                    "name": item_full_name(vnum, it.get("socket0"), language),
                     "count": it.get("count") or 1,
                     "pos": it.get("pos") or 0,
                     "sockets": [it.get("socket0") or 0, it.get("socket1") or 0,
@@ -10090,6 +12548,62 @@ def api_bot_safebox(pid):
                     "attrs": attrs,
                 })
             return jsonify({"ok": True, "items": items})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/api/bot_shop/<int:pid>")
+def api_bot_shop(pid):
+    # What a bot sells is in neither the bag nor the depot: on the 2.x line its
+    # stall is a real IkarusShop offline shop. player.ikashop_offlineshop is the
+    # stand itself (map, position, banner) and player.item with window
+    # IKASHOP_OFFLINESHOP is what stands on the counter, each line's asking
+    # price in that item's own ikashop_data JSON - the same three places seban's
+    # panel reads for its shop feed. The stall belongs to the character, so the
+    # owner here is the pid, unlike the depot, which belongs to the account.
+    language = lang()
+    try:
+        with db() as c, c.cursor() as cur:
+            cur.execute(
+                """
+                SELECT `map`, x, y, is_premium, CAST(`name` AS BINARY) AS name
+                  FROM player.ikashop_offlineshop
+                 WHERE owner = %s
+                """,
+                (pid,),
+            )
+            shop = cur.fetchone()
+            if not shop:
+                return jsonify({"ok": True, "shop": None})
+            cur.execute(
+                """
+                SELECT id, pos, `count`, vnum, socket0,
+                       CAST(JSON_UNQUOTE(JSON_EXTRACT(ikashop_data, '$.yang')) AS UNSIGNED) AS price
+                  FROM player.item
+                 WHERE owner_id = %s AND `window` = 'IKASHOP_OFFLINESHOP'
+                 ORDER BY pos ASC
+                """,
+                (pid,),
+            )
+            offers = []
+            for it in cur.fetchall():
+                vnum = it.get("vnum") or 0
+                offers.append({
+                    "id": it.get("id"),
+                    "vnum": vnum,
+                    "name": item_full_name(vnum, it.get("socket0"), language),
+                    "count": it.get("count") or 1,
+                    "pos": it.get("pos") or 0,
+                    "price": int(it.get("price") or 0),
+                })
+            return jsonify({"ok": True, "shop": {
+                # The banner is cp1250 like every other name column here.
+                "name": log_text(shop.get("name")),
+                "map_index": int(shop.get("map") or 0),
+                "x": int(shop.get("x") or 0),
+                "y": int(shop.get("y") or 0),
+                "is_premium": bool(shop.get("is_premium")),
+                "offers": offers,
+            }})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -10203,6 +12717,26 @@ def api_bot_rankings():
                               hunting_remain ASC, p.level DESC
                     LIMIT %s
                 """), (rank_limit,))
+            elif rtype == "shops" and ENGINE_MT2009:
+                # On the 2.x line a bot's stall is a real offline shop (2.0.26):
+                # an independent entity the engine keeps in
+                # player.ikashop_offlineshop while the keeper goes on hunting, so
+                # the keeper never reports BOT_ACTION_STALL and the live status
+                # file would list nobody. The database answers this one directly;
+                # duration is minutes left, zero is an expired stand awaiting its
+                # owner's service visit. The stand's map comes from the row, not
+                # from where the keeper happens to be hunting; the live entry is
+                # still read so the row can say what the keeper is doing now.
+                live = read_playerbot_live_status()
+                cur.execute(bot_sql("""
+                    SELECT p.id, p.name, p.level, p.job, p.gold,
+                           s.map AS stall_map_index
+                    FROM player.ikashop_offlineshop s
+                    JOIN player.player p ON p.id = s.owner
+                    WHERE s.duration > 0 AND <<BOT_P_2>>
+                    ORDER BY p.level DESC
+                    LIMIT %s
+                """), (rank_limit,))
             elif rtype == "shops":
                 # An open stall exists only in the game core's memory, so this is
                 # the one ranking the database cannot answer. The live status file
@@ -10269,6 +12803,30 @@ def api_bot_rankings():
                 """), (rank_limit,))
 
             rows = cur.fetchall()
+            # The Biologist's ranking names the row each bot is on, as the card
+            # does, so it reads the same quest flags and bag for the whole page.
+            bio_flags, bio_bags, bio_live = {}, {}, {}
+            if rtype == "biologist" and rows:
+                bio_ids = tuple(int(r["id"]) for r in rows)
+                id_marks = ",".join(["%s"] * len(bio_ids))
+                bio_names = tuple(m[0] for m in BIOLOGIST_MISSIONS)
+                cur.execute(
+                    "SELECT dwPID, szName, szState, lValue FROM player.quest "
+                    "WHERE dwPID IN ({}) AND szName IN ({})".format(
+                        id_marks, ",".join(["%s"] * len(bio_names))),
+                    bio_ids + bio_names)
+                for q in cur.fetchall():
+                    bio_flags.setdefault(int(q["dwPID"]), {})[(q["szName"], q["szState"])] = (
+                        int(q.get("lValue") or 0))
+                bio_vnums = tuple(BIOLOGIST_ITEM_VNUMS.values()) + tuple(BIOLOGIST_KEY_VNUMS.values())
+                cur.execute(
+                    "SELECT owner_id, vnum, COALESCE(SUM(count),0) AS n FROM player.item "
+                    "WHERE owner_id IN ({}) AND window = 'INVENTORY' AND vnum IN ({}) "
+                    "GROUP BY owner_id, vnum".format(id_marks, ",".join(["%s"] * len(bio_vnums))),
+                    bio_ids + bio_vnums)
+                for it in cur.fetchall():
+                    bio_bags.setdefault(int(it["owner_id"]), {})[int(it["vnum"])] = int(it.get("n") or 0)
+                bio_live = read_playerbot_live_status()
             # One lookup for the whole page instead of a column in each of the
             # dozen ranking queries, which is also the only way it stays right
             # when a new ranking is added.
@@ -10323,22 +12881,37 @@ def api_bot_rankings():
                 stall_map = ""
                 if rtype == "shops":
                     entry = live.get(r["id"]) or {}
+                    # An offline shop (2.x) stands where its row says; a classic
+                    # stall stands where its keeper does.
+                    stall_map_index = r.get("stall_map_index") or entry.get("map_index")
                     stall_map = messages.get(
                         {21: "m1", 23: "m2", 24: "m3", 1: "s1", 3: "s2", 4: "s3",
-                         41: "j1", 43: "j2", 44: "j3"}.get(entry.get("map_index"), ""), "")
+                         41: "j1", 43: "j2", 44: "j3"}.get(stall_map_index, ""), "")
 
-                bio_completed = max(0, min(len(BIOLOGIST_MISSIONS), int(r.get("biologist_completed") or 0)))
-                if bio_completed >= len(BIOLOGIST_MISSIONS):
-                    bio_label = "%d/%d • %s" % (
-                        bio_completed, len(BIOLOGIST_MISSIONS), messages["bio_complete"])
-                elif bio_completed > 0:
-                    mission = BIOLOGIST_MISSIONS[bio_completed - 1]
-                    bio_label = "%d/%d • %s" % (
-                        bio_completed, len(BIOLOGIST_MISSIONS),
-                        localized_biologist_name(mission[0], mission[2], language))
-                else:
-                    bio_label = "0/%d • %s" % (
-                        len(BIOLOGIST_MISSIONS), messages["bio_in_progress"])
+                bio_completed = max(0, min(len(BIOLOGIST_REACHABLE), int(r.get("biologist_completed") or 0)))
+                bio_label = ""
+                if rtype == "biologist":
+                    # The count, then the row the bot is on now. The label used to
+                    # name the row at the position of the count: "6/9 • Grzyb Tue"
+                    # for bots whose six herbs were done and whose Orc Tooth stood
+                    # at 1/10, and "5/9 • Bez" for bots whose fifth finished row was
+                    # the Demon Souvenir - an outgrown row is stepped over, so rows
+                    # are not finished in order.
+                    entry = bio_live.get(int(r["id"])) or {}
+                    bio_completed, stage, _ = biologist_progress(
+                        r.get("level"), bio_flags.get(int(r["id"]), {}),
+                        bio_bags.get(int(r["id"]), {}), entry.get("map_index"), language)
+                    if entry.get("personality_id") in BOT_DROPPER_PERSONALITIES:
+                        bio_label = "%d/%d • %s" % (
+                            bio_completed, len(BIOLOGIST_REACHABLE), messages["bio_dropper"])
+                    elif stage is None:
+                        bio_label = "%d/%d • %s" % (
+                            bio_completed, len(BIOLOGIST_REACHABLE), messages["bio_complete"])
+                    else:
+                        template = "bio_rank_next" if stage[0] == "next" else "bio_rank_now"
+                        bio_label = messages[template].format(
+                            done=bio_completed, total=len(BIOLOGIST_REACHABLE),
+                            stage=biologist_stage_text(stage, messages, " "))
                 hunting_complete = max(0, int(r.get("hunting_complete") or 0))
                 hunting_current = max(0, int(r.get("hunting_current") or 0))
                 hunting_remain = max(0, int(r.get("hunting_remain") or 0))
@@ -10417,6 +12990,36 @@ def rates():
             return redirect(url_for("rates"))     # "the table is missing" — said below
         except Exception:
             return redirect(url_for("rates"))     # "the database is down"  — said below
+        if ENGINE_MT2009:
+            # The flags first, whatever happens next: they are what a restart
+            # reads. Then the in-game helper, which needs somebody logged in
+            # (its server timer is armed at the first login); when nothing
+            # answers, the request below has the game container restart the
+            # cores, and this engine's m2-rates does nothing but that.
+            try:
+                with db() as c, c.cursor() as cur:
+                    persist_rates_mt2009(cur, vals)
+            except Exception:
+                flash(t("db_down"), "error")
+                return redirect(url_for("rates"))
+            try:
+                status, qid = queue_and_wait("", "RATES", "%d,%d,%d" % (vals["exp"], vals["drop"], vals["yang"]), "",
+                                             wait=RATES_LIVE_WAIT)
+            except Exception:
+                status, qid = "failed", 0
+            if status == "done":
+                write_rates_status("ok", vals, "set live through the in-game helper")
+                flash(t("rates_saved_live"))
+                return redirect(url_for("rates"))
+            if status == "timeout":
+                # Withdraw it: the restart carries the same numbers, and a
+                # row left pending would be swept as player_offline anyway.
+                try:
+                    with db() as c, c.cursor() as cur:
+                        cur.execute("UPDATE player.web_admin_queue SET status='cancelled' "
+                                    "WHERE id=%s AND status='pending'", (qid,))
+                except Exception:
+                    pass
         write_rates_status("running")
         try:
             # Never wait for this one: it stops and restarts the whole game server,
@@ -10441,9 +13044,276 @@ def rates():
     if not have_script:
         flash(t("rates_no_script"), "error")
     st = rates_status().get("state", "")
-    return render_template_string(TPL_RATES, cur=cur_rates, presets=RATE_PRESETS,
+    regen = None
+    regen_count = None
+    if ENGINE_MT2009:
+        try:
+            regen = read_regen_mt2009()
+        except Exception:
+            regen = {name: 100 for name in MT2009_REGEN_FLAGS}
+        try:
+            regen_count = read_regen_count_mt2009()
+        except Exception:
+            regen_count = {name: 100 for name in MT2009_REGEN_COUNT_FLAGS}
+    channels = None
+    if ENGINE_MT2009:
+        try:
+            channels = read_channels_state()
+        except Exception:
+            channels = None
+    return render_template_string(TPL_RATES, cur=cur_rates, presets=RATE_PRESETS, regen=regen,
+                                  regen_count=regen_count, count_choices=REGEN_COUNT_CHOICES,
+                                  channels=channels,
+                                  intro_key="rates_intro_mt2009" if ENGINE_MT2009 else "rates_intro",
                                   state_msg=t("rates_st_" + st) if st in RATE_STATES else "")
 
+
+@app.post("/rates/regen")
+@login_required
+def rates_regen():
+    """Stones and bosses, and ordinary monsters, respawning in a share of their
+    normal time. mt2009 only: the engine's regen_event reads the flags."""
+    if not ENGINE_MT2009:
+        return redirect(url_for("rates"))
+    vals = {}
+    for name in MT2009_REGEN_FLAGS:
+        raw = (request.form.get(name, "") or "").strip()
+        if not raw.isdigit() or not REGEN_MIN_PERCENT <= int(raw) <= 100:
+            flash(t("regen_range"), "error")
+            return redirect(url_for("rates"))
+        vals[name] = int(raw)
+    try:
+        with db() as c, c.cursor() as cur:
+            persist_regen_mt2009(cur, vals)
+    except Exception:
+        flash(t("db_down"), "error")
+        return redirect(url_for("rates"))
+    try:
+        status, qid = queue_and_wait("", "REGEN", "%d,%d" % (0 if vals["regen_boss"] >= 100 else vals["regen_boss"],
+                                                            0 if vals["regen_mob"] >= 100 else vals["regen_mob"]), "",
+                                     wait=RATES_LIVE_WAIT)
+    except Exception:
+        status, qid = "failed", 0
+    if status == "done":
+        flash(t("regen_saved_live"))
+    else:
+        if status == "timeout":
+            try:
+                with db() as c, c.cursor() as cur:
+                    cur.execute("UPDATE player.web_admin_queue SET status='cancelled' "
+                                "WHERE id=%s AND status='pending'", (qid,))
+            except Exception:
+                pass
+        flash(t("regen_saved_restart"))
+    return redirect(url_for("rates"))
+
+
+
+@app.post("/rates/regen_count")
+@login_required
+def rates_regen_count():
+    """How many monsters each respawn line keeps standing, stones and bosses
+    apart from the rest. mt2009 only: the engine's regen_spawn reads the flags."""
+    if not ENGINE_MT2009:
+        return redirect(url_for("rates"))
+    vals = {}
+    for name in MT2009_REGEN_COUNT_FLAGS:
+        raw = (request.form.get(name, "") or "").strip()
+        if not raw.isdigit() or int(raw) not in REGEN_COUNT_CHOICES:
+            flash(t("count_range"), "error")
+            return redirect(url_for("rates"))
+        vals[name] = int(raw)
+    try:
+        with db() as c, c.cursor() as cur:
+            persist_regen_count_mt2009(cur, vals)
+    except Exception:
+        flash(t("db_down"), "error")
+        return redirect(url_for("rates"))
+    try:
+        status, qid = queue_and_wait("", "REGEN_COUNT", "%d,%d" % (vals["count_boss"], vals["count_mob"]), "",
+                                     wait=RATES_LIVE_WAIT)
+    except Exception:
+        status, qid = "failed", 0
+    if status == "done":
+        flash(t("count_saved_live"))
+    else:
+        if status == "timeout":
+            try:
+                with db() as c, c.cursor() as cur:
+                    cur.execute("UPDATE player.web_admin_queue SET status='cancelled' "
+                                "WHERE id=%s AND status='pending'", (qid,))
+            except Exception:
+                pass
+        flash(t("count_saved_restart"))
+    return redirect(url_for("rates"))
+
+
+# The second channel (M2_PLAYERBOT_CH2). The game container decides it at every
+# start from .env (the launcher's) or from this panel's wish in the spool,
+# whichever was made later, and writes what it runs with beside the status
+# files. The panel cannot restart the container, so a change here applies at
+# the next start; the launcher reads the wish then and opens CH2's ports.
+CHANNELS_WISH = os.path.join(AI_SPOOL, "channels.wanted")
+CHANNELS_EFFECTIVE = "/opt/metin2/var/channels.effective"
+CH2_SHARE_CHOICES = (20, 30, 40, 50, 60, 70)
+
+
+def _read_kv(path):
+    out = {}
+    try:
+        with open(path, "r", encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def read_channels_state():
+    eff = _read_kv(CHANNELS_EFFECTIVE)
+    wish = _read_kv(CHANNELS_WISH)
+    on = eff.get("CH2") == "1"
+    share = int(eff.get("SHARE", "40")) if eff.get("SHARE", "").isdigit() else 40
+    ports = eff.get("PORTS", "13000-13002")
+    state = {"on": on, "share": share, "ports_open": ports.endswith("13012"),
+             "want_on": on, "want_share": share, "pending": "", "choices": CH2_SHARE_CHOICES}
+    if wish.get("CH2") in ("0", "1"):
+        w_on = wish.get("CH2") == "1"
+        w_share = int(wish.get("SHARE", "40")) if wish.get("SHARE", "").isdigit() else 40
+        state["want_on"], state["want_share"] = w_on, w_share
+        # A wish the running server does not match yet.
+        if w_on != on or (w_on and w_share != share):
+            state["pending"] = (t("ch2_on_word").replace("{share}", str(w_share)) if w_on
+                                else t("ch2_off_word"))
+    if state["want_share"] not in CH2_SHARE_CHOICES:
+        state["want_share"] = 40
+    return state
+
+
+@app.post("/rates/channels")
+@login_required
+def rates_channels():
+    """The second channel's switch and share, written for the next start."""
+    if not ENGINE_MT2009:
+        return redirect(url_for("rates"))
+    on = request.form.get("ch2", "") == "1"
+    raw = (request.form.get("share", "") or "").strip()
+    if not raw.isdigit() or int(raw) not in CH2_SHARE_CHOICES:
+        flash(t("ch2_bad"), "error")
+        return redirect(url_for("rates"))
+    body = "CH2=%d\nSHARE=%d\nSET_AT=%d\n" % (1 if on else 0, int(raw), int(time.time()))
+    tmp = CHANNELS_WISH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="ascii") as fh:
+            fh.write(body)
+        os.replace(tmp, CHANNELS_WISH)
+    except OSError:
+        flash(t("ch2_failed"), "error")
+        return redirect(url_for("rates"))
+    app.logger.info("channels: CH2=%s share=%s written for the next start", int(on), raw)
+    flash(t("ch2_saved"))
+    return redirect(url_for("rates"))
+
+
+@app.route("/guilds")
+@login_required
+def guilds_page():
+    """The bot guilds: tier, level, members, ladder, the war under way. Read
+    from the cores' playerbot_guild_status.tsv; nothing is written."""
+    guilds = read_guild_status()
+    # Per kingdom: seconds until its next bot war (0 = under way), so a
+    # player who wants to watch one knows when and where to be.
+    next_wars = {}
+    for g in guilds:
+        nw = g.get("next_war_in_s")
+        if nw is None:
+            continue
+        cur = next_wars.get(g["empire"])
+        if cur is None or (nw >= 0 and (cur < 0 or nw < cur)):
+            next_wars[g["empire"]] = nw
+    next_war_rows = [(GUILD_EMPIRE_KEYS.get(e, "gl_empire_unknown"), s) for e, s in sorted(next_wars.items())]
+    return render_template_string(TPL_GUILDS, guilds=guilds, tier_keys=GUILD_TIER_KEYS,
+                                  next_wars=next_war_rows)
+
+
+@app.route("/events", methods=["GET", "POST"])
+@login_required
+def events_page():
+    """Timed events: chest windows, rate windows, and "activate now".
+
+    The page only writes the file; the game core reads it within five seconds,
+    gates the chest odds, moves the rate flags from ONE core and speaks on the
+    chat (playerbot_events.h). Nothing restarts.
+    """
+    rows, nows = read_events()
+    if request.method == "POST":
+        # (the global before_request hook has already checked the CSRF token)
+        action = request.form.get("action", "")
+        if action == "save":
+            new_rows = []
+            for i in range(0, 64):
+                kind = request.form.get("r%d_kind" % i)
+                if kind is None:
+                    break
+                if kind not in EVENT_KINDS or request.form.get("r%d_del" % i):
+                    continue
+                start = event_hhmm(request.form.get("r%d_start" % i))
+                end = event_hhmm(request.form.get("r%d_end" % i))
+                try:
+                    value = max(0, min(1000, int(request.form.get("r%d_value" % i) or 0)))
+                except ValueError:
+                    value = -1
+                if not start or not end or start == "24:00" or value < 0:
+                    flash(t("ev_bad_row") % (i + 1), "error")
+                    return redirect(url_for("events_page"))
+                days = [d for d in range(1, 8) if request.form.get("r%d_d%d" % (i, d))]
+                new_rows.append({"kind": kind, "days": days, "start": start, "end": end,
+                                 "value": 0 if kind == "chest" else value,
+                                 "on": bool(request.form.get("r%d_on" % i))})
+            try:
+                write_events(new_rows, nows)
+            except OSError:
+                flash(t("ev_failed"), "error")
+                return redirect(url_for("events_page"))
+            flash(t("ev_saved"))
+            return redirect(url_for("events_page"))
+        kind = request.form.get("kind", "")
+        if kind not in EVENT_KINDS:
+            return redirect(url_for("events_page"))
+        if action == "now":
+            try:
+                minutes = max(5, min(1440, int(request.form.get("minutes") or 60)))
+                value = max(1, min(1000, int(request.form.get("value") or 50)))
+            except ValueError:
+                minutes, value = 60, 50
+            nows[kind] = {"until": int(time.time()) + minutes * 60,
+                          "value": 0 if kind == "chest" else value}
+            try:
+                write_events(rows, nows)
+            except OSError:
+                flash(t("ev_failed"), "error")
+                return redirect(url_for("events_page"))
+            flash(t("ev_now_started") % minutes)
+            return redirect(url_for("events_page"))
+        if action == "stop":
+            nows.pop(kind, None)
+            try:
+                write_events(rows, nows)
+            except OSError:
+                flash(t("ev_failed"), "error")
+                return redirect(url_for("events_page"))
+            flash(t("ev_stopped"))
+            return redirect(url_for("events_page"))
+        return redirect(url_for("events_page"))
+
+    # Two empty rows after the saved ones: a new window needs no script.
+    shown = list(rows) + [{"kind": "", "days": list(range(1, 8)), "start": "20:00",
+                           "end": "21:00", "value": 50, "on": True} for _ in range(2)]
+    return render_template_string(TPL_EVENTS, rows=shown, nows=nows, kinds=EVENT_KINDS,
+                                  status=read_events_status(), minutes=EVENT_NOW_MINUTES,
+                                  day_names=t("ev_days").split(","), now_epoch=int(time.time()))
 
 @app.route("/ai", methods=["GET", "POST"])
 @login_required
@@ -10469,15 +13339,42 @@ def ai_weights():
         vals["CHAT"] = 1 if request.form.get("CHAT") else 0
         vals["BOOKS"] = 1 if request.form.get("BOOKS") else 0
         vals["NIGHT"] = 1 if request.form.get("NIGHT") else 0
+        vals["LIFE"] = 1 if request.form.get("LIFE") else 0
+        vals["WARS"] = 1 if request.form.get("WARS") else 0
+        vals["TOWER"] = 1 if request.form.get("TOWER") else 0
+        vals["ISHOP"] = 1 if request.form.get("ISHOP") else 0
+        vals["PERSONA"] = 1 if request.form.get("PERSONA") else 0
         try:
             vals["SCRAP"] = max(0, min(100, int(request.form.get("SCRAP", 0))))
         except (TypeError, ValueError):
             vals["SCRAP"] = 0
+        try:
+            vals["REST"] = max(0, min(100, int(request.form.get("REST", 100))))
+        except (TypeError, ValueError):
+            vals["REST"] = 100
+        try:
+            vals["KINGDOMPVP"] = max(0, min(100, int(request.form.get("KINGDOMPVP", 0))))
+        except (TypeError, ValueError):
+            vals["KINGDOMPVP"] = 0
+        try:
+            vals["SCROLL_FROM"] = max(1, min(9, int(request.form.get("SCROLL_FROM", 1))))
+        except (TypeError, ValueError):
+            vals["SCROLL_FROM"] = 1
         for key in ("CHEST", "CHEST_STONE"):
             try:
                 vals[key] = max(0, min(1000, int(request.form.get(key))))
             except (TypeError, ValueError):
                 vals[key] = None
+        # The chest switch: off writes zero for both figures and keeps the
+        # sliders' values for the day it is switched back on.
+        chest_off = bool(request.form.get("CHEST_OFF"))
+        try:
+            write_chest_switch(chest_off, vals.get("CHEST"), vals.get("CHEST_STONE"))
+        except OSError:
+            pass
+        if chest_off:
+            vals["CHEST"] = 0
+            vals["CHEST_STONE"] = 0
         try:
             write_ai_weights(vals)
         except OSError:
@@ -10486,9 +13383,77 @@ def ai_weights():
         flash(t("ai_live"))
         return redirect(url_for("ai_weights"))
 
-    return render_template_string(TPL_AI, cur=read_ai_weights(),
-                                  keys=AI_WEIGHT_KEYS, wmin=AI_W_MIN,
+    # HUNTING drives the level-up mission goal, which is disabled on the mt2009
+    # line (levelup.quest ships in quest/_unused - see playerbot_missions.h), so
+    # the slider would do nothing there. LEVEL is the leveling control on 2.x.
+    keys = [k for k in AI_WEIGHT_KEYS if not (ENGINE_MT2009 and k[0] == "HUNTING")]
+    cur = read_ai_weights()
+    chest_off, chest_kill, chest_stone = read_chest_switch()
+    if chest_off:
+        # The sliders show what the operator had set, not the zeros the
+        # switch wrote, so switching back on restores them.
+        cur["CHEST"] = chest_kill
+        cur["CHEST_STONE"] = chest_stone
+    return render_template_string(TPL_AI, cur=cur, chest_off=chest_off,
+                                  keys=keys, wmin=AI_W_MIN, bots_held=read_bot_hold(),
                                   wmax=AI_W_MAX, wneutral=AI_W_NEUTRAL)
+
+
+@app.route("/ai/tower_now", methods=["POST"])
+@login_required
+def ai_tower_now():
+    """"Now" for the bot guilds' Demon Tower: the core watches this file's
+    mtime (PLAYERBOT_TOWER_NOW_PATH in playerbot_types.h) and calls a raid on
+    its next check when none is under way."""
+    path = os.path.join(AI_SPOOL, "playerbot_tower_now")
+    try:
+        with open(path, "a", encoding="utf-8"):
+            pass
+        os.utime(path, None)
+        flash(t("ai_tower_now_done"))
+    except OSError as e:
+        flash("%s: %s" % (t("ai_tower_now"), e))
+    return redirect(url_for("ai_weights"))
+
+
+@app.route("/ai/release_bots", methods=["POST"])
+@login_required
+def ai_release_bots():
+    """Let a held world's bots in.
+
+    A world made a moment ago has nobody's rates, respawns or personalities in
+    it yet, so the launcher can ask for its bots to wait at the door; this is
+    the door. The core reads the file on the same five-second clock as the
+    weights and fills the world through the ordinary spawn window, so nothing
+    is restarted and nothing arrives all at once."""
+    try:
+        write_bot_hold(False)
+        flash(t("ai_bots_released"))
+    except OSError as e:
+        flash("%s: %s" % (t("ai_bots_release"), e))
+    return redirect(url_for("ai_weights"))
+
+
+@app.route("/ai/items", methods=["GET", "POST"])
+@login_required
+def ai_item_policy():
+    """The item policy file, edited as text: the core reads it like the
+    weights, so saving is the whole operation. A malformed line is refused
+    with its number rather than written and silently skipped by the core."""
+    if request.method == "POST":
+        text = request.form.get("policy", "")
+        bad = check_ai_item_policy(text)
+        if bad:
+            flash(t("ai_items_bad").replace("{n}", ", ".join(str(n) for n in bad)), "error")
+            return render_template_string(TPL_AI_ITEMS, policy=text)
+        try:
+            write_ai_item_policy(text)
+        except OSError:
+            flash(t("ai_failed"), "error")
+            return redirect(url_for("ai_item_policy"))
+        flash(t("ai_items_live"))
+        return redirect(url_for("ai_item_policy"))
+    return render_template_string(TPL_AI_ITEMS, policy=read_ai_item_policy())
 
 
 
@@ -10645,8 +13610,15 @@ sh "$REPO/linux-port/fetch-sources.sh" fetch
 (cd "$REPO/linux-port/docker" && tar cf - .) | (cd "$STACK" && tar xf -)
 cd "$STACK" && docker compose up -d --build"""
 
+# The 2.x line is a package, not a checkout: the update is the zip the
+# manifest names, unpacked over the server folder by its own script. The 1.x
+# sequence above would stage the 1.x tree over it (l0st3k, 12 September).
+MANUAL_UPDATE_MT2009 = """cd /opt/metin2          # the server folder: VERSION, CHANGELOG.md, linux-port/
+sh linux-port/tools/update.sh"""
+
 def manual_update():
-    return str(CONF.get("update_command", "") or "").strip() or MANUAL_UPDATE
+    return str(CONF.get("update_command", "") or "").strip() or \
+        (MANUAL_UPDATE_MT2009 if ENGINE_MT2009 else MANUAL_UPDATE)
 
 TPL_PATCHLOG = BASE.replace("__BODY__", """
 <p><a href="{{url_for('dash')}}">{{t('back_players')}}</a></p>
@@ -10665,6 +13637,7 @@ TPL_PATCHLOG = BASE.replace("__BODY__", """
 {% else %}
 <p class="muted">{{t('upd_none')}}{% if upd.error %} — {{t('upd_failed')}}{% endif %}</p>
 {% endif %}
+{% if upd.next_line %}<p class="muted">{{ t('upd_next_line').replace('{new}', upd.next_line) }}</p>{% endif %}
 {# Asks straight away instead of waiting for the daily check -- the one place
    in the panel where a page deliberately waits for the network, because
    somebody pressed a button and is owed an answer. #}
@@ -11528,6 +14501,17 @@ def item_qty(raw):
         return None
     return q if 1 <= q <= MAX_ITEM_COUNT else None
 
+# Every word the in-game quest is allowed to leave in a queue row's status
+# when it has finished with it, plus the two written outside it (the sweep's
+# player_offline and the panel's own cancelled). Anything else in that column
+# is the quest's claim stamp, not an answer -- see queue_and_wait. The list is
+# web_admin.quest's own whitelist; add a word there and it belongs here too.
+QUEUE_FINAL_STATUSES = frozenset((
+    "done", "bad_args", "no_skill", "has_item", "full", "failed",
+    "qty_too_big", "partial", "no_gm", "unknown_cmd",
+    "player_offline", "cancelled",
+))
+
 def queue_and_wait(name, cmd, arg1, arg2, wait=7.0):
     """Insert the command into the queue and wait for the in-game quest to process it.
        Returns (status, queue_row_id) with status: done | player_offline | timeout | gone | ...
@@ -11547,7 +14531,17 @@ def queue_and_wait(name, cmd, arg1, arg2, wait=7.0):
             row = cur.fetchone()
         if row is None:
             return "gone", qid          # something removed the row — never apply on top of that
-        if row["status"] != "pending":
+        # Only a word from the quest's own list is an answer. Anything else is
+        # its claim stamp: web_admin.quest takes a row by writing a token into
+        # status ("w" + channel + "x" + salt + "t" + tick), does the work, and
+        # only then writes the result. Reading that as the answer reported the
+        # stamp back to the operator as a failure — "Coś poszło nie tak
+        # (w1x257t780)" — and running speed hit it every time, because its
+        # handler is the slowest in the quest: it walks the affect list
+        # thirty-two times before it writes anything (Sammy Suricate,
+        # 13 September). Waiting is right: the row is ours until the quest
+        # finishes with it, and the timeout below is still the way out.
+        if row["status"] in QUEUE_FINAL_STATUSES:
             return row["status"], qid
     return "timeout", qid
 
@@ -11613,7 +14607,10 @@ def action():
             return redirect(url_for("player", pid=pid))
         arg1, arg2 = preset.split(" ", 1)
     elif cmd == "SPEED":
-        arg2 = "3600"
+        # Thirty days: the speed stays until "Normal (reset)" takes it off.
+        # An hour looked like a speed that stopped working, and on mt2009 the
+        # old affect ignored the duration anyway (web_admin.quest, SPEED).
+        arg2 = "2592000"
     elif cmd == "LEVEL":
         # Checked here rather than left to the server, which does not refuse it
         # -- it returns from PointChange without a word and reports success all
@@ -11868,6 +14865,17 @@ def set_gm():
                     "VALUES (%s, %s, '', 'ALL', %s)", (login, name, rank))
     except Exception:
         flash(t("db_down"), "error")
+        return redirect(url_for("player", pid=pid))
+
+    if ENGINE_MT2009:
+        # No admin socket on this engine, so no m2-gm: the list is re-read by
+        # /reload a, which the helper can only run as an online IMPLEMENTOR.
+        # 2.0.x asked the spool anyway and said "dziala od razu" of a request
+        # nothing consumed.
+        if gm_reload_mt2009():
+            flash(t("gm_granted" if rank else "gm_removed").format(name=name, rank=gm_rank_label(rank) if rank else ""))
+        else:
+            flash(t("gm_granted_restart" if rank else "gm_removed_restart").format(name=name, rank=gm_rank_label(rank) if rank else ""))
         return redirect(url_for("player", pid=pid))
 
     told = gm_ask_for_reload()

@@ -148,6 +148,18 @@ quest web_admin begin
 		-- carries them out on THIS player.
 		-- ==========================================================
 		when wa_pc_tick.timer begin
+			-- mysql_direct_query() is not one function on the two engines this
+			-- quest runs on: r40250 (our questlua patch) returns the rows as a
+			-- table, mt2009 returns the number of affected rows FIRST and the
+			-- rows second. Taking the first value as the table made every panel
+			-- command on 2.0.x time out ("Nic w grze nie odpowiedzialo").
+			local function wa_query(q)
+				local a, b = mysql_direct_query(q)
+				if type(a) == "table" then
+					return a
+				end
+				return b
+			end
 			-- Reading a global that was never defined gives nil in Lua
 			-- rather than an error, so this is a safe way to ask "was
 			-- the core patched?". The server timer does the complaining
@@ -194,7 +206,7 @@ quest web_admin begin
 			-- below retires anything nobody claims within thirty
 			-- seconds, so the pending set cannot grow past what one
 			-- admin can queue in that time.
-			local rows = mysql_direct_query("SELECT id, player_name, cmd, arg1, arg2 FROM player.web_admin_queue WHERE status='pending' ORDER BY id ASC LIMIT 10")
+			local rows = wa_query("SELECT id, player_name, cmd, arg1, arg2 FROM player.web_admin_queue WHERE status='pending' ORDER BY id ASC LIMIT 10")
 			if type(rows) ~= "table" then
 				return
 			end
@@ -228,11 +240,11 @@ quest web_admin begin
 							-- else changes 0 rows. The panel gives up the
 							-- same way, and so does the sweep below, so no
 							-- two of them can ever act on one row.
-							mysql_direct_query("UPDATE player.web_admin_queue SET status='" .. wa_token .. "' WHERE id=" .. qid .. " AND status='pending' LIMIT 1")
+							wa_query("UPDATE player.web_admin_queue SET status='" .. wa_token .. "' WHERE id=" .. qid .. " AND status='pending' LIMIT 1")
 
 							-- Did we win? Ask, rather than trusting a row
 							-- count that not every binding reports.
-							local check = mysql_direct_query("SELECT id FROM player.web_admin_queue WHERE id=" .. qid .. " AND status='" .. wa_token .. "' LIMIT 1")
+							local check = wa_query("SELECT id FROM player.web_admin_queue WHERE id=" .. qid .. " AND status='" .. wa_token .. "' LIMIT 1")
 							local won = false
 							if type(check) == "table" then
 								if table.getn(check) > 0 then
@@ -374,6 +386,18 @@ quest web_admin begin
 											affect.add_collect(mov, bonus, secs)
 										end
 									end
+								elseif cmd == "GM_RELOAD" then
+									-- The panel wrote a new common.gmlist row and wants the
+									-- cores to re-read the list. "reload a" asks the db core
+									-- (HEADER_GD_RELOAD_ADMIN), which pushes the list to every
+									-- game core. interpret_command() runs it as THIS player, so
+									-- only an IMPLEMENTOR (gm level 5) can carry it; anyone else
+									-- would get "no such command" and nothing would happen.
+									if pc.get_gm_level() < 5 then
+										result = "no_gm"
+									else
+										command("reload a")
+									end
 								else
 									result = "unknown_cmd"
 								end
@@ -381,14 +405,14 @@ quest web_admin begin
 								-- Only words from our own short list may
 								-- reach the database. Nothing a user typed
 								-- can get in here.
-								if result ~= "done" and result ~= "bad_args" and result ~= "no_skill" and result ~= "has_item" and result ~= "full" and result ~= "failed" and result ~= "qty_too_big" and result ~= "partial" then
+								if result ~= "done" and result ~= "bad_args" and result ~= "no_skill" and result ~= "has_item" and result ~= "full" and result ~= "failed" and result ~= "qty_too_big" and result ~= "partial" and result ~= "no_gm" then
 									result = "unknown_cmd"
 								end
 
 								-- Release the row. "AND status=<our stamp>"
 								-- makes sure we only ever overwrite the row
 								-- we own.
-								mysql_direct_query("UPDATE player.web_admin_queue SET status='" .. result .. "' WHERE id=" .. qid .. " AND status='" .. wa_token .. "' LIMIT 1")
+								wa_query("UPDATE player.web_admin_queue SET status='" .. result .. "' WHERE id=" .. qid .. " AND status='" .. wa_token .. "' LIMIT 1")
 							end
 						end
 					end
@@ -410,6 +434,18 @@ quest web_admin begin
 		-- after thirty means there is no such player in the world.
 		-- ==========================================================
 		when wa_tick.server_timer begin
+			-- mysql_direct_query() is not one function on the two engines this
+			-- quest runs on: r40250 (our questlua patch) returns the rows as a
+			-- table, mt2009 returns the number of affected rows FIRST and the
+			-- rows second. Taking the first value as the table made every panel
+			-- command on 2.0.x time out ("Nic w grze nie odpowiedzialo").
+			local function wa_query(q)
+				local a, b = mysql_direct_query(q)
+				if type(a) == "table" then
+					return a
+				end
+				return b
+			end
 			if __wa_no_sql == true then
 				return
 			end
@@ -421,11 +457,64 @@ quest web_admin begin
 				return
 			end
 
+			-- Server-wide rates, mt2009 line. The engine multiplies
+			-- experience, drops and yang by the event flags mob_exp,
+			-- mob_item and mob_gold (CQuestManager::SetEventFlag), and
+			-- the "_buyer" twins are what a premium account reads, so
+			-- both get the same number. game.set_event_flag() needs no
+			-- current player -- it is a packet to the db core, which
+			-- stores the flag and broadcasts it to every core -- which
+			-- is why this lives in the server timer and not in a
+			-- player's. The panel has already written the six rows into
+			-- player.quest itself, so a restart carries them anyway;
+			-- this is what makes them live without one. The row names
+			-- no player (player_name is empty), so no player timer ever
+			-- claims it and the sweep below would retire it after 30 s.
+			local rrows = wa_query("SELECT id, arg1, arg2 FROM player.web_admin_queue WHERE status='pending' AND cmd='RATES' ORDER BY id ASC LIMIT 3")
+			if type(rrows) == "table" then
+				local ri
+				for ri = 1, table.getn(rrows) do
+					local rr = rrows[ri]
+					if type(rr) == "table" then
+						local rqid = tonumber(rr.id)
+						-- arg1 = "exp,drop,yang", arg2 unused. Digits only
+						-- reach set_event_flag; anything else is bad_args.
+						local rexp, rdrop, ryang = nil, nil, nil
+						if type(rr.arg1) == "string" then
+							local _, _, a1, a2, a3 = string.find(rr.arg1, "^(%d+),(%d+),(%d+)$")
+							rexp = tonumber(a1)
+							rdrop = tonumber(a2)
+							ryang = tonumber(a3)
+						end
+						if rqid ~= nil then
+							local rres = "done"
+							if rexp == nil or rdrop == nil or ryang == nil then
+								rres = "bad_args"
+							elseif rexp < 1 or rexp > 10000 or rdrop < 1 or rdrop > 10000 or ryang < 1 or ryang > 10000 then
+								rres = "bad_args"
+							elseif game.set_event_flag == nil then
+								rres = "failed"
+							else
+								game.set_event_flag("mob_exp", rexp)
+								game.set_event_flag("mob_exp_buyer", rexp)
+								game.set_event_flag("mob_item", rdrop)
+								game.set_event_flag("mob_item_buyer", rdrop)
+								game.set_event_flag("mob_gold", ryang)
+								game.set_event_flag("mob_gold_buyer", ryang)
+							end
+							-- Out of pending in one statement, like the sweep: a
+							-- second core doing the same changes nothing.
+							wa_query("UPDATE player.web_admin_queue SET status='" .. rres .. "' WHERE id=" .. rqid .. " AND status='pending' LIMIT 1")
+						end
+					end
+				end
+			end
+
 			-- The thirty seconds are safely longer than the seven the
 			-- panel waits, so this never races it: by the time a row is
 			-- old enough to be swept, the panel has long since either
 			-- been answered or taken the row away with 'cancelled'.
-			local rows = mysql_direct_query("SELECT id FROM player.web_admin_queue WHERE status='pending' AND COALESCE(TIMESTAMPDIFF(SECOND, created, NOW()), 999) >= 30 ORDER BY id ASC LIMIT 5")
+			local rows = wa_query("SELECT id FROM player.web_admin_queue WHERE status='pending' AND COALESCE(TIMESTAMPDIFF(SECOND, created, NOW()), 999) >= 30 ORDER BY id ASC LIMIT 5")
 			if type(rows) ~= "table" then
 				return
 			end
@@ -449,7 +538,7 @@ quest web_admin begin
 						-- finished result, or the panel's 'cancelled'.
 						-- Two cores doing this at once is harmless -- the
 						-- second changes nothing.
-						mysql_direct_query("UPDATE player.web_admin_queue SET status='player_offline' WHERE id=" .. qid .. " AND status='pending' LIMIT 1")
+						wa_query("UPDATE player.web_admin_queue SET status='player_offline' WHERE id=" .. qid .. " AND status='pending' LIMIT 1")
 					end
 				end
 			end

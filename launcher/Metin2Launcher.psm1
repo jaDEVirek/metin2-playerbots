@@ -4,19 +4,47 @@ $ErrorActionPreference = 'Stop'
 # Fallback used when the manifest carries no support block (offline, or an old manifest).
 $script:M2_DEFAULT_SUPPORT_CONTACT = 'https://discord.gg/pt5tvnrN6'
 
+function Get-M2SiblingClientExecutable {
+    # The full package (Metin2-Singleplayer-<version>.zip) unpacks as Klient\
+    # beside Serwer\; a launcher that finds the client there asks nobody for
+    # it. Empty when there is no such folder.
+    param([Parameter(Mandatory = $true)][string]$ServerRoot)
+    $parent = Split-Path -Parent ([IO.Path]::GetFullPath($ServerRoot).TrimEnd('\'))
+    if (-not $parent) { return '' }
+    foreach ($folder in @('Klient', 'Client')) {
+        $candidate = Join-Path $parent "$folder\metin2client.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return [IO.Path]::GetFullPath($candidate) }
+    }
+    return ''
+}
+
 function Get-M2DefaultLauncherConfig {
     param([Parameter(Mandatory = $true)][string]$ServerRoot)
 
+    # The mt2009 line has its own manifest: an update meant for one engine
+    # dropped onto the other's tree would put ENGINE, world.sql and eighty
+    # engine files where they do not belong, and the launcher would then
+    # refuse to start the world it had.
+    $manifest = 'https://raw.githubusercontent.com/TieruYT/metin2-playerbots/main/update-manifest.json'
+    if ((Get-M2ServerEngine -ServerRoot $ServerRoot) -eq 'mt2009') {
+        $manifest = 'https://raw.githubusercontent.com/TieruYT/metin2-playerbots/main/update-manifest-mt2009.json'
+    }
+    $sibling = Get-M2SiblingClientExecutable -ServerRoot $ServerRoot
     [pscustomobject]@{
         schema = 1
-        manifestUrl = 'https://raw.githubusercontent.com/TieruYT/metin2-playerbots/main/update-manifest.json'
-        clientRoot = ''
-        clientExecutable = ''
+        manifestUrl = $manifest
+        clientRoot = $(if ($sibling) { Split-Path -Parent $sibling } else { '' })
+        clientExecutable = $sibling
         supportUploadUrl = ''
         # Interface language: 'pl' or 'en'. More and more of the Discord is
         # English-speaking, and a launcher nobody can read is a launcher nobody
         # runs correctly.
         language = 'pl'
+        # Whether PLAY starts the game client as well as the server. On by
+        # default, because that is what the button has always done and what
+        # most people want; an operator who only keeps the world running for
+        # other people turns it off and stops having a client open itself.
+        launchClientOnPlay = $true
         serverRoot = [IO.Path]::GetFullPath($ServerRoot)
     }
 }
@@ -38,6 +66,21 @@ function Get-M2LauncherConfig {
             $defaults.$name = [string]$loaded.$name
         }
     }
+    # Its own line, because the loop above casts to [string] and "False" is a
+    # non-empty string - every config would then read as "yes, start it".
+    if ($null -ne $loaded.PSObject.Properties['launchClientOnPlay']) {
+        $defaults.launchClientOnPlay = [bool]$loaded.launchClientOnPlay
+    }
+    # A config saved before the client was unpacked beside the server, or
+    # pointing at a client that has since moved, still gets the sibling.
+    if (-not [string]$defaults.clientExecutable -or
+        -not (Test-Path -LiteralPath ([string]$defaults.clientExecutable) -PathType Leaf)) {
+        $sibling = Get-M2SiblingClientExecutable -ServerRoot $ServerRoot
+        if ($sibling) {
+            $defaults.clientExecutable = $sibling
+            $defaults.clientRoot = Split-Path -Parent $sibling
+        }
+    }
     return $defaults
 }
 
@@ -47,7 +90,7 @@ function Save-M2LauncherConfig {
         [Parameter(Mandatory = $true)][string]$ConfigPath
     )
 
-    $Config | Select-Object schema, manifestUrl, clientRoot, clientExecutable, supportUploadUrl, language |
+    $Config | Select-Object schema, manifestUrl, clientRoot, clientExecutable, supportUploadUrl, language, launchClientOnPlay |
         ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
 }
 
@@ -97,6 +140,33 @@ function Get-M2UpdateManifest {
     $uri = $null
     if (-not [Uri]::TryCreate($Source, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne 'https') {
         throw 'Manifest musi być lokalnym plikiem albo adresem HTTPS.'
+    }
+    # raw.githubusercontent.com is a CDN with a five-minute cache
+    # (Cache-Control: max-age=300), and for a while after a release it hands
+    # out the previous manifest: measured five minutes after 2.0.8 was pushed,
+    # "Masz juz najnowsza wersje (2.0.7)" from a launcher that had just read
+    # it. The contents API answers from the repository itself (its cache is a
+    # minute), so for the repository's own manifest it is asked first, with
+    # the raw URL as the fallback - the API's anonymous budget is sixty
+    # requests an hour per address, and a session reads the manifest once.
+    $apiUri = $null
+    if ($uri.Host -eq 'raw.githubusercontent.com') {
+        $parts = $uri.AbsolutePath.Trim('/') -split '/', 4
+        if ($parts.Count -eq 4) {
+            [void][Uri]::TryCreate(('https://api.github.com/repos/{0}/{1}/contents/{3}?ref={2}' -f $parts[0], $parts[1], $parts[2], $parts[3]),
+                [UriKind]::Absolute, [ref]$apiUri)
+        }
+    }
+    if ($null -ne $apiUri) {
+        try {
+            $response = Invoke-WebRequest -Uri $apiUri -Method Get -UseBasicParsing -TimeoutSec $TimeoutSec `
+                -Headers @{ Accept = 'application/vnd.github.raw+json'; 'User-Agent' = 'metin2-playerbots-launcher' }
+            $text = [string]$response.Content
+            if ($text.TrimStart().StartsWith('{')) {
+                return ConvertFrom-M2ManifestText -Text $text -Origin ([string]$apiUri)
+            }
+        }
+        catch { }
     }
     try {
         # Invoke-WebRequest, not Invoke-RestMethod: the REST variant parses for
@@ -174,6 +244,58 @@ function New-M2AntivirusError {
         'Dodaj katalog serwera do wykluczen w Zabezpieczeniach Windows (Ochrona przed ' +
         'wirusami > Zarzadzaj ustawieniami > Wykluczenia) albo przeslij ten log, ' +
         'zebysmy zobaczyli, o ktory plik chodzi.')
+}
+
+function Get-M2FolderProcesses {
+    # Nazwy programow uruchomionych z tego folderu (albo z jego podfolderow).
+    # Windows nie pozwala nadpisac pliku .exe dzialajacego programu, a mowi
+    # o tym dopiero przy kopiowaniu - po pobraniu calej paczki.
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    $names = @()
+    try {
+        $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+        foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
+            $path = $null
+            try { $path = $process.Path } catch { }
+            if ($path -and $path.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+                $names += $process.Name
+            }
+        }
+    }
+    catch { }
+    return @($names | Select-Object -Unique)
+}
+
+function Test-M2FileInUse {
+    # "Proces nie moze uzyskac dostepu do pliku, poniewaz jest on uzywany przez
+    # inny proces": ERROR_SHARING_VIOLATION albo ERROR_LOCK_VIOLATION, jako
+    # IOException gdzies w lancuchu wyjatkow (jak przy Test-M2AccessDenied).
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    $exception = $ErrorRecord.Exception
+    while ($exception) {
+        if ($exception.HResult -eq -2147024864 -or $exception.HResult -eq -2147024863) { return $true }
+        $exception = $exception.InnerException
+    }
+    return $false
+}
+
+function New-M2FileInUseError {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Root
+    )
+
+    $holders = @(Get-M2FolderProcesses -Root $Root)
+    $lines = @()
+    $lines += "Plik jest teraz uzywany przez uruchomiony program: $Path"
+    if ($holders.Count -gt 0) {
+        $lines += "Z tego folderu dziala: $($holders -join ', ')."
+    }
+    $lines += 'Zamknij gre (sprawdz tez Menedzer zadan, czy metin2client.exe nie zostal w tle) i kliknij ZAINSTALUJ AKTUALIZACJE jeszcze raz.'
+    $lines += 'Nic nie zostalo zmienione - poprzednia wersja dziala dalej.'
+    return ($lines -join [Environment]::NewLine)
 }
 
 function Test-M2AccessDenied {
@@ -314,14 +436,27 @@ function Get-M2Download {
     if (-not [Uri]::TryCreate($Source, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne 'https') {
         throw 'Pakiet aktualizacji musi pochodzić z lokalnego pliku albo adresu HTTPS.'
     }
-    try {
-        Invoke-WebRequest -Uri $uri -OutFile $Destination -UseBasicParsing -TimeoutSec 300
-    }
-    catch {
-        if (Test-M2AntivirusBlock -ErrorRecord $_) {
-            throw (New-M2AntivirusError -Path $Destination -ErrorRecord $_)
+    # Three attempts: a release asset on GitHub answered "(500) Wewnetrzny
+    # blad serwera" and "Polaczenie zostalo nieoczekiwanie zakonczone" a
+    # second into the download, twice in two minutes, and served the same
+    # file minutes later (Hiob, 17 September). One request, one failure was
+    # the whole update. An antivirus block is raised at once - it does not
+    # mend itself.
+    $attempts = 3
+    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+        try {
+            Invoke-WebRequest -Uri $uri -OutFile $Destination -UseBasicParsing -TimeoutSec 300
+            return
         }
-        throw
+        catch {
+            if (Test-M2AntivirusBlock -ErrorRecord $_) {
+                throw (New-M2AntivirusError -Path $Destination -ErrorRecord $_)
+            }
+            if ($attempt -ge $attempts) { throw }
+            Write-Warning ('Pobieranie nie powiodlo sie (proba ' + $attempt + ' z ' + $attempts + '): ' + $_.Exception.Message + ' - ponawiam za 5 s.')
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+        }
     }
 }
 
@@ -384,7 +519,9 @@ function Test-M2ProtectedPath {
         'linux-port\docker\.env',
         '.m2launcher.json',
         '.m2launcher-state.json',
-        '.m2install.json'
+        '.m2install.json',
+        # COOP: the friends' accounts and passwords, the hosting state.
+        '.m2coop.json'
     )
     foreach ($protectedFile in $protectedFiles) {
         if ($path.Equals($protectedFile, [StringComparison]::OrdinalIgnoreCase)) {
@@ -426,11 +563,14 @@ function Invoke-M2PackageUpdate {
     New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
 
     try {
+        $downloadWatch = [Diagnostics.Stopwatch]::StartNew()
         Get-M2Download -Source $url -Destination $download
         $actualHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToUpperInvariant()
         if ($actualHash -ne $expectedHash) {
             throw "Błędna suma SHA-256. Oczekiwano $expectedHash, otrzymano $actualHash."
         }
+        $downloadMb = [Math]::Round((Get-Item -LiteralPath $download).Length / 1MB, 1)
+        Write-Host ("[faza] pakiet pobrany i sprawdzony: {0} MB w {1} s" -f $downloadMb, [int]$downloadWatch.Elapsed.TotalSeconds) -ForegroundColor DarkCyan
 
         Expand-M2SafeZip -ArchivePath $download -Destination $expanded
         $files = @(Get-ChildItem -LiteralPath $expanded -Recurse -File -Force)
@@ -481,6 +621,12 @@ function Invoke-M2PackageUpdate {
                 catch {
                     if (Test-M2AntivirusBlock -ErrorRecord $_) {
                         throw (New-M2AntivirusError -Path $change.Relative -ErrorRecord $_)
+                    }
+                    # The game still running from this folder: its exe cannot be
+                    # replaced, and Windows says so only here (Ratorex, 18
+                    # September - five tries, each after a 65 MB download).
+                    if (Test-M2FileInUse -ErrorRecord $_) {
+                        throw (New-M2FileInUseError -Path $change.Destination -Root $target)
                     }
                     if (-not (Test-M2AccessDenied -ErrorRecord $_)) { throw }
                     # One repair is worth trying before this is called a failure:
@@ -544,6 +690,12 @@ function Invoke-M2EnginePatches {
         adding a patch must not mean editing this function.
     #>
     param([Parameter(Mandatory = $true)][string]$ServerRoot)
+
+    # The patches are r40250's. The mt2009 tree ships already ported and
+    # patched (linux-port-mt2009/port/*.py did that where the engine source
+    # is), and a hunk written for r40250's char.cpp has nothing to match in
+    # it; the staged files themselves travel in the update instead.
+    if ((Get-M2ServerEngine -ServerRoot $ServerRoot) -ne 'r40250') { return 0 }
 
     $patchDir = Join-Path $ServerRoot 'linux-port\overlays\playerbot\patches'
     $target = Join-Path $ServerRoot 'linux-port\docker\game\src\server'
@@ -755,7 +907,12 @@ function Sync-M2PlayerbotOverlay {
     # the container reads.
     $seedSource = Join-Path $ServerRoot 'linux-port\overlays\playerbot\sql\playerbots_seed.sql'
     $seedStaged = Join-Path $ServerRoot 'linux-port\docker\mariadb\playerbot\playerbots_seed.sql'
-    if ((Test-Path -LiteralPath $seedSource -PathType Leaf) -and
+    if ((Get-M2ServerEngine -ServerRoot $ServerRoot) -ne 'r40250') {
+        # mt2009's seed is rendered from the overlay's by port/seedify.py and
+        # ships where the migrate container mounts it; the overlay's own would
+        # write columns this schema does not have. Nothing to copy over it.
+    }
+    elseif ((Test-Path -LiteralPath $seedSource -PathType Leaf) -and
         (Test-Path -LiteralPath (Split-Path -Parent $seedStaged) -PathType Container)) {
         $seedStagedHash = $null
         if (Test-Path -LiteralPath $seedStaged -PathType Leaf) {
@@ -973,6 +1130,23 @@ function New-M2SupportBundle {
             Invoke-M2CapturedCommand -OutputPath (Join-Path $work 'compose-logs.txt') -Command {
                 docker compose --project-directory $composeDir -f $composeFile logs --no-color --tail 800
             }
+            # The game container on its own, with a window of its own: the
+            # shared 800 lines were fifty seconds of watchdog and MariaDB
+            # "Aborted connection" chatter on a world whose core was dying
+            # every ninety seconds, and the one line that mattered - the
+            # supervisor's CORE DIED with the backtrace under it - had
+            # scrolled out before the bundle was made.
+            Invoke-M2CapturedCommand -OutputPath (Join-Path $work 'game-container-logs.txt') -Command {
+                docker compose --project-directory $composeDir -f $composeFile logs --no-color --tail 6000 game
+            }
+            # Filtered on the PowerShell side: 2.0.11 piped this through grep,
+            # which Windows PowerShell does not have, and every bundle carried
+            # a CommandNotFoundException where the supervisor's lines belonged.
+            Invoke-M2CapturedCommand -OutputPath (Join-Path $work 'game-supervise.txt') -Command {
+                docker compose --project-directory $composeDir -f $composeFile logs --no-color --tail 200000 game 2>&1 |
+                    Select-String -Pattern 'supervise', 'CORE DIED', 'fatal signal', 'crash' -SimpleMatch |
+                    Select-Object -Last 400 | ForEach-Object { $_.Line }
+            }
             # The core's syslog never reaches the container log - only syserr
             # does - so a bundle sent about "the bots walk to the wrong portal"
             # carried nothing about where any bot was going. The travel,
@@ -986,13 +1160,72 @@ function New-M2SupportBundle {
             # holds, so the first embedded quote ended the argument and the
             # file came back empty on the machine it was made for (1.30.40).
             # Hence -e per pattern instead of one quoted alternation.
-            Invoke-M2CapturedCommand -OutputPath (Join-Path $work 'playerbot-syslog.txt') -Command {
-                docker compose --project-directory $composeDir -f $composeFile exec -T game sh -c `
-                    'for f in /opt/metin2/var/channel1/game1/log/*/syslog.* /opt/metin2/var/channel1/game1/syslog; do [ -f $f ] && tail -n 400000 $f; done 2>/dev/null | grep -a -e PLAYERBOT_WORLD -e PLAYERBOT_PORTAL -e PLAYERBOT_NAV -e PLAYERBOT_WATCHDOG -e PLAYERBOT_GOAL -e PLAYERBOT_LOAD -e PLAYERBOT_SHOP -e PLAYERBOT_TOWN -e PLAYERBOT_DEPARTURE -e PLAYERBOT_HORSE -e PLAYERBOT_MONKEY -e PLAYERBOT_AUTH -e autospawn | tail -n 60000'
+            # Every core, not game1 alone. Since 2.0.8 Shinsoo lives on `first'
+            # and Jinno on `game2', and a bundle about "the bots stand at level
+            # five" carried nothing about the two cores they stood on. One file
+            # per core, and the crash traces m2-supervise keeps beside the
+            # syserr (crash-<stamp>.txt, 2.0.8) - the only way to see where a
+            # player's core died.
+            # The second channel's cores too, when the server has run one
+            # (M2_PLAYERBOT_CH2): their files are named ch2-<core>.
+            $coreKeys = @('first', 'game1', 'game2')
+            # A command that prints nothing gives $null, and [string] of that
+            # is $null too in Windows PowerShell 5.1 - so .Trim() on it threw
+            # "You cannot call a method on a null-valued expression" and the
+            # whole bundle failed on every server without a second channel
+            # (2.0.76: archonek, Urtopy). Joined and asked, never called.
+            $ch2Probe = $null
+            try { $ch2Probe = docker compose --project-directory $composeDir -f $composeFile exec -T game sh -c 'ls /opt/metin2/var/channel2/game1/syslog 2>/dev/null' } catch { $ch2Probe = $null }
+            if (-not [string]::IsNullOrWhiteSpace([string](@($ch2Probe) -join ''))) { $coreKeys += @('ch2-first', 'ch2-game1', 'ch2-game2') }
+            foreach ($core in $coreKeys) {
+                $coreDir = '/opt/metin2/var/channel1/' + $core
+                if ($core -like 'ch2-*') { $coreDir = '/opt/metin2/var/channel2/' + $core.Substring(4) }
+                Invoke-M2CapturedCommand -OutputPath (Join-Path $work ('playerbot-syslog-' + $core + '.txt')) -Command {
+                    docker compose --project-directory $composeDir -f $composeFile exec -T game sh -c `
+                        ('for f in ' + $coreDir + '/log/*/syslog.* ' + $coreDir + '/syslog; do [ -f $f ] && tail -n 400000 $f; done 2>/dev/null | grep -a -e PLAYERBOT_WORLD -e PLAYERBOT_PORTAL -e PLAYERBOT_NAV -e PLAYERBOT_WATCHDOG -e PLAYERBOT_GOAL -e PLAYERBOT_LOAD -e PLAYERBOT_SHOP -e PLAYERBOT_TOWN -e PLAYERBOT_DEPARTURE -e PLAYERBOT_HORSE -e PLAYERBOT_MONKEY -e PLAYERBOT_AUTH -e PLAYERBOT_CHANNEL -e PLAYERBOT_SERVICE -e PLAYERBOT_CONFIG -e PLAYERBOT_EVENT -e PLAYERBOT_LIFE -e PLAYERBOT_CHEST -e PLAYERBOT_COMBAT -e PLAYERBOT_STOCK -e PLAYERBOT_GUILD -e PLAYERBOT_TOWER -e PLAYERBOT_ISHOP -e PLAYERBOT_OFFLINE -e PLAYERBOT_MARKET -e PLAYERBOT_BAG -e INVENTORY_ARRANGE -e PLAYERBOT_AI -e PLAYERBOT_ECONOMY -e PLAYERBOT_PVP -e PLAYERBOT_LOOT -e PLAYERBOT_MOOD -e PLAYERBOT_PERSONA -e PLAYERBOT_ANTIPK -e PLAYERBOT_MERC -e PLAYERBOT_LPP -e PLAYERBOT_PARTY:.accepted -e PLAYERBOT_PARTY:.asked -e PLAYERBOT_LURE:.order -e PLAYERBOT_LURE:.pack.handed -e PLAYERBOT_LURE:.waiting -e QUEST_ITEM -e GMPANEL -e GM_PROFILE -e autospawn | tail -n 40000')
+                }
+                Invoke-M2CapturedCommand -OutputPath (Join-Path $work ('syserr-' + $core + '.txt')) -Command {
+                    docker compose --project-directory $composeDir -f $composeFile exec -T game sh -c `
+                        ('tail -n 3000 ' + $coreDir + '/syserr 2>/dev/null')
+                }
+                Invoke-M2CapturedCommand -OutputPath (Join-Path $work ('playerbot-status-' + $core + '.tsv')) -Command {
+                    docker compose --project-directory $composeDir -f $composeFile exec -T game sh -c `
+                        ('cat ' + $coreDir + '/playerbot_status.tsv 2>/dev/null')
+                }
+                Invoke-M2CapturedCommand -OutputPath (Join-Path $work ('crash-' + $core + '.txt')) -Command {
+                    docker compose --project-directory $composeDir -f $composeFile exec -T game sh -c `
+                        ('ls -la ' + $coreDir + '/crash*.txt 2>/dev/null; for f in $(ls -t ' + $coreDir + '/crash*.txt 2>/dev/null | head -n 5); do echo; echo === $f; cat $f; done')
+                }
+                # A player's login lands on a channel core: the key it brought,
+                # what the db core answered, and a FULL or ALREADY refusal are
+                # all syslog lines, and none of the patterns above matched them.
+                # "Wisi na ekranie logowania" (sizowski, 2.0.11) could not be read
+                # from a bundle without these.
+                Invoke-M2CapturedCommand -OutputPath (Join-Path $work ('login-' + $core + '.txt')) -Command {
+                    docker compose --project-directory $composeDir -f $composeFile exec -T game sh -c `
+                        ('for f in ' + $coreDir + '/log/*/syslog.* ' + $coreDir + '/syslog; do [ -f $f ] && tail -n 400000 $f; done 2>/dev/null | grep -a -e LOGIN -e Login -e login -e AUTH -e CHANNEL_STATUS -e P2P -e ALREADY -e FULL | grep -a -v -e PLAYERBOT_AUTH -e playerbot_ | tail -n 2000')
+                }
             }
-            Invoke-M2CapturedCommand -OutputPath (Join-Path $work 'playerbot-status.tsv') -Command {
+            # The auth core answers the client's first screen. Its syserr and
+            # every login it handled, because "Logowanie..." that never ends
+            # is decided here or in the db core, and 2.0.11 collected neither.
+            Invoke-M2CapturedCommand -OutputPath (Join-Path $work 'syserr-auth.txt') -Command {
                 docker compose --project-directory $composeDir -f $composeFile exec -T game sh -c `
-                    'cat /opt/metin2/var/channel1/game1/playerbot_status.tsv 2>/dev/null'
+                    'tail -n 2000 /opt/metin2/var/auth/syserr 2>/dev/null'
+            }
+            Invoke-M2CapturedCommand -OutputPath (Join-Path $work 'login-auth.txt') -Command {
+                docker compose --project-directory $composeDir -f $composeFile exec -T game sh -c `
+                    'for f in /opt/metin2/var/auth/log/*/syslog.* /opt/metin2/var/auth/syslog; do [ -f $f ] && tail -n 200000 $f; done 2>/dev/null | grep -a -v -e playerbot_ -e PLAYERBOT_ | tail -n 2000'
+            }
+            Invoke-M2CapturedCommand -OutputPath (Join-Path $work 'login-db.txt') -Command {
+                docker compose --project-directory $composeDir -f $composeFile exec -T game sh -c `
+                    'for f in /opt/metin2/var/db/log/*/syslog.* /opt/metin2/var/db/syslog; do [ -f $f ] && tail -n 400000 $f; done 2>/dev/null | grep -a -e LOGIN -e Login -e login -e AUTH -e ALREADY -e KEY -e PLAYER_LOAD | grep -a -v -e playerbot_ | tail -n 2000'
+            }
+            # The db core writes its own syserr (a failed query, a table the
+            # game asked for and the schema lacks).
+            Invoke-M2CapturedCommand -OutputPath (Join-Path $work 'syserr-db.txt') -Command {
+                docker compose --project-directory $composeDir -f $composeFile exec -T game sh -c `
+                    'tail -n 1000 /opt/metin2/var/db/syserr 2>/dev/null'
             }
             Invoke-M2CapturedCommand -OutputPath (Join-Path $work 'compose-services.txt') -Command {
                 docker compose --project-directory $composeDir -f $composeFile config --services
@@ -1010,6 +1243,19 @@ function New-M2SupportBundle {
                     $safeLog = Protect-M2LogContent -Text (Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue)
                     [IO.File]::WriteAllText((Join-Path $logOutput $_.Name), $safeLog, [Text.UTF8Encoding]::new($false))
                 }
+        }
+
+        # Konfiguracja launchera, przepuszczona przez ten sam filtr co logi.
+        #
+        # Bez niej nie wiadomo, z ktorego manifestu ten launcher czyta - a linie
+        # 1.x i mt2009 maja osobne. Gdy SIZOWSKI zglosil, ze nie moze
+        # zainstalowac aktualizacji, bundle nie niosl tego pliku i trzeba bylo
+        # zgadywac miedzy dwiema przyczynami, ktore wygladaja w logu identycznie:
+        # zly adres manifestu i manifest, ktorego nikt nie przestawil.
+        $launcherConfig = Join-Path $root '.m2launcher.json'
+        if (Test-Path -LiteralPath $launcherConfig -PathType Leaf) {
+            $safeConfig = Protect-M2LogContent -Text (Get-Content -LiteralPath $launcherConfig -Raw -ErrorAction SilentlyContinue)
+            [IO.File]::WriteAllText((Join-Path $work 'launcher-config-redacted.json'), $safeConfig, [Text.UTF8Encoding]::new($false))
         }
 
         Compress-Archive -Path (Join-Path $work '*') -DestinationPath $zip -CompressionLevel Optimal -Force
@@ -1219,6 +1465,89 @@ function Get-M2DbDataVolumes {
     finally { $ErrorActionPreference = $previous }
 }
 
+function Get-M2ServerEngine {
+    <#
+        Which engine the tree under linux-port\docker was built for. 'r40250'
+        is the original port; the mt2009 tree (linux-port-mt2009 in the
+        repository, deployed under the same linux-port name so that every
+        path in the launcher stays one path) carries an ENGINE file naming
+        itself. Everything engine-specific asks here: which dumps make a
+        world, whether the r40250 engine patches are applied, what a complete
+        build context holds.
+    #>
+    param([Parameter(Mandatory = $true)][string]$ServerRoot)
+    $marker = Join-Path $ServerRoot 'linux-port\docker\ENGINE'
+    if (Test-Path -LiteralPath $marker -PathType Leaf) {
+        $engine = ([IO.File]::ReadAllText($marker)).Trim().ToLowerInvariant()
+        if ($engine -match '^[a-z0-9]+$') { return $engine }
+    }
+    return 'r40250'
+}
+
+function Get-M2RequiredSqlDumps {
+    # The per-database dumps MariaDB imports on its first start. r40250's
+    # package ships hotbackup (legitimately empty); mt2009's keeps the protos
+    # in a sixth database, world, and has no hotbackup dump at all.
+    param([Parameter(Mandatory = $true)][string]$Engine)
+    if ($Engine -eq 'mt2009') { return @('account', 'common', 'player', 'log', 'world') }
+    return @('account', 'common', 'player', 'log', 'hotbackup')
+}
+
+function Restore-M2EmptyGameContextDirs {
+    # The build inputs that are empty directories on every install of both
+    # lines, and are therefore the most fragile thing a package can carry:
+    # git cannot track an empty directory at all, a zip holds it as a bare
+    # entry (twelve of them in the whole full package) and more than one
+    # extraction tool drops those. The game Dockerfile COPYs
+    # src/serverfiles/share/package all the same, so without it the build dies
+    # at "failed to compute cache key" - and until now the launcher refused
+    # first and told the player to re-run the r40250 installer, which on the
+    # 2.x line is a package they have never had (dekri, 20 September).
+    # Nothing is ever in these, so make them rather than demand them.
+    param([Parameter(Mandatory = $true)][string]$ServerRoot)
+    $made = @()
+    foreach ($rel in @('linux-port\docker\game\src\serverfiles\share\package')) {
+        $full = Join-Path $ServerRoot $rel
+        if (Test-Path -LiteralPath $full) { continue }
+        try {
+            New-Item -ItemType Directory -Path $full -Force -ErrorAction Stop | Out-Null
+            $made += $rel
+        } catch {
+            # A folder we cannot create is a folder the check below will name,
+            # which is the honest outcome.
+        }
+    }
+    return $made
+}
+
+function Get-M2RequiredGameContext {
+    # What linux-port\docker\game\src has to hold for the image to build,
+    # relative to it: the modules the Dockerfile COPYs and the share
+    # directories. mt2009 keeps its protos in the database, so it has no
+    # share\conf, and its dependency script sits one level up, in game\.
+    param([Parameter(Mandatory = $true)][string]$ServerRoot)
+    if ((Get-M2ServerEngine -ServerRoot $ServerRoot) -eq 'mt2009') {
+        return @(
+            '..\build-deps-mt2009.sh', 'extern\include', 'extern\cryptopp', 'extern-tarballs',
+            'server\__REVISION__',
+            'server\common', 'server\db', 'server\game', 'server\libgame',
+            'server\liblua', 'server\libpoly', 'server\libsql', 'server\libthecore',
+            'serverfiles\share\CMD', 'serverfiles\share\data',
+            'serverfiles\share\locale', 'serverfiles\share\package',
+            'serverfiles\mark-default'
+        )
+    }
+    return @(
+        'build-deps-40250.sh', 'extern',
+        'server\common', 'server\db', 'server\game', 'server\libgame',
+        'server\liblua', 'server\libpoly', 'server\libserverkey',
+        'server\libsql', 'server\libthecore',
+        'serverfiles\share\conf', 'serverfiles\share\data',
+        'serverfiles\share\locale', 'serverfiles\share\package',
+        'serverfiles\mark-default'
+    )
+}
+
 function Get-M2MissingSqlDumps {
     # The five SQL dumps MariaDB imports on its very first start. They come out
     # of the operator's own r40250 package (Server/metin2_mysql_dump.zip) and
@@ -1230,7 +1559,8 @@ function Get-M2MissingSqlDumps {
     param([Parameter(Mandatory = $true)][string]$ServerRoot)
     $dumpDir = Join-Path $ServerRoot 'linux-port\docker\mariadb\initdb.d\dumps'
     $missing = @()
-    foreach ($db in @('account', 'common', 'player', 'log', 'hotbackup')) {
+    $engine = Get-M2ServerEngine -ServerRoot $ServerRoot
+    foreach ($db in (Get-M2RequiredSqlDumps -Engine $engine)) {
         $f = Join-Path $dumpDir "$db.sql"
         if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { $missing += "$db.sql"; continue }
         # hotbackup is legitimately empty (its Readme says so); the rest carry
@@ -1572,7 +1902,16 @@ function New-M2DatabaseBackup {
 
         $zip = Join-Path $BackupRoot ($name + '.zip')
         if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-        Compress-Archive -Path (Join-Path $dir '*') -DestinationPath $zip -CompressionLevel Optimal
+        # Not Compress-Archive: in Windows PowerShell 5.1 it holds every entry
+        # in a MemoryStream, which stops at 2 GB, and a world whose log.sql had
+        # grown past that failed its backup with "Stream was too long". The
+        # backup comes before anything is deleted, so every reset of such a
+        # world was refused - three tries in a day for uxietoszef (18
+        # September), the world untouched each time. CreateFromDirectory
+        # writes each file straight into the zip, the same layout as before.
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($dir, $zip,
+            [System.IO.Compression.CompressionLevel]::Optimal, $false)
         return [pscustomobject]@{
             Folder   = $dir
             Zip      = $zip
@@ -1714,9 +2053,22 @@ function Reset-M2WorldToFreshInstall {
     }
     $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     try {
+        # A stopped container still holds its volume. The launcher stops the
+        # stack with `compose stop', which leaves every container in place, so
+        # `volume rm' answered "volume is in use" on a server that was
+        # perfectly stopped - four times in a row for one player, each time
+        # "czy serwer na pewno jest zatrzymany?" (NieBijOddam, 13 September).
+        # Remove whatever references the volume first; `compose up' recreates
+        # the containers on the next start, the way it does after an update.
+        $holders = @(& docker ps -a -q --filter "volume=$Volume" 2>$null | Where-Object { $_ })
+        foreach ($id in $holders) {
+            & docker rm -f $id 1>$null 2>$null
+        }
         & docker volume rm -f $Volume 1>$null 2>$null
         if ($LASTEXITCODE -ne 0) {
-            throw "Nie udalo sie usunac wolumenu '$Volume' - czy serwer na pewno jest zatrzymany?"
+            $still = @(& docker ps -a --filter "volume=$Volume" --format '{{.Names}} ({{.Status}})' 2>$null | Where-Object { $_ })
+            $who = if ($still.Count -gt 0) { ' Wciaz uzywaja go: ' + ($still -join ', ') + '.' } else { '' }
+            throw ("Nie udalo sie usunac wolumenu '$Volume'.$who Zatrzymaj Docker Desktop, uruchom go ponownie i sprobuj jeszcze raz.")
         }
     }
     finally { $ErrorActionPreference = $previous }
@@ -1746,8 +2098,14 @@ Export-ModuleMember -Function @(
     'Repair-M2GameDbUser',
     'Test-M2VolumeInitialized',
     'Get-M2MissingSqlDumps',
+    'Get-M2ServerEngine',
+    'Get-M2SiblingClientExecutable',
+    'Get-M2RequiredSqlDumps',
+    'Get-M2RequiredGameContext',
+    'Restore-M2EmptyGameContextDirs',
     'Test-M2DockerRunning',
     'Sync-M2PlayerbotOverlay',
     'Set-M2PlayerbotsVersionEnvironment',
-    'Invoke-M2EnginePatches'
+    'Invoke-M2EnginePatches',
+    'Get-M2FolderProcesses'
 )

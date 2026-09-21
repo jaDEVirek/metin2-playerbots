@@ -229,6 +229,27 @@ namespace playerbot_empire_rules
 		}
 	}
 
+	// The operator's own number for each kingdom instead of a share of one
+	// budget (the launcher's "Indywidualne wartosci dla krolestw", Greess).
+	// Each kingdom takes what it was asked for, cut to the identities it has,
+	// and nothing it cannot take is handed to another: the operator named
+	// every number, so a kingdom short of identities is short, not generous.
+	inline void TakeKingdomCounts(const int* asked, const int* registered, int* out)
+	{
+		if (!out)
+			return;
+		for (int e = 0; e < EMPIRE_COUNT; ++e)
+			out[e] = 0;
+		if (!asked || !registered)
+			return;
+		for (int e = EMPIRE_SHINSOO; e <= EMPIRE_JINNO; ++e)
+		{
+			const int want = asked[e] > 0 ? asked[e] : 0;
+			const int have = registered[e] > 0 ? registered[e] : 0;
+			out[e] = want < have ? want : have;
+		}
+	}
+
 	// -------------------------------------------------------------------
 	//  The points a bot walks to, per kingdom
 	// -------------------------------------------------------------------
@@ -290,10 +311,15 @@ namespace playerbot_empire_rules
 
 	// The centre of a village's stall ring: where a keeper opens its counter and
 	// where a shopper looks for one. Chunjo's two are the points the AI has
-	// always used and are left alone - moving a live market is not this change.
-	// The other four are the centroid of that village's own eight service NPCs,
-	// snapped to the nearest standable cell inside the safe zone, so a counter
-	// stands among the shops instead of in the field behind them.
+	// always used, and both stand beside that kingdom's guard (11002) in the
+	// middle of the village's round square. The other four used to be the
+	// centroid of the village's eight service NPCs, which put Jayang's market
+	// among the merchants on the square's edge ("sklepy sa zle rozstawione,
+	// bardziej przy handlarzach niz przy kole, straznik ... na kordach 457,
+	// 630", Tieru, 15 September) and ran Pyongmoo's ring half out of the safe
+	// zone. They are the cell under the kingdom's own guard now - 11000 in
+	// Shinsoo, 11004 in Jinno, read from each map's npc.txt - and server_attr
+	// says the whole ring of 400..1700 round every one is open safe ground.
 	struct TTownPitchRow
 	{
 		long mapIndex;
@@ -303,12 +329,12 @@ namespace playerbot_empire_rules
 	inline bool GetTownPitch(long mapIndex, TPoint& out)
 	{
 		static const TTownPitchRow rows[] = {
-			{ 1,  { 473625, 954925 } },
-			{ 3,  { 353987, 880012 } },
+			{ 1,  { 474325, 954225 } },
+			{ 3,  { 353025, 882325 } },
 			{ 21, { 63400, 166300 } },
 			{ 23, { 145500, 240000 } },
-			{ 41, { 961212, 270162 } },
-			{ 43, { 865500, 244975 } },
+			{ 41, { 959925, 268825 } },
+			{ 43, { 863425, 246025 } },
 		};
 		for (unsigned int i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i)
 		{
@@ -369,6 +395,30 @@ namespace playerbot_empire_rules
 			{ 1,  { 499200, 957000 } },
 			{ 21, { 89800, 182100 } },
 			{ 41, { 950100, 233300 } },
+		};
+		for (unsigned int i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i)
+		{
+			if (rows[i].mapIndex == mapIndex)
+			{
+				out = rows[i].pitch;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Baek-Go, mob 20018 - the herbalist, who is NOT the Biologist above: two
+	// NPCs, both in every first village and nowhere else. His crafting board is
+	// what turns the herbs a bot picks up into potions, so herbalism is an M1
+	// errand exactly like the Biologist's hand-in, and a bot that walks to one
+	// is already standing beside the other. Read off each map's npc.txt through
+	// its own BasePosition (cell * 100 + base), the way the Biologist's row was.
+	inline bool GetHerbalist(long mapIndex, TPoint& out)
+	{
+		static const TTownPitchRow rows[] = {
+			{ 1,  { 479100, 961700 } },
+			{ 21, { 67400, 161400 } },
+			{ 41, { 968100, 266000 } },
 		};
 		for (unsigned int i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i)
 		{
@@ -499,6 +549,51 @@ namespace playerbot_empire_rules
 			case TELEPORT_DESERT: return 63;
 			case TELEPORT_SOHAN: return 61;
 			default: return 0;
+		}
+	}
+
+	// The same three maps from the other side: which destination a shared map
+	// is, so a caller holding a map index can ask the table above for the
+	// arrival of the kingdom it is carrying. Everything else - the two Spider
+	// Dungeons and Hwang - has one entry point for all three kingdoms and is
+	// not in here.
+	inline bool GetFrontierTeleportDestination(long mapIndex, ETeleportDestination& out)
+	{
+		switch (mapIndex)
+		{
+			case 64: out = TELEPORT_ORC_VALLEY; return true;
+			case 63: out = TELEPORT_DESERT; return true;
+			case 61: out = TELEPORT_SOHAN; return true;
+			default: return false;
+		}
+	}
+
+	// Where a kingdom leaves a shared map: its own warp NPC, a few steps from
+	// where that kingdom's characters are put down. npc.txt gives three per
+	// map and they pair with the three Town.txt entries above - the valley and
+	// Sohan number them 10007/10009/10011 for Shinsoo/Chunjo/Jinno and the
+	// desert 10008/10010/10012.
+	//
+	// This is the other half of the arrival table. Until it existed every bot
+	// of every kingdom walked to Chunjo's gate to go home, which on the far
+	// side of the valley is a seventy-kilometre crossing of hostile ground -
+	// and arrived through Chunjo's entrance in the first place ("wszystkie boty
+	// po wejsciu do doliny, nie zaleznie od krolestwa, wchodza w miejscu
+	// wejscia zoltych", SIZOWSKI, 13 September).
+	inline bool GetFrontierGate(int empire, long mapIndex, TPoint& out)
+	{
+		if (empire < EMPIRE_SHINSOO || empire > EMPIRE_JINNO)
+			return false;
+		// [map][empire - 1]
+		static const TPoint valley[3] = { { 403200, 672900 }, { 269100, 740200 }, { 320000, 809200 } };
+		static const TPoint desert[3] = { { 215700, 629000 }, { 219700, 499900 }, { 344000, 500000 } };
+		static const TPoint sohan[3]  = { { 433600, 295100 }, { 374000, 181900 }, { 497600, 168800 } };
+		switch (mapIndex)
+		{
+			case 64: out = valley[empire - 1]; return true;
+			case 63: out = desert[empire - 1]; return true;
+			case 61: out = sohan[empire - 1]; return true;
+			default: return false;
 		}
 	}
 

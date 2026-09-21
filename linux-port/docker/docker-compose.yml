@@ -197,6 +197,10 @@ services:
       # Single authoritative startup switch (implemented by the bot manager).
       # Keep the existing 350-bot world by default; lower this in .env for tests.
       PLAYERBOT_AUTOSPAWN_COUNT: "${PLAYERBOT_AUTOSPAWN_COUNT:-350}"
+      # 0 keeps Shinsoo and Jinno from being started even when the seed once
+      # registered them (the migrate service reads the same switch for the
+      # seed itself).
+      M2_PLAYERBOT_KINGDOMS: "${M2_PLAYERBOT_KINGDOMS:-0}"
 
       # The Moonlight Treasure Chest event: chances in a thousand that a kill,
       # and that a Metin stone, drops a chest. Zero switches the event off.
@@ -275,6 +279,11 @@ services:
       # Blank on first run means "generate one and print it once".
       M2_PANEL_PASSWORD: "${M2_PANEL_PASSWORD:-}"
       M2_PANEL_PORT: "7788"
+      # The address the panel is published on, and the explicit answer to
+      # "may anybody else reach it": empty lets the panel decide from the
+      # address (loopback = local, no passphrase), 0 or 1 overrides that.
+      M2PANEL_BIND_ADDRESS: "${M2_PANEL_BIND_ADDRESS:-${M2_HOST_BIND_ADDRESS:-0.0.0.0}}"
+      M2PANEL_LOCAL_ONLY: "${M2_PANEL_LOCAL_ONLY:-}"
       M2_PANEL_BIND: "0.0.0.0"
 
       # So the panel can answer "is the game up" by probing the game container
@@ -709,7 +718,7 @@ services:
       PLAYERBOTS_GAME_HOST: game
       PLAYERBOTS_LOGIN_PORT: "11000"
       PLAYERBOTS_WORLD_PORT: "13000"
-      PLAYERBOTS_STATUS_GLOB: "/opt/metin2/var/channel1/*/playerbot_status.tsv"
+      PLAYERBOTS_STATUS_GLOB: "/opt/metin2/var/channel*/*/playerbot_status.tsv"
       # Opened by the visitor's browser, so the address the classic panel is
       # reachable at from outside - not a container name.
       TIERU_PANEL_URL: "${M2_SEBAN_TIERU_PANEL_URL:-http://127.0.0.1:${M2_PANEL_PUBLIC_PORT:-7788}}"
@@ -765,8 +774,15 @@ services:
       - "${M2_PANEL_BIND_ADDRESS:-${M2_HOST_BIND_ADDRESS:-0.0.0.0}}:${M2_ITEMSHOP_PUBLIC_PORT:-7791}:80/tcp"
     networks: [backend]
 
+  # The panel's two helpers run the image the seban-panel service builds.
+  # An older Compose does not know that and tries to pull it from Docker
+  # Hub first - "pull access denied for metin2/seban-panel" - which ended
+  # a start with no such image yet in code 1 (DUDU on a VPS, archonek
+  # updating on Windows, 18 September; Compose 5.5 here never pulls it).
+  # Never pulled: the build in the same `up` makes it before they start.
   seban-collector:
     image: metin2/seban-panel:latest
+    pull_policy: never
     container_name: "${M2_CONTAINER_PREFIX:-metin2}-seban-collector"
     restart: unless-stopped
     command: ["python", "collector.py"]
@@ -782,6 +798,7 @@ services:
 
   seban-item-grants:
     image: metin2/seban-panel:latest
+    pull_policy: never
     container_name: "${M2_CONTAINER_PREFIX:-metin2}-seban-item-grants"
     restart: unless-stopped
     command: ["python", "item_grants.py"]

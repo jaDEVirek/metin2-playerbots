@@ -104,6 +104,128 @@ namespace
 		return finder.Found();
 	}
 
+	// Whether a drop would land in a bag with no free cell: only by merging
+	// into a stack of the same thing, the way the engine's own pickup does
+	// (same vnum, same sockets, room under ITEM_MAX_COUNT).
+	bool PlayerBotLootMergesIntoStack(LPCHARACTER ch, LPITEM item)
+	{
+		if (!ch || !item || !item->IsStackable())
+			return false;
+		for (WORD cell = 0; cell < PLAYERBOT_BAG_CELLS; ++cell)
+		{
+			LPITEM held = ch->GetInventoryItem(cell);
+			if (!held || held->GetVnum() != item->GetVnum() ||
+					held->GetCount() + item->GetCount() > ITEM_MAX_COUNT)
+				continue;
+			bool sameSockets = true;
+			for (int s = 0; s < ITEM_SOCKET_MAX_NUM; ++s)
+				if (held->GetSocket(s) != item->GetSocket(s))
+					sameSockets = false;
+			if (sameSockets)
+				return true;
+		}
+		return false;
+	}
+
+	// Whether the engine's pickup would find this drop a place: a stack of the
+	// same thing to pour it into, or room of its own size - GetEmptyInventoryEx
+	// on mt2009, which also knows the pages a material or a book goes to, and
+	// the item's height on r40250. Yang never needs a cell.
+	bool PlayerBotBagTakesDrop(LPCHARACTER ch, LPITEM item)
+	{
+		if (!ch || !item)
+			return false;
+		if (IsPlayerBotMoneyDrop(item) || PlayerBotLootMergesIntoStack(ch, item))
+			return true;
+#if defined(PLAYERBOT_ENGINE_MT2009)
+		return ch->GetEmptyInventoryEx(item) != -1;
+#else
+		return ch->GetEmptyInventory(item->GetSize()) != -1;
+#endif
+	}
+
+	// A bot past the age of pennies leaves the pennies on the ground.
+	//
+	// Every drop in reach was loot, so a bot of sixty with millions in its
+	// purse ran for a small red potion, a level-ten sword and a handful of
+	// herbs like a bot of ten, and carried them to the merchant for a few
+	// hundred yang ("boty rzucaja sie jak zombie po przedmioty", sizowski).
+	// The operator's rule: once a bot has the level and the yang to be past
+	// it, merchant fodder worth under PLAYERBOT_LOOT_CHOOSY_MAX_VALUE is not
+	// worth a step. Fodder is exactly three things - potions, gear it has
+	// outgrown by PLAYERBOT_LOOT_OUTGROWN_GEAR_LEVELS under
+	// PLAYERBOT_PRECIOUS_REFINE with no prize lines, and the herbs the merchant
+	// takes - so a refine material, a book, a scroll, a chest, a stone, a gear
+	// piece it could still wear and yang are picked up by everybody as before,
+	// and an item with no merchant price counts as unknown, never as cheap.
+	bool IsPlayerBotChoosyLooter(LPCHARACTER ch)
+	{
+		return ch && (int)ch->GetLevel() >= PLAYERBOT_LOOT_CHOOSY_MIN_LEVEL &&
+				(long long)ch->GetGold() >= PLAYERBOT_LOOT_CHOOSY_MIN_GOLD;
+	}
+
+	bool IsPlayerBotLootBeneathBot(LPCHARACTER ch, LPITEM item)
+	{
+		if (!ch || !item || !item->GetProto())
+			return false;
+		// Never the goods a player crafts further, whatever the merchant pays:
+		// a bot of seventy-three walked past Grzyb Tue, Korzen Gango and a
+		// Zbroja Twarzy Ducha+3 on a floor (Tieru, 15 September).
+		if (IsPlayerBotPickupGoods(item))
+			return false;
+		const long long unit = (long long)GetPlayerBotNpcSellUnitPrice(item);
+		if (unit <= 0 || unit * (long long)item->GetCount() >= PLAYERBOT_LOOT_CHOOSY_MAX_VALUE)
+			return false;
+		switch (item->GetType())
+		{
+			case ITEM_USE:
+				return item->GetSubType() == USE_POTION ||
+						item->GetSubType() == USE_POTION_NODELAY;
+			case ITEM_MATERIAL:
+				return IsPlayerBotNonGearMaterial(item->GetVnum());
+			case ITEM_WEAPON:
+			case ITEM_ARMOR:
+			{
+				// Helmets and shields are picked up whatever their merchant price:
+				// the ones of level 21, 41 and 61 are worth more than it says, and a
+				// dungeon floor kept its Upiorna Maska while bots of fifty walked
+				// past (Tieru, 15 September: "tarcze na 21 41 61 poziom czy helmy
+				// ... warto podnosic tak czy siak").
+				if (item->GetType() == ITEM_ARMOR &&
+						(item->GetSubType() == ARMOR_HEAD || item->GetSubType() == ARMOR_SHIELD))
+					return false;
+				if (item->GetRefineLevel() >= PLAYERBOT_PRECIOUS_REFINE ||
+						IsPlayerBotPrizeItem(item) || IsPlayerBotSpecialLevel30Weapon(item))
+					return false;
+				int levelLimit = 0;
+				for (int i = 0; i < ITEM_LIMIT_MAX_NUM; ++i)
+					if (item->GetProto()->aLimits[i].bType == LIMIT_LEVEL)
+						levelLimit = (int)item->GetProto()->aLimits[i].lValue;
+				return levelLimit + PLAYERBOT_LOOT_OUTGROWN_GEAR_LEVELS <= (int)ch->GetLevel();
+			}
+			default:
+				return false;
+		}
+	}
+
+	// What a medal dropper bends down for. Its bag is its counter's stock
+	// already - fifty to seventy of ninety cells - and a Monkey Dungeon floor
+	// filled the rest in two to five minutes: once the dropper was let stay while
+	// a medal had a cell, 28 of 37 visits ended with no cell left and the average
+	// visit lasted under three minutes. It takes the medal, the goods a player
+	// crafts further, a skill book, a Moonlight chest (for its counter,
+	// PLAYERBOT_CHEST_DROPPER_HOLD) and whatever pours into a stack it already
+	// carries; the rest stays on the floor for whoever wants it.
+	bool IsPlayerBotMedalDropperLoot(LPCHARACTER ch, LPITEM item)
+	{
+		if (!ch || !item || !item->GetProto())
+			return false;
+		if (item->GetVnum() == PLAYERBOT_HORSE_MEDAL_VNUM || item->GetType() == ITEM_SKILLBOOK ||
+				item->GetVnum() == PLAYERBOT_MOONLIGHT_CHEST_VNUM || IsPlayerBotPickupGoods(item))
+			return true;
+		return PlayerBotLootMergesIntoStack(ch, item);
+	}
+
 	class CCollectPlayerBotLoot
 	{
 		public:
@@ -111,7 +233,15 @@ namespace
 				m_owner(owner),
 				m_maxDistance(maxDistance),
 				m_failedLoot(failedLoot),
-				m_dwNow(dwNow)
+				m_dwNow(dwNow),
+				// One count for the whole sweep: a full bag is a full bag for
+				// every drop in it.
+				m_bagFull(CountPlayerBotFreeInventoryCells(owner) == 0),
+				m_skippedNoRoom(0),
+				m_choosy(IsPlayerBotChoosyLooter(owner)),
+				m_skippedCheap(0),
+				m_medalDropper(owner && GetPlayerBotPersonalityByPID(owner->GetPlayerID()) ==
+						BOT_PERSONALITY_MEDAL_DROPPER)
 			{
 			}
 
@@ -134,8 +264,38 @@ namespace
 				const int distance = DISTANCE_APPROX(
 						m_owner->GetX() - item->GetX(),
 						m_owner->GetY() - item->GetY());
-				if (distance <= m_maxDistance)
-					m_items.push_back(std::make_pair(distance, item));
+				if (distance > m_maxDistance)
+					return true;
+				// A key of the Demon Tower is the floor's, whoever the bot is
+				// (playerbot_demon_tower.h uses or hands it in).
+				const bool towerKey = IsPlayerBotDemonTowerKey(item->GetVnum());
+				if (!towerKey && m_medalDropper && !IsPlayerBotMedalDropperLoot(m_owner, item))
+					return true;
+				// A cape or a symbol nobody wears (IsPlayerBotLeftOnGroundItem).
+				if (IsPlayerBotLeftOnGroundItem(item->GetVnum()))
+					return true;
+				if (!towerKey && m_choosy && IsPlayerBotLootBeneathBot(m_owner, item))
+				{
+					++m_skippedCheap;
+					return true;
+				}
+				// A drop the bag cannot take is not loot: walking up to it,
+				// announcing the pickup and being refused by the engine every
+				// five seconds is what "mowi ze podnosi lup ale nie robi nic"
+				// was. Counted, so the pass can say so once a minute. And
+				// "cannot take" is the engine's own test for this drop, not a bag
+				// with no cell at all: a bag with single holes and no free column
+				// is refused a sword or a breastplate ("No empty inventory ...
+				// size 2", 7736 times in two hours from 320 bots on the test
+				// world), and the bot stood at the drop asking every five seconds
+				// until the watchdog moved it.
+				if (m_bagFull ? !PlayerBotLootMergesIntoStack(m_owner, item)
+						: !PlayerBotBagTakesDrop(m_owner, item))
+				{
+					++m_skippedNoRoom;
+					return true;
+				}
+				m_items.push_back(std::make_pair(distance, item));
 
 				return true;
 			}
@@ -146,12 +306,19 @@ namespace
 			}
 
 			const std::vector<std::pair<int, LPITEM> >& GetItems() const { return m_items; }
+			int SkippedNoRoom() const { return m_skippedNoRoom; }
+			int SkippedCheap() const { return m_skippedCheap; }
 
 		private:
 			LPCHARACTER m_owner;
 			int m_maxDistance;
 			const std::map<DWORD, DWORD>& m_failedLoot;
 			DWORD m_dwNow;
+			bool m_bagFull;
+			int m_skippedNoRoom;
+			bool m_choosy;
+			int m_skippedCheap;
+			bool m_medalDropper;
 			std::vector<std::pair<int, LPITEM> > m_items;
 	};
 
@@ -238,9 +405,13 @@ namespace
 		const DWORD itemVID = pickup->GetVID();
 		const DWORD itemVnum = pickup->GetVnum();
 		const bool material = pickup->GetType() == ITEM_MATERIAL;
+		// Read before the pickup: a stack that merges is gone after it.
+		const long itemSocket0 = pickup->GetSocket(0);
+		const BYTE itemType = pickup->GetType();
 		state.dwNextLootPickupTime = dwNow + GetPlayerBotLootPickupInterval(pickup);
 		if (ch->PickupItem(itemVID))
 		{
+			NotePlayerBotMoodValuable(ch, itemVnum, itemSocket0, itemType, "pickup");
 			state.mapLootSeenSince.erase(itemVID);
 			if (material)
 				RememberPlayerBotSpotDrop(ch->GetMapIndex(), ch->GetX(), ch->GetY(), itemVnum);
@@ -332,9 +503,25 @@ namespace
 				state.mapFailedLootVIDs, dwNow);
 		ch->GetSectree()->ForEachAround(collector);
 		collector.Sort();
+		if (collector.SkippedCheap() > 0)
+			PlayerBotLogThrottled("loot_left_cheap", dwNow,
+					"PLAYERBOT_LOOT: left merchant fodder pid=%u name=%s level=%u gold=%lld drops=%d",
+					ch->GetPlayerID(), ch->GetName(), (unsigned int)ch->GetLevel(),
+					(long long)ch->GetGold(), collector.SkippedCheap());
 		const std::vector<std::pair<int, LPITEM> >& items = collector.GetItems();
 		if (items.empty())
 		{
+			// Drops in reach and no cell to put one in. Said once a minute per
+			// bot with the count, so the next "boty maja zapchane eq" report
+			// carries a number; the town errand for a full bag is the
+			// manager's (bInventoryFull) and the junk rule's, not this pass's.
+			if (collector.SkippedNoRoom() > 0 && dwNow >= state.dwNextBagFullLogTime)
+			{
+				state.dwNextBagFullLogTime = dwNow + 60000;
+				sys_log(0, "PLAYERBOT_LOOT: bag full pid=%u name=%s map=%ld drops_in_reach=%d level=%d can_open_shop=%d",
+						ch->GetPlayerID(), ch->GetName(), ch->GetMapIndex(),
+						collector.SkippedNoRoom(), ch->GetLevel(), PlayerBotCanOpenShop(ch) ? 1 : 0);
+			}
 			// An empty 25 m search used to run twice per second for every peaceful
 			// bot.  Delay only the next empty-floor query; as soon as an item is seen,
 			// the normal 500 ms walking/visibility cadence remains unchanged.
@@ -373,9 +560,12 @@ namespace
 
 			const DWORD itemVnum = nearest->GetVnum();
 			const bool material = nearest->GetType() == ITEM_MATERIAL;
+			const long itemSocket0 = nearest->GetSocket(0);
+			const BYTE itemType = nearest->GetType();
 			state.dwNextLootPickupTime = dwNow + GetPlayerBotLootPickupInterval(nearest);
 			if (ch->PickupItem(nearestVID))
 			{
+				NotePlayerBotMoodValuable(ch, itemVnum, itemSocket0, itemType, "pickup");
 				state.mapLootSeenSince.erase(nearestVID);
 				if (material)
 					RememberPlayerBotSpotDrop(ch->GetMapIndex(), ch->GetX(), ch->GetY(), itemVnum);

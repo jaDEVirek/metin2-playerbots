@@ -11,10 +11,6 @@
 // Three things in it could not be kept, and each is a fact about this world
 // rather than a preference:
 //
-//   * The quest counts kills of mobs 2105 and 2107. Neither is spawned anywhere
-//     in this server's maps - the desert here is stocked with the Black Wind
-//     band, 401 to 404 - so the trial counts those instead. It is the same
-//     desert the quest sends a player to and the same one bots already hunt.
 //   * The quest gives thirty minutes and fails you at the end of them. A bot
 //     hunts in a straight line for hours and has nobody to be disappointed by a
 //     failure, so there is no clock: it kills until it is done.
@@ -43,6 +39,29 @@ namespace
 		return std::max(0, ch->GetQuestFlag(PLAYERBOT_BATTLE_HORSE_KILLS_FLAG));
 	}
 
+	// playerbot_travel.h; the trial is asked about long before the travel is
+	// included.
+	bool IsPlayerBotMapHostedHere(long mapIndex);
+
+	// A trial is open only on the core that hosts its map. A bot cannot
+	// cross to a map its core does not host, and on a split world the
+	// desert and the Demon Tower are on one core each: 58 Shinsoo and 42
+	// Jinno bots stood in their second villages reading "Zdobywam konia
+	// bojowego na pustyni (0/100)" (seban latino, 16 September) - the
+	// frontier draw answered the desert and was filtered to nothing, and
+	// since 2.0.61 the Biologist yielded to the trial as well, so those
+	// bots had neither. The answer is kept per map because the target
+	// collector asks it per candidate monster; the maps are loaded before
+	// the first bot ticks.
+	bool IsPlayerBotHorseTrialOpenHere(long trialMap)
+	{
+		static std::map<long, bool> s_mapTrialHosted;
+		std::map<long, bool>::iterator it = s_mapTrialHosted.find(trialMap);
+		if (it == s_mapTrialHosted.end())
+			it = s_mapTrialHosted.insert(std::make_pair(trialMap, IsPlayerBotMapHostedHere(trialMap))).first;
+		return it->second;
+	}
+
 	// Everything the stable keeper checks before it will talk about a battle
 	// horse, minus the two items this world cannot supply.
 	bool IsPlayerBotBattleHorseCandidate(LPCHARACTER ch)
@@ -54,10 +73,26 @@ namespace
 				ch->GetHorseHealth() > 0;
 	}
 
+	// A dropper is a drop character and takes no trial - the operator's rule of
+	// 15 September, which the Biologist and the guild already follow. The two
+	// "on trial" predicates below did not ask, so a Metin dropper of thirty-six
+	// with a horse at ten was on the battle trial as far as every reader was
+	// concerned: the frontier draw pointed it at the desert, and its status read
+	// "Zdobywam konia bojowego na pustyni (0/100)" from the guild map it farms
+	// (GG1249125 and MORDEGAPOTEGA, Urtopy, 18 September). The stable keeper's
+	// side (IsPlayerBotBattleHorseEarned) is left alone: a horse already earned
+	// is still handed over.
+	bool IsPlayerBotTrialExempt(LPCHARACTER ch)
+	{
+		return ch && IsPlayerBotDropper(GetPlayerBotPersonalityByPID(ch->GetPlayerID()));
+	}
+
 	// Out in the desert working on it.
 	bool IsPlayerBotOnBattleHorseTrial(LPCHARACTER ch)
 	{
-		return IsPlayerBotBattleHorseCandidate(ch) &&
+		return IsPlayerBotHorseTrialOpenHere(PLAYERBOT_MAP_DESERT) &&
+				IsPlayerBotBattleHorseCandidate(ch) &&
+				!IsPlayerBotTrialExempt(ch) &&
 				GetPlayerBotBattleHorseKills(ch) < PLAYERBOT_BATTLE_HORSE_KILLS;
 	}
 
@@ -70,9 +105,59 @@ namespace
 
 	bool IsPlayerBotBattleHorseTrialMob(DWORD vnum)
 	{
-		return vnum >= PLAYERBOT_BATTLE_HORSE_MOB_FIRST &&
-				vnum <= PLAYERBOT_BATTLE_HORSE_MOB_LAST;
+		return vnum == PLAYERBOT_BATTLE_HORSE_MOB_SNAKE_ARCHER ||
+				vnum == PLAYERBOT_BATTLE_HORSE_MOB_SCORPION_ARCHER;
 	}
+
+	// The military horse: the same shape one step up.
+	//
+	// Medals carry a horse to twenty and stop there; the twenty-first level is a
+	// trial in the Demon Tower, with no clock on it, exactly as the combat horse
+	// is a trial in the desert. That is what the operator asked for, and it is
+	// why map 66 had to be moved onto the core the bots live on - 1001-1004
+	// stand nowhere else in this world, so before the move this trial could
+	// never have been started, let alone finished.
+	int GetPlayerBotMilitaryHorseKills(LPCHARACTER ch)
+	{
+		if (!ch)
+			return 0;
+		return std::max(0, ch->GetQuestFlag(PLAYERBOT_MILITARY_HORSE_KILLS_FLAG));
+	}
+
+	bool IsPlayerBotMilitaryHorseCandidate(LPCHARACTER ch)
+	{
+		return ch &&
+				ch->GetLevel() >= PLAYERBOT_MILITARY_HORSE_MIN_LEVEL &&
+				ch->GetHorseLevel() == PLAYERBOT_MILITARY_HORSE_FROM_HORSE_LEVEL &&
+				ch->GetHorseHealth() > 0;
+	}
+
+	bool IsPlayerBotOnMilitaryHorseTrial(LPCHARACTER ch)
+	{
+		return IsPlayerBotHorseTrialOpenHere(PLAYERBOT_MAP_DEMON_TOWER) &&
+				IsPlayerBotMilitaryHorseCandidate(ch) &&
+				!IsPlayerBotTrialExempt(ch) &&
+				GetPlayerBotMilitaryHorseKills(ch) < PLAYERBOT_MILITARY_HORSE_KILLS;
+	}
+
+	bool IsPlayerBotMilitaryHorseEarned(LPCHARACTER ch)
+	{
+		return IsPlayerBotMilitaryHorseCandidate(ch) &&
+				GetPlayerBotMilitaryHorseKills(ch) >= PLAYERBOT_MILITARY_HORSE_KILLS;
+	}
+
+	bool IsPlayerBotMilitaryHorseTrialMob(DWORD vnum)
+	{
+		for (size_t i = 0; i < sizeof(PLAYERBOT_MILITARY_HORSE_MOBS) /
+				sizeof(PLAYERBOT_MILITARY_HORSE_MOBS[0]); ++i)
+			if (PLAYERBOT_MILITARY_HORSE_MOBS[i] == vnum)
+				return true;
+		return false;
+	}
+
+	// The Biologist's share of a kill (playerbot_missions.h, later in the
+	// include order).
+	void NotePlayerBotBiologistCarrierKill(LPCHARACTER ch, LPCHARACTER target);
 
 	// Called wherever a bot has just swung at something. The engine has no hook
 	// that says "you killed this", so the kill is read off the target the tick
@@ -87,6 +172,27 @@ namespace
 		if (state.dwLastKillCreditedVID == vid)
 			return;
 		state.dwLastKillCreditedVID = vid;
+		// Under the same guard, so a corpse is one roll.
+		NotePlayerBotBiologistCarrierKill(ch, target);
+
+		// The military trial is credited from the same place and under the same
+		// VID guard. A second hook of its own would have had to share
+		// dwLastKillCreditedVID with this one, and whichever ran first would
+		// have eaten the other's kill.
+		if (IsPlayerBotOnMilitaryHorseTrial(ch) &&
+				IsPlayerBotMilitaryHorseTrialMob(target->GetRaceNum()))
+		{
+			const int demonKills = GetPlayerBotMilitaryHorseKills(ch) + 1;
+			ch->SetQuestFlag(PLAYERBOT_MILITARY_HORSE_KILLS_FLAG, demonKills);
+			if (demonKills >= PLAYERBOT_MILITARY_HORSE_KILLS)
+				sys_log(0, "PLAYERBOT_HORSE: military trial complete pid=%u name=%s kills=%d",
+						ch->GetPlayerID(), ch->GetName(), demonKills);
+			else if (demonKills % 10 == 0)
+				sys_log(0, "PLAYERBOT_HORSE: military trial pid=%u name=%s kills=%d/%d",
+						ch->GetPlayerID(), ch->GetName(), demonKills,
+						PLAYERBOT_MILITARY_HORSE_KILLS);
+			return;
+		}
 
 		if (!IsPlayerBotOnBattleHorseTrial(ch) ||
 				!IsPlayerBotBattleHorseTrialMob(target->GetRaceNum()))
@@ -141,7 +247,7 @@ namespace
 		if (ch->GetGold() < (int)PLAYERBOT_BATTLE_HORSE_FEE)
 			return false;
 
-		ch->PointChange(POINT_GOLD, -(int)PLAYERBOT_BATTLE_HORSE_FEE);
+		PlayerBotChangeGold(ch, -(int)PLAYERBOT_BATTLE_HORSE_FEE);
 		// The ordinary horse's paper goes back, as it does for a player. No bot
 		// has one - nothing in this world hands them out - so this is here for
 		// the day something does, not because it fires today.

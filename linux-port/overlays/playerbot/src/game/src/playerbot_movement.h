@@ -16,6 +16,10 @@
 // above it, and reopens the same anonymous namespace. Include it exactly once,
 // from playerbot_manager.cpp, after playerbot_navigation.h.
 
+// CDungeon is only forward-declared by the engine headers the manager
+// includes; the floor helpers below need the class.
+#include "dungeon.h"
+
 namespace
 {
 	struct TKnownPlayerBotMetin
@@ -193,7 +197,7 @@ namespace
 		TPlayerBotMonkeyDoor aDoors[PLAYERBOT_MONKEY_MAX_DOORS];
 	};
 
-	TPlayerBotMonkeyGeometry s_aPlayerBotMonkeyGeometry[3];
+	TPlayerBotMonkeyGeometry s_aPlayerBotMonkeyGeometry[5];
 
 	struct FPlayerBotCollectMonkeyDoors
 	{
@@ -231,6 +235,14 @@ namespace
 		}
 	};
 
+	// One cache per dungeon map. The three kingdoms' easy dungeons are the same
+	// maze on three bases and the geometry is read off each map's own NPCs, so
+	// Shinsoo's and Jinno's rooms were never the problem - having no slot was:
+	// this answered -1 for maps 5 and 45, GetPlayerBotMonkeyGeometry answered
+	// NULL, no chamber or door was known there, and every bot in those two
+	// dungeons hunted the entrance room while Chunjo's walked all eleven ("in
+	// both Kingdoms Bots only farm in starting zone of Ape Dungeon", Dixdros,
+	// 14 September).
 	int GetPlayerBotMonkeyGeometrySlot(long mapIndex)
 	{
 		switch (mapIndex)
@@ -238,6 +250,8 @@ namespace
 			case PLAYERBOT_MAP_MONKEY_EASY: return 0;
 			case PLAYERBOT_MAP_MONKEY_MEDIUM: return 1;
 			case PLAYERBOT_MAP_MONKEY_HARD: return 2;
+			case PLAYERBOT_MAP_MONKEY_SHINSOO: return 3;
+			case PLAYERBOT_MAP_MONKEY_JINNO: return 4;
 			default: return -1;
 		}
 	}
@@ -541,9 +555,62 @@ namespace
 		return leader ? leader->GetPlayerID() : ch->GetPlayerID();
 	}
 
+	// Defined with the party code in playerbot_manager.cpp; declared in
+	// playerbot_travel.h too, which comes later in the include order.
+	bool IsPlayerBotHumanLedParty(LPPARTY party);
+
+	// A bot climbing the Demon Tower with a player: in the player's party, the
+	// player on the same map. For such a bot the tower's stones are the floor's
+	// objective - "takie metiny sie zbija, by zaliczyc kolejne pietra" (Tieru,
+	// 16 September) - and no level band applies; for a bot on its own they stay
+	// what IsPlayerBotDungeonTriggerStone says, a warp sprung on strangers.
+	// The dungeon's floor counter: mt2009's CDungeon carries one (the quests'
+	// d.get_level and d.advance_level), r40250's does not.
+	int GetPlayerBotDungeonLevel(LPDUNGEON d)
+	{
+#if defined(PLAYERBOT_ENGINE_MT2009)
+		return d ? d->GetLevel() : 0;
+#else
+		(void)d;
+		return 0;
+#endif
+	}
+
+	void AdvancePlayerBotDungeonLevel(LPDUNGEON d)
+	{
+#if defined(PLAYERBOT_ENGINE_MT2009)
+		if (d)
+			d->AdvanceLevel();
+#else
+		(void)d;
+#endif
+	}
+
+	// A raider of the Demon Tower, or any bot inside its instance
+	// (playerbot_demon_tower.h, which comes later in the include order).
+	bool IsPlayerBotTowerRaider(LPCHARACTER ch);
+
+	bool IsPlayerBotClimbingWithPlayer(LPCHARACTER ch)
+	{
+		if (!ch || !ch->GetParty() || !IsPlayerBotHumanLedParty(ch->GetParty()))
+			return false;
+		LPCHARACTER leader = ch->GetParty()->GetLeaderCharacter();
+		return leader && leader != ch && leader->GetMapIndex() == ch->GetMapIndex();
+	}
+
+	bool IsPlayerBotDungeonStoneObjective(LPCHARACTER ch, LPCHARACTER stone)
+	{
+		return ch && stone && stone->IsStone() && !stone->IsDead() &&
+				IsPlayerBotDungeonTriggerStone(stone->GetRaceNum()) &&
+				(IsPlayerBotClimbingWithPlayer(ch) || IsPlayerBotTowerRaider(ch));
+	}
+
 	void RememberPlayerBotMetin(LPCHARACTER stone, DWORD dwNow)
 	{
-		if (!stone || !stone->IsStone() || stone->IsDead())
+		// The Demon Tower's quest stones are nobody's hunting ground: see
+		// PLAYERBOT_DEVIL_TOWER_STONE_FIRST.
+		if (!stone || !stone->IsStone() || stone->IsDead() ||
+				IsPlayerBotDungeonTriggerStone(stone->GetRaceNum()))
 			return;
 		const bool bNewDiscovery = s_mapKnownPlayerBotMetins.find(stone->GetVID()) ==
 				s_mapKnownPlayerBotMetins.end();
@@ -581,11 +648,22 @@ namespace
 	{
 		if (!ch || !stone || !stone->IsStone() || stone->IsDead())
 			return false;
-		// The server drop multiplier still has useful value at a ten-level
-		// advantage. Below that it collapses sharply (15% at -11 and 1% at -15),
-		// so a level-25 bot should pass level-5/10 stones and keep level-15+.
+		// A floor's objective for a bot climbing with a player: no band at all.
+		if (IsPlayerBotDungeonStoneObjective(ch, stone))
+			return true;
+		// Breaking one warps every PC on the killer's map into a new tower.
+		if (IsPlayerBotDungeonTriggerStone(stone->GetRaceNum()))
+			return false;
+		// Iwakura's stone hunter: ten levels either way, "aby zagwarantowac
+		// szanse na drop oraz upewnic sie, ze bot fizycznie da rade go zniszczyc".
+		if (IsPlayerBotPersonaEnabled())
+			return playerbot_persona::InPogromcaBand((int)ch->GetLevel(), (int)stone->GetLevel());
+		// Alone, a stone up to nine over the bot (a stronger one it cannot break
+		// by itself - it joins those, IsPlayerBotStoneJoinable), and one it has
+		// outgrown by PLAYERBOT_STONE_OUTGROWN_LEVELS is passed: the drop curve
+		// is 1% at fifteen over, and nothing comes out of it past that.
 		return stone->GetLevel() <= ch->GetLevel() + 9 &&
-				ch->GetLevel() <= stone->GetLevel() + 10;
+				(int)ch->GetLevel() <= (int)stone->GetLevel() + PLAYERBOT_STONE_OUTGROWN_LEVELS;
 	}
 
 	BYTE ChoosePlayerBotMetinHotspot(DWORD playerID, BYTE currentIndex, DWORD dwNow,
@@ -740,7 +818,10 @@ namespace
 				ch->HorseSummon(false);
 			ClearPlayerBotRoute(state, false);
 			state.dwNextNavPlanTime = 0;
-			state.dwNextHorseRideCheckTime = dwNow + 1000;
+			// The pass that climbed down wants the ground for a moment, and the
+			// travel used to put the bot back on the horse a second later
+			// (PLAYERBOT_HORSE_TRAVEL_FLIP_HOLD_MS).
+			state.dwNextHorseRideCheckTime = dwNow + PLAYERBOT_HORSE_TRAVEL_FLIP_HOLD_MS;
 			state.dwLastMeaningfulActivityTime = dwNow;
 			sys_log(0, "PLAYERBOT_HORSE: dismounted pid=%u name=%s map=%ld pos=(%ld,%ld) reason=%s",
 					ch->GetPlayerID(), ch->GetName(), ch->GetMapIndex(), ch->GetX(), ch->GetY(),
@@ -752,12 +833,37 @@ namespace
 				ch->GetHorseHealth() <= 0 || ch->GetHorseStamina() <= 0 ||
 				dwNow < state.dwNextHorseRideCheckTime)
 			return false;
+		// What CHARACTER::StartRiding refuses that this pass can see coming.
+		// IsBusy is the whole of it in practice: a counter open, another bot's
+		// counter being read, the safebox page, the item shop, a herbalist's
+		// craft - all ordinary things a bot does, and every one of them made
+		// the mount below fail and write a line to syserr. Measured on the
+		// test world on 20 September: 1060 + 775 + 566 ... some thousands of
+		// "mount failed" lines in a day, every one of them a bot that was
+		// simply doing something else at the time. A refusal the AI could
+		// have predicted is not an error; it is a reason to wait.
+		// IsBusy is mt2009's; r40250's StartRiding asks nothing of the kind, so
+		// there is nothing to predict there beyond these two.
+		if (ch->IsDead() || ch->IsPolymorphed()
+#if defined(PLAYERBOT_ENGINE_MT2009)
+				|| ch->IsBusy()
+#endif
+				)
+		{
+			state.dwNextHorseRideCheckTime = dwNow + PLAYERBOT_HORSE_RIDE_RETRY_INTERVAL;
+			return false;
+		}
 
 		ch->Stop();
 		if (!ch->StartRiding())
 		{
 			state.dwNextHorseRideCheckTime = dwNow + PLAYERBOT_HORSE_RIDE_RETRY_INTERVAL;
-			sys_err("PLAYERBOT_HORSE: mount failed pid=%u name=%s horse_level=%u health=%d stamina=%d reason=%s",
+			// Throttled, because what is left is whatever the engine refuses
+			// for a reason nothing above could ask about - and if that ever
+			// becomes common again, one line a minute is enough to see it
+			// without burying every other error in the file.
+			PlayerBotLogThrottled("horse_mount_failed", dwNow,
+					"PLAYERBOT_HORSE: mount failed pid=%u name=%s horse_level=%u health=%d stamina=%d reason=%s",
 					ch->GetPlayerID(), ch->GetName(), (unsigned int)ch->GetHorseLevel(),
 					ch->GetHorseHealth(), ch->GetHorseStamina(), reason ? reason : "?");
 			return false;
@@ -819,9 +925,8 @@ namespace
 		// horse regardless of how near the destination is. SetPlayerBotRidingForTravel
 		// still refuses gracefully when the horse is spent, leaving the bot on foot.
 		//
-		// A portal wants the saddle kept for a different reason. The dismount below
-		// exists so a bot walks up to an NPC on foot, the way a player does before
-		// talking to one; a teleporter is not talked to at all.
+		// A portal wants the saddle for any distance; the leg's own mount below
+		// takes the horse only for a long way.
 		if (fightOnHorse || keepHorseAtDestination)
 		{
 			SetPlayerBotRidingForTravel(ch, state, true, dwNow,
@@ -842,11 +947,36 @@ namespace
 			if (target && CanPlayerBotFightOnHorse(ch, target))
 				return;
 		}
-		const int distance = DISTANCE_APPROX(ch->GetX() - destX, ch->GetY() - destY);
-		if (!allowHorse || distance <= PLAYERBOT_HORSE_DISMOUNT_DISTANCE)
-			SetPlayerBotRidingForTravel(ch, state, false, dwNow,
-					allowHorse ? "near_destination" : "on_foot_action");
-		else if (distance >= PLAYERBOT_HORSE_MOUNT_DISTANCE)
+		// The opposite case, and the one the desert bots fell into: a transport
+		// horse and a live combat target that must be fought on foot. Mounting for
+		// the leg here only to have the combat pass (combat_ready /
+		// dismount_for_target) climb down again next tick was the
+		// long_travel<->combat_ready thrash - KimJestes2 mounted and dismounted
+		// once a second on the desert for minutes, never landing a blow
+		// (sizowski). While a fight is pending the saddle is the combat pass's to
+		// give up, not this pass's to take; once the foe is gone the next leg
+		// mounts as before. Only for a real, live foe, so a stale VID cannot
+		// strand the bot on foot.
+		if (!fightOnHorse && !keepHorseAtDestination && !CanPlayerBotEverFightOnHorse(ch))
+		{
+			LPCHARACTER foe = ch->GetVictim();
+			if (!foe && state.dwTargetVID != 0)
+				foe = CHARACTER_MANAGER::instance().Find(state.dwTargetVID);
+			if (foe && !foe->IsDead())
+				return;
+		}
+		// A rider keeps the saddle to the end of the leg, and on a leg that does
+		// not ask for the horse. Nothing a bot does at the end of one wants the
+		// ground on either engine: an NPC, a counter, the anvil, a chest, a book,
+		// the gear and a portal all answer a rider (Tieru, 15 September: "Nie
+		// trzeba schodzic z konia by przeczytac ksiazke, sciagnac eq, ubrac eq,
+		// otworzyc jakies skrzynki, porozmawiac z npc, przejsc przez portal"). The
+		// two climb-downs that stood here, near_destination and on_foot_action,
+		// were 13 011 of 24 389 in 36 minutes on the test world. What does want
+		// the ground gets off by itself: a fight on a transport horse, a duel, a
+		// skill, the rod, a polymorph marble, a counter going up.
+		if (allowHorse && !ch->IsRiding() &&
+				DISTANCE_APPROX(ch->GetX() - destX, ch->GetY() - destY) >= PLAYERBOT_HORSE_MOUNT_DISTANCE)
 			SetPlayerBotRidingForTravel(ch, state, true, dwNow, "long_travel");
 	}
 
@@ -955,7 +1085,20 @@ namespace
 		// shortest way out of the door's own three hundred units.
 		state.bMonkeySpot = (BYTE)FindNearestPlayerBotMonkeySpot(
 				baseX, baseY, room, ch->GetX(), ch->GetY());
-		ClearPlayerBotRoute(state, false);
+		// Everything the bot was doing belongs to the room it has left. The
+		// route used to be cleared with its goal kept - and parked, when long -
+		// so the next move towards that goal, or towards the monster it had been
+		// fighting, found it unreachable from here and was routed back through
+		// the door the bot had just come by. Of 87 returns to the entrance
+		// chamber within fifteen seconds, 35 had exactly such a portal route
+		// planned in between. The goal, the parked route and the target go with
+		// the room; nothing that fights there can follow, because a GOTO door
+		// moves only player characters.
+		ClearPlayerBotRoute(state, true);
+		state.vecParkedRoute.clear();
+		state.lParkedMapIndex = 0;
+		state.dwTargetVID = 0;
+		ch->SetVictim(NULL);
 		state.dwNextWanderTime = dwNow;
 		sys_log(0, "PLAYERBOT_MONKEY: chamber pid=%u name=%s map=%ld chamber=%d from=%d spots=%u",
 				ch->GetPlayerID(), ch->GetName(), mapIndex, chamber, previous,
@@ -984,6 +1127,46 @@ namespace
 		}
 
 		const long mapIndex = ch->GetMapIndex();
+		// A point on another map's coordinates is not a walk. ClampWorld below
+		// pulls any goal onto this map's last cell, the planner calls that
+		// corner unreachable, and the caller asks again: bots on Bokjung's town
+		// square planned (204750,307150) - that map's far corner - 1615 times in
+		// a day on the test world, every one a far plan for nothing. The hub
+		// tables, all 222 village ground points, the known-Metin registry and
+		// the walk back after a death each check the map, so the source is
+		// somewhere else; refused here with the point as it was asked for, the
+		// bot's errands and the caller's address, one line a minute per caller,
+		// so the log names it. A step a little past the edge still goes through.
+		if (LPSECTREE_MAP offMap = SECTREE_MANAGER::instance().GetMap(mapIndex))
+		{
+			const TMapSetting& setting = offMap->m_setting;
+			if (destX < setting.iBaseX - PLAYERBOT_NAV_OFF_MAP_MARGIN ||
+					destY < setting.iBaseY - PLAYERBOT_NAV_OFF_MAP_MARGIN ||
+					destX >= setting.iBaseX + setting.iWidth + PLAYERBOT_NAV_OFF_MAP_MARGIN ||
+					destY >= setting.iBaseY + setting.iHeight + PLAYERBOT_NAV_OFF_MAP_MARGIN)
+			{
+				const void* caller = __builtin_return_address(0);
+				char szOffMapTag[48];
+				snprintf(szOffMapTag, sizeof(szOffMapTag), "nav_off_map:%p", caller);
+				PlayerBotErrThrottled(szOffMapTag, dwNow,
+						"PLAYERBOT_NAV: destination off the map pid=%u name=%s map=%ld pos=(%ld,%ld) dest=(%ld,%ld) "
+						"action=%u goal=%u shop=%d phase=%u market=%d bio=%d stable=%d fishing=%d crossing=%ld "
+						"departure=%ld hub=%u metin_hunt=%d caller=%p",
+						ch->GetPlayerID(), ch->GetName(), mapIndex, ch->GetX(), ch->GetY(), destX, destY,
+						(unsigned int)state.bCurrentAction, (unsigned int)state.bLongTermGoal,
+						state.bVisitingShop ? 1 : 0, (unsigned int)state.bTownVisitPhase,
+						state.bMarketTrip ? 1 : 0, state.bVisitingBiologist ? 1 : 0,
+						state.bVisitingStable ? 1 : 0, state.bFishingSession ? 1 : 0,
+						state.lDesertCrossingTo, state.lDepartureMap, (unsigned int)state.wHuntingHub,
+						IsPlayerBotMetinHunting(state, dwNow) ? 1 : 0, caller);
+				if (ch->IsStateMove())
+					ch->Stop();
+				if (state.bStuckCounter < 255)
+					++state.bStuckCounter;
+				state.bLastNavOutcome = PLAYERBOT_NAV_OUT_UNREACHABLE;
+				return false;
+			}
+		}
 		CPlayerBotNavigation& navigation = CPlayerBotNavigation::instance(mapIndex);
 		if (!navigation.Init(mapIndex))
 			return false;
@@ -1012,7 +1195,17 @@ namespace
 		}
 
 		bool redirectedToMonkeyPortal = false;
+		// Not through a door before the room has been worked. A destination in
+		// another chamber, asked for inside the dwell, is simply unreachable from
+		// here. Routing it through a door was the AI's half of the returns to
+		// the entrance chamber, and with the engine now refusing to move a bot
+		// through a door for the same time, every such route would end with a
+		// bot waiting at a door that will not open - 86% of the routes through a
+		// door were planned inside the dwell. A chosen exit is unaffected: the
+		// wander pass walks to a door that stands in this chamber, which needs
+		// no redirect.
 		if (IsPlayerBotMonkeyMap(mapIndex) &&
+				dwNow - state.dwMonkeyChamberTime >= PLAYERBOT_MONKEY_CHAMBER_DWELL &&
 				!navigation.CanReach(ch->GetX(), ch->GetY(), destX, destY))
 		{
 			long doorX = 0, doorY = 0;
@@ -1102,6 +1295,8 @@ namespace
 						ch->GetX(), ch->GetY(), destX, destY, routeSeed, dwNow,
 						targetSnapRadius, flexibleTargetSnap, state.vecRoute,
 						state.bNavDeferredCount >= PLAYERBOT_NAV_STARVED_ATTEMPTS);
+				state.bRoutePartial = planResult == PLAYERBOT_NAV_PLAN_FOUND &&
+						navigation.LastPlanWasPartial();
 				if (planResult == PLAYERBOT_NAV_PLAN_DEFERRED)
 				{
 					if (state.bNavDeferredCount < 255)
@@ -1140,6 +1335,13 @@ namespace
 				}
 			}
 			state.bNavDeferredCount = 0;
+			// And the clock with it. Nothing ever cleared this, so `waited_ms`
+			// in the deferral line was the time since the bot's *first* refusal
+			// ever, not the wait of the request being reported: the live server
+			// printed waits of four to six hours, which is simply how long the
+			// bot had been alive. A number that cannot be wrong is worth more
+			// than a number that is usually enormous.
+			state.dwFirstNavDeferTime = 0;
 
 			state.uRouteIndex = resumedIndex;
 			state.lIssuedWaypointX = 0;
@@ -1190,6 +1392,18 @@ namespace
 
 		if (state.uRouteIndex >= state.vecRoute.size())
 		{
+			// A partial route ran out where the cap fell, not at the goal: plan
+			// the rest from here. Reporting an arrival even once would hand a
+			// caller a destination the bot is nowhere near.
+			if (state.bRoutePartial &&
+					DISTANCE_APPROX(ch->GetX() - destX, ch->GetY() - destY) > PLAYERBOT_NAV_ARRIVAL_DISTANCE)
+			{
+				state.bRoutePartial = false;
+				ClearPlayerBotRoute(state, false);
+				state.dwNextNavPlanTime = 0;
+				state.bLastNavOutcome = PLAYERBOT_NAV_OUT_NO_PROGRESS;
+				return false;
+			}
 			ch->Stop();
 			state.bLastNavOutcome = PLAYERBOT_NAV_OUT_ARRIVED;
 			return true;

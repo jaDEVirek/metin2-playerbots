@@ -34,7 +34,7 @@ namespace
 	{
 		if (!ch || !ch->IsItemLoaded() || ch->GetSkillGroup() == 0)
 			return false;
-		for (WORD cell = 0; cell < INVENTORY_MAX_NUM; ++cell)
+		for (WORD cell = 0; cell < PLAYERBOT_BAG_CELLS; ++cell)
 		{
 			LPITEM item = ch->GetInventoryItem(cell);
 			const DWORD skillVnum = GetPlayerBotSkillBookSkillVnum(item);
@@ -79,6 +79,15 @@ namespace
 	{
 		if (!ch || state.bBotRole == BOT_ROLE_METIN_HUNTER)
 			return;
+		// A medal, M2 or M3 dropper farms its own table and goes on no Metin
+		// expedition - the half hour that kept a medal dropper of twenty-five
+		// out of its dungeon. The Metin dropper's table is the stones.
+		if (IsPlayerBotDropper(state.bPersonality) &&
+				state.bPersonality != BOT_PERSONALITY_METIN_DROPPER)
+		{
+			state.dwMetinExpeditionUntil = 0;
+			return;
+		}
 		if (state.dwMetinExpeditionUntil != 0 && dwNow >= state.dwMetinExpeditionUntil)
 		{
 			state.dwMetinExpeditionUntil = 0;
@@ -167,6 +176,9 @@ namespace
 
 		OfferPlayerBotGoal(candidates, rank, count, NeedsPlayerBotPotions(ch),
 				BOT_GOAL_RESTOCK, PLAYERBOT_WEIGHT_RESTOCK);
+		// Training blocked on alignment needs ordinary hunting, not another stone.
+		OfferPlayerBotGoal(candidates, rank, count, PlayerBotNeedsTrainingRank(ch),
+				BOT_GOAL_LEVEL_UP, PLAYERBOT_WEIGHT_SKILL);
 		OfferPlayerBotGoal(candidates, rank, count,
 				state.bAmbition == BOT_AMBITION_EQUIPMENT && canRefine,
 				BOT_GOAL_REFINE, PLAYERBOT_WEIGHT_REFINE);

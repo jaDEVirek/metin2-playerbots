@@ -31,7 +31,11 @@ namespace
 		++s_uPlayerBotLoadSaves;
 		ch->FlushDelayedSaveItem();
 		const DWORD playerID = ch->GetPlayerID();
+#if !defined(PLAYERBOT_ENGINE_MT2009)
+		// mt2009 has no cache-flush packet; its db core writes the player
+		// cache out on its own clock, so a panel reads the save a little later.
 		db_clientdesc->DBPacket(HEADER_GD_FLUSH_CACHE, 0, &playerID, sizeof(playerID));
+#endif
 		sys_log(1, "PLAYERBOT_AI: persisted state pid=%u name=%s level=%u exp=%u gold=%lld",
 				playerID, ch->GetName(), level, ch->GetExp(), (long long)ch->GetGold());
 	}
@@ -67,8 +71,23 @@ namespace
 				threat->GetMapIndex() == ch->GetMapIndex() && threat->GetVictim() == ch;
 		const int hpPercent = ch->GetMaxHP() > 0 ? ch->GetHP() * 100 / ch->GetMaxHP() : 100;
 
-		if (!bThreatHasAggro && hpPercent >= PLAYERBOT_RETREAT_END_HP_PERCENT)
+		// Two ways out that do not depend on the monster changing its mind: the
+		// bot is far enough away, or it has been running long enough. Without
+		// them the only exit was the threat dropping aggro, and a monster that
+		// cannot reach the bot never does.
+		const int threatDistance = threat
+				? DISTANCE_APPROX(ch->GetX() - threat->GetX(), ch->GetY() - threat->GetY())
+				: PLAYERBOT_RETREAT_SAFE_DISTANCE;
+		const bool escaped = threatDistance >= PLAYERBOT_RETREAT_SAFE_DISTANCE;
+		const bool ranLongEnough = state.dwRetreatStartedTime != 0 &&
+				dwNow - state.dwRetreatStartedTime >= PLAYERBOT_RETREAT_MAX_MS;
+		if ((!bThreatHasAggro && hpPercent >= PLAYERBOT_RETREAT_END_HP_PERCENT) ||
+				escaped || ranLongEnough)
 		{
+			if (escaped || ranLongEnough)
+				sys_log(0, "PLAYERBOT_AI: tactical retreat over pid=%u name=%s hp=%d/%d dist=%d reason=%s",
+						ch->GetPlayerID(), ch->GetName(), ch->GetHP(), ch->GetMaxHP(),
+						threatDistance, escaped ? "escaped" : "timeout");
 			state.bTacticalRetreat = false;
 			state.dwRetreatStartedTime = 0;
 			state.dwRetreatThreatVID = 0;
@@ -208,9 +227,21 @@ namespace
 			state.dwRetreatThreatVID = 0;
 			state.dwLastDeathTime = dwNow;
 			state.dwLastKillerVID = state.dwTargetVID;
+			// A bot that falls in a duel has lost it, whoever struck last, and
+			// the duel ends on the tick it falls. It used to end only once the
+			// bot had stood up again and been refused its blows for
+			// PLAYERBOT_PVP_REFUSED_GIVE_UP, still counting itself in the duel
+			// - and before 2.0.41, when those blows were not refused, going on
+			// hitting a winner whose client would not let them hit back ("wali
+			// jakas zemste, gdzie nie moge mu oddac", Drip).
+			if (playerbot_pvp::GetDuelOpponent(ch->GetPlayerID(), dwNow) != 0)
+				EndPlayerBotDuel(ch, state, dwNow, "lost");
 			state.lDeathX = ch->GetX();
 			state.lDeathY = ch->GetY();
 			++state.bDeathCount;
+			// A Conqueror dying to monsters too often has outgrown its gear
+			// (playerbot_persona.h).
+			NotePlayerBotPersonaDeath(ch, state, dwNow);
 
 			state.dwTargetVID = 0;
 			ch->SetVictim(NULL);

@@ -60,6 +60,22 @@ function Get-M2LauncherErrorGuidance {
         $port = $Matches.port
     }
 
+    # An engine file a mod rewrote to call into the bot manager for something
+    # it never had: an update replaces our files and leaves that one, and the
+    # build dies on it at every click - archonek on 18 September, every update
+    # from 2.0.74 on, with messenger_manager.cpp and GetCompanionOwner from a
+    # fork's companion system, while this function answered with nothing that
+    # named the file. Asked first: the compiler's line is the whole answer.
+    if ($value -match '(?i)([A-Za-z0-9_]+\.(?:cpp|h)):\d+:\d+: error: [^\r\n]*CPlayerBotManager[^\r\n]*has no member named') {
+        $modFile = $Matches[1]
+        return [pscustomobject]@{
+            Code = 'ENGINE_FILE_FROM_MOD'
+            Title = "Plik silnika $modFile pochodzi z innej przeróbki"
+            Message = "Budowa rdzenia gry zatrzymała się na pliku ${modFile}: woła funkcję botów, której w tej wersji nie ma. Ten plik pochodzi z cudzej przeróbki (modu) i aktualizacja go nie podmieniła. Baza i postęp są w porządku."
+            Remedy = "Przywróć fabryczny plik ${modFile}: skopiuj go z pełnej paczki serwera do folderu serwera, do podfolderu linux-port\docker\game\src\server\game\src, i kliknij ZAINSTALUJ AKTUALIZACJE albo GRAJ. Jeśli nie masz pełnej paczki, wyślij logi na Discorda (ZBIERZ / WYŚLIJ LOGI)."
+        }
+    }
+
     # Not a busy port: Windows itself refused the bind. Hyper-V and WSL reserve
     # random port ranges after a restart ("excluded port ranges"), and when
     # 11000 or 13000 falls inside one, compose fails one second after the
@@ -79,7 +95,7 @@ function Get-M2LauncherErrorGuidance {
             Code = 'PORT_IN_USE'
             Title = "Port $port jest już zajęty"
             Message = "Inny program albo druga instalacja serwera używa portu $port. Launcher nie uruchomi drugiego serwera na tym samym porcie."
-            Remedy = 'Zamknij poprzednią instalację przyciskiem „Zatrzymaj i zapisz” albo korzystaj z launchera znajdującego się w folderze już uruchomionego serwera. Nie usuwaj wolumenów Dockera.'
+            Remedy = 'Kliknij GRAJ albo ZAINSTALUJ AKTUALIZACJE jeszcze raz - launcher sam znajdzie kontener innej instalacji trzymający ten port i zatrzyma go, nie ruszając bazy, wolumenów ani postępu (w wersji konsolowej robi to opcja 21, Zwolnij porty). Samo wyłączenie Docker Desktop nie pomaga: kontenery mają politykę restart=unless-stopped, więc wracają przy każdym starcie silnika i znów zajmują port. Nie usuwaj wolumenów Dockera.'
         }
     }
 
@@ -140,7 +156,39 @@ function Get-M2LauncherErrorGuidance {
         }
     }
 
-    if ($value -match '(?i)\b404\b|not found.+update-manifest|update-manifest.+not found') {
+    # apt inside a build refuses a Release file dated after the machine's
+    # clock, and Docker Desktop's machine takes the Windows clock: Xewi's
+    # Windows ran three hours behind (19 September), so every start stopped at
+    # the panel's apt-get while the containers built earlier - "z dockera
+    # dziala" - still ran.
+    if ($value -match '(?i)is not valid yet \(invalid for another') {
+        return [pscustomobject]@{
+            Code = 'CLOCK_BEHIND'
+            Title = 'Zegar komputera jest przestawiony'
+            Message = 'Budowa serwera zatrzymała się, bo zegar Windows - a za nim Docker - jest opóźniony względem prawdziwego czasu i serwer pakietów odrzucił pobieranie (komunikat „Release file ... is not valid yet”). Pliki serwera i baza są w porządku.'
+            Remedy = 'W Windows otwórz Ustawienia → Czas i język → Data i godzina, włącz „Ustaw czas automatycznie”, sprawdź strefę czasową (dla Polski: Warszawa) i kliknij „Synchronizuj teraz”. Potem zamknij Docker Desktop (ikona w zasobniku → Quit) i kliknij GRAJ.'
+        }
+    }
+
+    # An image the build makes itself, looked for on Docker Hub by an older
+    # Compose: seban-collector and seban-item-grants run the image the
+    # seban-panel service builds, and the compose file says pull_policy: never
+    # for them only from 2.0.77 on.
+    if ($value -match '(?i)pull access denied for metin2/') {
+        return [pscustomobject]@{
+            Code = 'LOCAL_IMAGE_PULLED'
+            Title = 'Docker szukał w internecie obrazu, który serwer buduje sam'
+            Message = 'Starszy Docker Compose próbował pobrać z Docker Hub obraz panelu zaawansowanego (metin2/seban-panel), zanim go zbudował, i przerwał start. Pliki serwera i baza są w porządku.'
+            Remedy = 'Kliknij GRAJ jeszcze raz. Jeśli błąd wróci, otwórz PowerShell w folderze serwera, w podfolderze linux-port\docker, wykonaj: docker compose build seban-panel, a potem kliknij GRAJ. Logowanie do Docker Hub (docker login) niczego tu nie zmienia.'
+        }
+    }
+
+    # Only a 404 said of the manifest itself. This reads the whole output of
+    # the failed action, and a log carries "404" somewhere - the panel's answer
+    # to a missing icon, a pid, a coordinate - so the bare number sent
+    # archonek to wait for an update channel that was there all along
+    # (18 September: the manifest answered 200, the start had failed).
+    if ($value -match '(?i)update-manifest[^\r\n]*\b404\b|\b404\b[^\r\n]*update-manifest|not found[^\r\n]+update-manifest|update-manifest[^\r\n]+not found') {
         return [pscustomobject]@{
             Code = 'UPDATE_CHANNEL_UNPUBLISHED'
             Title = 'Kanał aktualizacji nie został jeszcze opublikowany'
@@ -221,23 +269,174 @@ function Get-M2DockerPortOwner {
         [AllowEmptyString()][string]$CurrentProject = ''
     )
 
-    $dockerPs = Invoke-M2DiagnosticProcess -FileName 'docker.exe' -Arguments 'ps --format "{{json .}}"' -TimeoutMilliseconds 4000
-    if ($dockerPs.ExitCode -ne 0) { return $null }
+    foreach ($holder in @(Get-M2DockerPortHolders -Ports @($Port) -CurrentProject $CurrentProject)) {
+        return $holder
+    }
+    return $null
+}
+
+# Which of the wanted ports a container's PORTS column actually publishes.
+#
+# The column is a comma-separated list of "[host:]HOST->CONTAINER/proto", and a
+# published range collapses into a single entry: "127.0.0.1:13000-13002->
+# 13000-13002/tcp". The host side is what matters, and it is either one number
+# or two around a dash.
+function Get-M2PublishedPortMatches {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$PortsText,
+        [Parameter(Mandatory = $true)][int[]]$Ports
+    )
+
+    $matched = @()
+    if (-not $PortsText) { return $matched }
+    foreach ($entry in ($PortsText -split ',')) {
+        $piece = $entry.Trim()
+        if (-not $piece -or $piece -notmatch '->') { continue }
+        $hostSide = ($piece -split '->')[0].Trim()
+        # Drop the bind address; IPv6 arrives as "[::]:7788".
+        if ($hostSide -match '^\[[^\]]*\]:(.+)$') { $hostSide = $Matches[1] }
+        elseif ($hostSide -match '^[^:]*:(.+)$') { $hostSide = $Matches[1] }
+        $first = 0
+        $last = 0
+        if ($hostSide -match '^(\d+)-(\d+)$') { $first = [int]$Matches[1]; $last = [int]$Matches[2] }
+        elseif ($hostSide -match '^(\d+)$') { $first = [int]$Matches[1]; $last = $first }
+        else { continue }
+        foreach ($port in @($Ports)) {
+            $number = [int]$port
+            if ($number -ge $first -and $number -le $last -and $matched -notcontains $number) {
+                $matched += $number
+            }
+        }
+    }
+    return $matched
+}
+
+# Every running container that publishes one of these host ports, with its
+# compose project and the folder it was started from. The folder is the half an
+# operator needs and never had: one machine here carries five projects of this
+# same server (m2dep, m2zip, m2mt, m2fresh, metin2), each from its own
+# directory, and "another installation is using the port" without naming which
+# one is advice nobody can act on.
+function Get-M2DockerPortHolders {
+    param(
+        [Parameter(Mandatory = $true)][int[]]$Ports,
+        [AllowEmptyString()][string]$CurrentProject = ''
+    )
+
+    $holders = @()
+    if (@($Ports).Count -eq 0) { return $holders }
+    $dockerPs = Invoke-M2DiagnosticProcess -FileName 'docker.exe' -Arguments 'ps --format "{{json .}}"' -TimeoutMilliseconds 6000
+    if ($dockerPs.ExitCode -ne 0) { return $holders }
     foreach ($line in ($dockerPs.Output -split '\r?\n')) {
         if (-not $line.Trim()) { continue }
         try { $container = $line | ConvertFrom-Json } catch { continue }
-        $ports = [string]$container.Ports
-        if ($ports -notmatch ('(?i)(?:^|,\s*)(?:(?:0\.0\.0\.0|127\.0\.0\.1|\[::\]|\*):)?' + $Port + '->')) { continue }
+        # Docker prints a published range as one entry - "127.0.0.1:13000-13002
+        # ->13000-13002/tcp" - so matching the literal "13001->" found nothing
+        # and the three game channels looked like they belonged to no container
+        # at all. The preflight then called the player's own running server a
+        # foreign program and refused to start (sizowski, 13 September, on the
+        # very check meant to help). Every host side is parsed, single or range.
+        $matched = @(Get-M2PublishedPortMatches -PortsText ([string]$container.Ports) -Ports $Ports)
+        if ($matched.Count -eq 0) { continue }
         $project = ''
+        $workingDir = ''
         $labels = [string]$container.Labels
         if ($labels -match '(?:^|,)com\.docker\.compose\.project=([^,]+)') { $project = $Matches[1] }
-        return [pscustomobject]@{
+        if ($labels -match '(?:^|,)com\.docker\.compose\.project\.working_dir=([^,]+)') { $workingDir = $Matches[1] }
+        $holders += [pscustomobject]@{
             Container = [string]$container.Names
             Project = $project
+            WorkingDir = $workingDir
+            Ports = @($matched)
             IsCurrentProject = [bool]($CurrentProject -and $project -and $project.Equals($CurrentProject, [StringComparison]::OrdinalIgnoreCase))
         }
     }
-    return $null
+    return $holders
+}
+
+# The host ports this installation publishes, read from its own .env. The
+# preflight used to look at the panel's 7788 alone, so a collision on 7790 - the
+# advanced panel, which a second copy of the server publishes too - passed the
+# check with "OK: port panelu jest wolny" and then stopped compose after the
+# images were built: "Bind for 127.0.0.1:7790 failed: port is already
+# allocated". compose gives up on the first taken port, so the check has to know
+# all of them.
+function Get-M2StackHostPorts {
+    param([Parameter(Mandatory = $true)][string]$ServerRoot)
+
+    $envPath = Join-Path $ServerRoot 'linux-port\docker\.env'
+    $values = @{}
+    if (Test-Path -LiteralPath $envPath -PathType Leaf) {
+        foreach ($line in @([IO.File]::ReadAllLines($envPath))) {
+            if ("$line" -match '^\s*([A-Za-z0-9_]+)=(.*)$') { $values[$Matches[1]] = $Matches[2].Trim() }
+        }
+    }
+    $ports = @()
+    foreach ($entry in @(
+            @{ Key = 'M2_PANEL_PUBLIC_PORT'; Default = 7788; Name = 'panel WWW' },
+            @{ Key = 'M2_SEBAN_PANEL_PORT'; Default = 7790; Name = 'panel zaawansowany' },
+            @{ Key = 'M2_ITEMSHOP_PUBLIC_PORT'; Default = 7791; Name = 'ItemShop' },
+            @{ Key = 'M2_AUTH_PORT'; Default = 11000; Name = 'serwer logowania' },
+            @{ Key = 'M2_DB_PUBLISH_PORT'; Default = 3306; Name = 'baza danych' })) {
+        $value = [string]$values[$entry.Key]
+        $number = [int]$entry.Default
+        if ($value -match '^\d+$') { $number = [int]$value }
+        $ports += [pscustomobject]@{ Port = $number; Name = [string]$entry.Name }
+    }
+    # "13000-13002": each channel binds its own port and any one of them can be
+    # the one that is taken.
+    $first = 13000
+    $last = 13002
+    $range = [string]$values['M2_GAME_PORT_RANGE']
+    if ($range -match '^(\d+)\s*-\s*(\d+)$') { $first = [int]$Matches[1]; $last = [int]$Matches[2] }
+    elseif ($range -match '^(\d+)$') { $first = [int]$Matches[1]; $last = $first }
+    if ($last -lt $first) { $last = $first }
+    if (($last - $first) -gt 32) { $last = $first + 32 }
+    for ($p = $first; $p -le $last; $p++) {
+        $ports += [pscustomobject]@{ Port = [int]$p; Name = 'kanal gry' }
+    }
+    return $ports
+}
+
+# Containers of ANOTHER compose project sitting on this installation's ports.
+# This is the recurring half of "port jest juz zajety" on a machine that has
+# ever held a second copy of the server: every container ships with
+# restart: unless-stopped, so Docker Desktop brings the old project back up on
+# every engine start and it takes the ports before this installation can - which
+# is exactly why quitting Docker by hand does not help. `docker stop` is the fix
+# because that flag survives a restart; removing a volume never is.
+function Get-M2ForeignPortHolders {
+    param([Parameter(Mandatory = $true)][string]$ServerRoot)
+
+    $project = Get-M2InstallationProjectName -ServerRoot $ServerRoot
+    $ports = @(Get-M2StackHostPorts -ServerRoot $ServerRoot | ForEach-Object { [int]$_.Port })
+    $holders = @(Get-M2DockerPortHolders -Ports $ports -CurrentProject $project)
+    return @($holders | Where-Object { $_.Project -and -not $_.IsCurrentProject })
+}
+
+function Stop-M2ForeignPortHolders {
+    param([Parameter(Mandatory = $true)][string]$ServerRoot)
+
+    $stopped = @()
+    $seen = @{}
+    foreach ($holder in @(Get-M2ForeignPortHolders -ServerRoot $ServerRoot)) {
+        if ($seen.ContainsKey($holder.Project)) { continue }
+        $seen[$holder.Project] = $true
+        # The whole project, not just the container that answered: its siblings
+        # hold the remaining ports and the same restart policy would bring them
+        # back on the next engine start.
+        $ids = @(& docker ps -aq --filter ("label=com.docker.compose.project=" + $holder.Project) 2>$null |
+            Where-Object { $_ })
+        if ($ids.Count -eq 0) { continue }
+        & docker stop $ids 1>$null 2>$null
+        $stopped += [pscustomobject]@{
+            Project = [string]$holder.Project
+            WorkingDir = [string]$holder.WorkingDir
+            Containers = $ids.Count
+            Ports = @($holder.Ports)
+        }
+    }
+    return $stopped
 }
 
 # The TCP ranges Windows has reserved for itself (Hyper-V, WSL, NAT). A port
@@ -297,6 +496,62 @@ function Get-DockerDesktopCandidates {
         catch { }
     }
     return @($paths | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -Unique)
+}
+
+function Get-M2ClockSkewText {
+    param([int]$Seconds)
+    $s = [Math]::Abs($Seconds)
+    if ($s -ge 3600) { return ('{0} h {1:D2} min' -f [int][Math]::Floor($s / 3600), [int][Math]::Floor(($s % 3600) / 60)) }
+    if ($s -ge 60) { return ('{0} min' -f [int][Math]::Floor($s / 60)) }
+    return ('{0} s' -f $s)
+}
+
+function Get-M2InternetClockSkew {
+    # Seconds the Windows clock runs ahead (+) or behind (-) of the time an
+    # HTTPS server puts in its Date header; $null when none answered. Docker
+    # Desktop's machine takes the Windows clock, and apt inside a build refuses
+    # a Release file dated after it ("not valid yet"): Xewi's Windows ran three
+    # hours behind on 19 September and no build got past the panel's apt-get.
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+    $response = $null
+    $date = ''
+    $answeredAt = [DateTime]::UtcNow
+    try {
+        $request = [Net.HttpWebRequest]::Create('https://api.github.com/')
+        $request.Method = 'HEAD'
+        $request.Timeout = 4000
+        $request.UserAgent = 'metin2-playerbots-launcher'
+        try { $response = $request.GetResponse() }
+        catch {
+            # An HTTP error still carries the header. PowerShell hands the
+            # WebException over wrapped, so walk down to it.
+            $inner = $_.Exception
+            while ($inner -and -not ($inner -is [Net.WebException])) { $inner = $inner.InnerException }
+            if ($inner) { $response = $inner.Response }
+        }
+        $answeredAt = [DateTime]::UtcNow
+        if ($response) { $date = [string]$response.Headers['Date'] }
+    }
+    catch { return $null }
+    finally { if ($response) { $response.Close() } }
+    if (-not $date) { return $null }
+    $parsed = [DateTime]::MinValue
+    $styles = [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal
+    if (-not [DateTime]::TryParse($date, [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) { return $null }
+    return [int][Math]::Round(($answeredAt - $parsed).TotalSeconds)
+}
+
+function Get-M2DockerClockSkew {
+    # Seconds Docker's machine runs ahead (+) or behind (-) of Windows. It is
+    # set from Windows when it starts and can fall behind after the computer
+    # sleeps; a restart of Docker Desktop puts it right.
+    $probe = Invoke-M2DiagnosticProcess -FileName 'docker.exe' -Arguments 'info --format "{{.SystemTime}}"' -TimeoutMilliseconds 3500
+    if ($probe.ExitCode -ne 0 -or $probe.TimedOut) { return $null }
+    if ([string]$probe.Output -notmatch '(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?(Z|[+-]\d\d:\d\d)') { return $null }
+    $stamp = $Matches[1] + $(if ($Matches[2] -eq 'Z') { '+00:00' } else { $Matches[2] })
+    $parsed = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParseExact($stamp, "yyyy-MM-dd'T'HH:mm:sszzz", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsed)) { return $null }
+    return [int][Math]::Round(($parsed.UtcDateTime - [DateTime]::UtcNow).TotalSeconds)
 }
 
 function Get-M2DockerPreflight {
@@ -411,35 +666,82 @@ function Get-M2DockerPreflight {
     $portOwner = $null
     $dockerPortOwner = $null
     $currentProject = Get-M2InstallationProjectName -ServerRoot $root
+    $foreignHolders = @()
     if ($CheckPanelPort) {
-        $portOwner = Get-M2ListeningProcess -Port $panelPort
-        if ($portOwner) {
-            if ($dockerEngineReady) {
-                $dockerPortOwner = Get-M2DockerPortOwner -Port $panelPort -CurrentProject $currentProject
+        $busy = @()
+        foreach ($entry in @(Get-M2StackHostPorts -ServerRoot $root)) {
+            $listener = Get-M2ListeningProcess -Port ([int]$entry.Port)
+            if ($null -ne $listener) {
+                $busy += [pscustomobject]@{
+                    Port = [int]$entry.Port
+                    Name = [string]$entry.Name
+                    Listener = $listener
+                }
             }
-            if ($dockerPortOwner -and $dockerPortOwner.IsCurrentProject) {
-                [void]$checks.Add("OK: port panelu $panelPort należy do tej instalacji ($($dockerPortOwner.Container)).")
+        }
+        $holders = @()
+        if ($busy.Count -gt 0 -and $dockerEngineReady) {
+            $holders = @(Get-M2DockerPortHolders -Ports @($busy | ForEach-Object { [int]$_.Port }) -CurrentProject $currentProject)
+        }
+        if ($busy.Count -eq 0) {
+            [void]$checks.Add('OK: wszystkie porty serwera są wolne.')
+        }
+        foreach ($entry in $busy) {
+            $holder = @($holders | Where-Object { $_.Ports -contains [int]$entry.Port }) | Select-Object -First 1
+            if ($holder -and $holder.IsCurrentProject) {
+                [void]$checks.Add("OK: port $($entry.Port) ($($entry.Name)) należy do tej instalacji ($($holder.Container)).")
+            }
+            elseif ($holder) {
+                $where = if ($holder.WorkingDir) { ", folder $($holder.WorkingDir)" } else { '' }
+                [void]$checks.Add("BŁĄD: port $($entry.Port) ($($entry.Name)) zajmuje kontener $($holder.Container) z innej instalacji (projekt $($holder.Project)$where).")
+                $foreignHolders += $holder
+            }
+            elseif ($entry.Listener.Name -match '(?i)^(com\.docker|docker|vpnkit|wslrelay)') {
+                # Docker itself holds every published port on Windows, in the
+                # name of some container. Not recognising which one is a gap in
+                # this check, never a reason to refuse the start: saying "close
+                # com.docker.backend" to somebody whose own server is running is
+                # advice that cannot be followed.
+                [void]$checks.Add("UWAGA: port $($entry.Port) ($($entry.Name)) trzyma Docker ($($entry.Listener.Name)); nie rozpoznano kontenera - zakladam, ze to ta instalacja.")
+                [void]$warnings.Add("Port $($entry.Port) jest zajety przez Dockera. Jesli serwer nie wstanie, sprawdz DIAGNOSTYKA i zatrzymaj inne instalacje.")
             }
             else {
-                $ownerText = if ($dockerPortOwner) {
-                    "kontener $($dockerPortOwner.Container), projekt $($dockerPortOwner.Project)"
-                }
-                elseif ($portOwner.Name) { "proces $($portOwner.Name), PID $($portOwner.Pid)" }
-                else { "PID $($portOwner.Pid)" }
-                [void]$checks.Add("BŁĄD: port panelu $panelPort jest zajęty przez $ownerText.")
-                [void]$blocking.Add("Port $panelPort zajmuje inna aplikacja lub instalacja. Zatrzymaj poprzedni serwer albo uruchamiaj go z jego własnego folderu launchera.")
+                $who = if ($entry.Listener.Name) { "proces $($entry.Listener.Name), PID $($entry.Listener.Pid)" } else { "PID $($entry.Listener.Pid)" }
+                [void]$checks.Add("BŁĄD: port $($entry.Port) ($($entry.Name)) zajmuje $who.")
+                [void]$blocking.Add("Port $($entry.Port) ($($entry.Name)) zajmuje $who. Zamknij ten program albo zmień port w pliku linux-port\docker\.env.")
             }
         }
-        else {
-            [void]$checks.Add("OK: port panelu $panelPort jest wolny.")
+        if ($foreignHolders.Count -gt 0) {
+            $projects = @($foreignHolders | ForEach-Object { $_.Project } | Select-Object -Unique)
+            # Single quotes: PowerShell's tokenizer accepts the typographic
+            # double quotes as string delimiters, so the pair around the
+            # launcher's own menu entry ends a double-quoted string mid-sentence
+            # and the whole module stops parsing.
+            [void]$blocking.Add(
+                ('Porty serwera trzyma inna instalacja tego samego serwera (projekt: {0}). ' +
+                 'Launcher zatrzymuje ją sam przy GRAJ i przy ZAINSTALUJ AKTUALIZACJE, a w wersji ' +
+                 'konsolowej jest to opcja 21 (Zwolnij porty) - bez ruszania bazy, wolumenów i postępu. ' +
+                 'Jeśli ten komunikat wraca mimo to, uruchom Docker Desktop i spróbuj ponownie. ' +
+                 'Samo wyłączenie Dockera nie pomaga: te kontenery mają politykę restart=unless-stopped, ' +
+                 'więc wracają przy każdym starcie silnika i znów zajmują porty.') -f ($projects -join ', '))
         }
+        # Kept for callers that only ask about the panel.
+        $panelBusy = @($busy | Where-Object { [int]$_.Port -eq [int]$panelPort }) | Select-Object -First 1
+        if ($panelBusy) { $portOwner = $panelBusy.Listener }
+        $panelHolder = @($holders | Where-Object { $_.Ports -contains [int]$panelPort }) | Select-Object -First 1
+        if ($panelHolder) { $dockerPortOwner = $panelHolder }
     }
 
     # Ports the stack binds on the host, against the ranges Windows reserved.
     # The game ports are the ones that fail in practice: a range that starts
     # at 11000 or 13000 blocks the login server or the channel, and nothing
     # in the launcher used to say so.
-    $excludedRanges = Get-M2ExcludedPortRanges
+    # @(): a function's array of one unrolls to a bare object and of none to
+    # $null, and under StrictMode neither has .Count - every player whose
+    # Windows reserved exactly one port range (or none) got "The property
+    # 'Count' cannot be found on this object" from Start, StartDocker and
+    # Logs alike, because all three run this preflight.
+    $excludedRanges = @(Get-M2ExcludedPortRanges)
     if ($excludedRanges.Count -gt 0) {
         $envPath = Join-Path $root 'linux-port\docker\.env'
         $authPort = 11000
@@ -472,6 +774,30 @@ function Get-M2DockerPreflight {
         }
     }
 
+    # The clock: a warning and never a stop. The build tolerates a clock that
+    # runs behind where it cheaply can (the panel, the game's runtime stage),
+    # and nothing in the running server needs the right hour - but a fresh
+    # build of the game's libraries still asks apt, and the player is the only
+    # one who can put the clock right.
+    $clockSkew = Get-M2InternetClockSkew
+    if ($null -ne $clockSkew) {
+        if ([Math]::Abs($clockSkew) -le 300) {
+            [void]$checks.Add('OK: zegar Windows zgadza się z internetem.')
+        }
+        else {
+            $which = $(if ($clockSkew -lt 0) { 'spóźnia się' } else { 'śpieszy się' })
+            [void]$checks.Add(('UWAGA: zegar Windows {0} o {1} względem internetu.' -f $which, (Get-M2ClockSkewText $clockSkew)))
+            [void]$warnings.Add('Zegar Windows jest przestawiony, a Docker bierze czas od Windows - budowa serwera może się zatrzymać na komunikacie „Release file ... is not valid yet”. Ustawienia → Czas i język → Data i godzina: włącz „Ustaw czas automatycznie”, sprawdź strefę czasową (dla Polski: Warszawa) i kliknij „Synchronizuj teraz”. Potem zamknij Docker Desktop (ikona w zasobniku → Quit) i kliknij GRAJ.')
+        }
+    }
+    if ($dockerEngineReady) {
+        $dockerSkew = Get-M2DockerClockSkew
+        if ($null -ne $dockerSkew -and [Math]::Abs($dockerSkew) -gt 300) {
+            [void]$checks.Add(('UWAGA: zegar Dockera odbiega od zegara Windows o {0}.' -f (Get-M2ClockSkewText $dockerSkew)))
+            [void]$warnings.Add('Zegar maszyny Dockera rozjechał się z zegarem Windows (zdarza się po uśpieniu komputera). Zamknij Docker Desktop (ikona w zasobniku → Quit), uruchom go ponownie i kliknij GRAJ.')
+        }
+    }
+
     return [pscustomobject]@{
         CanStart = $blocking.Count -eq 0
         DockerCliPresent = $dockerCliPresent
@@ -481,6 +807,7 @@ function Get-M2DockerPreflight {
         Wsl = $wslState
         PanelPort = $panelPort
         CurrentProject = $currentProject
+        ForeignPortHolders = @($foreignHolders)
         Checks = @($checks)
         Warnings = @($warnings)
         BlockingIssues = @($blocking)
@@ -511,5 +838,10 @@ function Format-M2DockerPreflightReport {
 Export-ModuleMember -Function @(
     'Get-M2LauncherErrorGuidance',
     'Get-M2DockerPreflight',
-    'Format-M2DockerPreflightReport'
+    'Format-M2DockerPreflightReport',
+    'Get-M2StackHostPorts',
+    'Get-M2PublishedPortMatches',
+    'Get-M2DockerPortHolders',
+    'Get-M2ForeignPortHolders',
+    'Stop-M2ForeignPortHolders'
 )

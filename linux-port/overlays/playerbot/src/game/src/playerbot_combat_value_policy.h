@@ -31,7 +31,7 @@ enum Reason {
     REJECT_NO_EXP_EVIDENCE, REJECT_ZERO_EXP, REJECT_LOW_EXP,
     ALLOW_SELF_DEFENSE, ALLOW_PARTY_DEFENSE, ALLOW_QUEST,
     ALLOW_MATERIAL, ALLOW_EQUIPMENT, ALLOW_EXP,
-    REJECT_RESIDENCE_POLICY
+    REJECT_RESIDENCE_POLICY, REJECT_OUTGROWN_PREY, ALLOW_LURE
 };
 
 struct Policy {
@@ -54,9 +54,20 @@ struct Context {
     bool activeQuestTarget;
     bool activeMaterialTarget;
     bool activeEquipmentTarget;
+    // The pack a lure course is walking out to tag. A person's standing order
+    // puts the bot in COMMITTED_TRAVEL so it stops grinding between courses,
+    // and that refused the very monsters the course exists to fetch: the order
+    // was taken, "Juz dla ciebie luruje" was said, and every course ended
+    // "no_pack" a tick later while the bot stood beside the person (l0st3k,
+    // 20 September). What an errand mode names is not what it may refuse.
+    bool lureCourseTarget;
     // Obtain from the real server's EXP rules, not a copied level table.
     bool expEvidenceKnown;
     int levelExpPercent;
+    // Adapter sets this for a village monster far enough under the bot's
+    // level and far enough away that walking to it is a waste of the walk.
+    // Behind the objectives: an errand is still an errand.
+    bool outgrownPrey;
     // False if the engine's estimate proves the bot cannot receive EXP.
     // True requires at least positive eligible base EXP; see adapter contract.
     bool canReceiveExp;
@@ -64,8 +75,9 @@ struct Context {
     Context() : baseEligible(false), mode(OBJECTIVES),
         boundedSelfDefense(false), boundedPartyDefense(false),
         activeQuestTarget(false), activeMaterialTarget(false),
-        activeEquipmentTarget(false), expEvidenceKnown(false),
-        levelExpPercent(0), canReceiveExp(false) {}
+        activeEquipmentTarget(false), lureCourseTarget(false),
+        expEvidenceKnown(false),
+        levelExpPercent(0), outgrownPrey(false), canReceiveExp(false) {}
 };
 
 struct Decision {
@@ -79,6 +91,9 @@ inline Decision Evaluate(const Context& c, const Policy& p = Policy()) {
     if (c.mode == RETREAT) return Decision(false, REJECT_RETREAT);
     if (c.boundedSelfDefense) return Decision(true, ALLOW_SELF_DEFENSE);
     if (c.boundedPartyDefense) return Decision(true, ALLOW_PARTY_DEFENSE);
+    // Under defence and over the errand modes: fetching the pack IS the
+    // errand, and a bot saving its own life still does not stop to fetch one.
+    if (c.lureCourseTarget) return Decision(true, ALLOW_LURE);
     if (c.mode == COMMITTED_TRAVEL)
         return Decision(false, REJECT_COMMITTED_TRAVEL);
     if (c.activeQuestTarget) return Decision(true, ALLOW_QUEST);
@@ -88,6 +103,7 @@ inline Decision Evaluate(const Context& c, const Policy& p = Policy()) {
     // may still finish an errand here, but experience is not a reason to be
     // here at all.
     if (c.mode == SERVICE_ONLY) return Decision(false, REJECT_RESIDENCE_POLICY);
+    if (c.outgrownPrey) return Decision(false, REJECT_OUTGROWN_PREY);
     if (!c.expEvidenceKnown || c.levelExpPercent < 0)
         return Decision(false, REJECT_NO_EXP_EVIDENCE);
     if (!c.canReceiveExp || c.levelExpPercent == 0)
@@ -112,6 +128,8 @@ inline const char* ReasonName(Reason r) {
         case ALLOW_EQUIPMENT: return "equipment";
         case ALLOW_EXP: return "exp";
         case REJECT_RESIDENCE_POLICY: return "residence_policy";
+        case REJECT_OUTGROWN_PREY: return "outgrown_prey";
+        case ALLOW_LURE: return "lure_course";
     }
     return "unknown";
 }

@@ -18,6 +18,12 @@
 
 namespace
 {
+	// Defined with the luring course (playerbot_lure.h), which is included
+	// below this file: what a bot holding a person's order is waiting for
+	// before it sets off. A status line that says only "Czekam" is exactly
+	// what a person cannot report.
+	const char* GetPlayerBotLureWaitReason(DWORD dwPID);
+
 	// Whether a real player is close enough for any of this to be seen. The
 	// overhead text exists for them, so with nobody watching there is nothing
 	// to broadcast.
@@ -123,15 +129,62 @@ namespace
 			case BOT_ACTION_STALL: return "prowadze stragan";
 			case BOT_ACTION_MARKET: return "jestem na zakupach";
 			case BOT_ACTION_LURE: return "podciagam moby dla PT";
-			case BOT_ACTION_TOWN_REST: return "chodze po straganach";
+			case BOT_ACTION_TOWN_REST: return "odpoczywam w miescie";
+			case BOT_ACTION_MINING: return "kopie rude";
 			default: return "mysle";
 		}
 	}
 
+	// The line over a bot's head. On the 2.x line it is the server command
+	// "PlayerBotStatus <vid> <hex>", which the client root draws as a text tail
+	// and nothing else (playerbot_status_tail.py): the client puts every TALKING
+	// packet from a character into the chat history beside its tail
+	// (RecvChatPacket), so a town of bots filled the chat window with statuses.
+	// The text goes as hex because the client's command parser splits its line
+	// on spaces; the bytes are the status's CP1250, and the name stays out of it,
+	// because the client draws the name over the head already. A root without
+	// the handler writes "Unknown Server Command" to its syserr.txt and draws
+	// nothing. The r40250 client has no handler, so that line keeps talking.
 	void SendPlayerBotOverheadChat(LPCHARACTER ch, const char* szText)
 	{
 		if (!ch || !szText || !szText[0] || !ch->GetSectree())
 			return;
+
+#if defined(PLAYERBOT_ENGINE_MT2009)
+		static const char kHexDigits[] = "0123456789abcdef";
+		char hex[PLAYERBOT_STATUS_TAIL_MAX_BYTES * 2 + 1];
+		size_t n = 0;
+		for (; n < PLAYERBOT_STATUS_TAIL_MAX_BYTES && szText[n]; ++n)
+		{
+			unsigned char c = (unsigned char)szText[n];
+			// The client refuses a control byte; a space keeps the rest of the line.
+			if (c < 32 || c == 127)
+				c = ' ';
+			hex[n * 2] = kHexDigits[c >> 4];
+			hex[n * 2 + 1] = kHexDigits[c & 15];
+		}
+		hex[n * 2] = '\0';
+
+		char command[sizeof(hex) + 32];
+		int commandLen = snprintf(command, sizeof(command), "PlayerBotStatus %u %s",
+				(unsigned int)ch->GetVID(), hex);
+		if (commandLen <= 0 || commandLen >= (int)sizeof(command))
+			return;
+		++commandLen;   // the trailing NUL every chat packet carries
+
+		TPacketGCChat pack_command;
+		pack_command.header = HEADER_GC_CHAT;
+		pack_command.size = sizeof(TPacketGCChat) + commandLen;
+		pack_command.type = CHAT_TYPE_COMMAND;
+		pack_command.id = 0;   // the bot's VID travels in the command
+		pack_command.bEmpire = 0;
+
+		TEMP_BUFFER commandBuf;
+		commandBuf.write(&pack_command, sizeof(TPacketGCChat));
+		commandBuf.write(command, commandLen);
+		ch->PacketAround(commandBuf.read_peek(), commandBuf.size());
+		return;
+#endif
 
 		char chatbuf[256];
 		int len = snprintf(chatbuf, sizeof(chatbuf), "%s : %s", ch->GetName(), szText);
@@ -181,6 +234,11 @@ namespace
 		}
 	}
 
+	// Either side of a mercenary's contract, and the walk to offer one
+	// (playerbot_companions.h).
+	bool BuildPlayerBotMercStatus(LPCHARACTER ch, const TPlayerBotAIState& state, const char* prefix,
+			char* status, size_t statusSize);
+
 	void BuildPlayerBotStatusText(LPCHARACTER ch, const TPlayerBotAIState& state,
 			char* status, size_t statusSize)
 	{
@@ -189,6 +247,27 @@ namespace
 
 		const char* prefix = ch->GetParty() ? "[PT] " : "";
 		const char* goal = GetPlayerBotGoalLabel(state.bLongTermGoal);
+		// The Demon Tower: the floor a bot is on, or the raid it is going to
+		// (playerbot_demon_tower.h).
+		if (IsPlayerBotDemonTowerInstance(ch->GetMapIndex()))
+		{
+			LPDUNGEON dungeon = ch->GetDungeon();
+			snprintf(status, statusSize, "%sWieza Demonow: pietro %d", prefix,
+					dungeon ? GetPlayerBotDungeonLevel(dungeon) + 2 : 0);
+			return;
+		}
+		if (state.dwTowerRaidGuild != 0 || state.bTowerSummoned)
+		{
+			snprintf(status, statusSize, "%sZbiorka gildii: Wieza Demonow", prefix);
+			return;
+		}
+		// A guild war outranks every errand while it lasts (playerbot_guild_war.h).
+		if (state.dwGuildWarEnemyGID != 0)
+		{
+			CGuild* enemy = CGuildManager::instance().FindGuild(state.dwGuildWarEnemyGID);
+			snprintf(status, statusSize, "%sWojna gildii z %s", prefix, enemy ? enemy->GetName() : "?");
+			return;
+		}
 		if (state.bVisitingShop)
 		{
 			// "Handluje bronia (cel: zapasy)" says what the bot is standing at
@@ -234,36 +313,86 @@ namespace
 		// The luring course says which stage it is in, because "walking away
 		// from the party" and "bringing nine monsters back to it" look the same
 		// from outside and are not the same thing at all.
+		// A standing order says whose it is: an operator reading the panel wants
+		// to know that a bot standing about is waiting to pull for somebody, not
+		// that it has run out of things to do.
+		char forWhom[CHARACTER_NAME_MAX_LEN + 8];
+		forWhom[0] = 0;
+		if (state.dwLurePlayerPID != 0)
+		{
+			LPCHARACTER askedBy =
+					CHARACTER_MANAGER::instance().FindByPID(state.dwLurePlayerPID);
+			snprintf(forWhom, sizeof(forWhom), " dla %s",
+					askedBy ? askedBy->GetName() : "gracza");
+		}
 		if (state.bLureStage != LURE_STAGE_NONE)
 		{
 			switch (state.bLureStage)
 			{
 				case LURE_STAGE_PLAN:
-					snprintf(status, statusSize, "%sSzykuje lur dla druzyny", prefix);
+					snprintf(status, statusSize, "%sSzykuje lur%s", prefix,
+							forWhom[0] ? forWhom : " dla druzyny");
 					return;
 				case LURE_STAGE_RETURN:
-					snprintf(status, statusSize, "%sWracam do druzyny: prowadze %d mobow",
-							prefix, state.iLureChasing);
+					snprintf(status, statusSize, "%sWracam%s: prowadze %d mobow",
+							prefix, forWhom[0] ? forWhom : " do druzyny", state.iLureChasing);
 					return;
 				case LURE_STAGE_HANDOFF:
-					snprintf(status, statusSize, "%sPrzekazuje moby: %d przyprowadzonych, %d nadal za mna",
-							prefix, state.iLureDelivered, state.iLureChasing);
+					snprintf(status, statusSize, "%sPrzekazuje moby%s: %d przyprowadzonych, %d nadal za mna",
+							prefix, forWhom, state.iLureDelivered, state.iLureChasing);
 					return;
 				case LURE_STAGE_RECOVER:
-					snprintf(status, statusSize, "%sWstrzymuje lur: druzyna jeszcze walczy", prefix);
+					snprintf(status, statusSize, "%sWstrzymuje lur: %s jeszcze walczy",
+							prefix, forWhom[0] ? "gracz" : "druzyna");
 					return;
 				default:
-					snprintf(status, statusSize, "%sLuruje dla PT: %u/%u grupy, sciga mnie %d",
-							prefix, (unsigned int)state.bLureGroupsTagged,
+					snprintf(status, statusSize, "%sLuruje%s: %u/%u grupy, sciga mnie %d",
+							prefix, forWhom[0] ? forWhom : " dla PT",
+							(unsigned int)state.bLureGroupsTagged,
 							(unsigned int)state.bLureGroupsPlanned, state.iLureChasing);
 					return;
 			}
+		}
+		if (forWhom[0])
+		{
+			// And what it is waiting for. A bot reading "Czekam, zeby lurowac
+			// dla X" for twenty minutes and never setting off is the whole of
+			// what a person sees of this feature going wrong; the word in
+			// brackets is what turns that into a report somebody can act on.
+			const char* waitFor = GetPlayerBotLureWaitReason(ch ? ch->GetPlayerID() : 0);
+			if (waitFor)
+				snprintf(status, statusSize, "%sCzekam, zeby lurowac%s (%s)",
+						prefix, forWhom, waitFor);
+			else
+				snprintf(status, statusSize, "%sCzekam, zeby lurowac%s", prefix, forWhom);
+			return;
 		}
 		if (state.bRecoveringAfterDeath)
 		{
 			snprintf(status, statusSize, "%sOdpoczywam po smierci", prefix);
 			return;
 		}
+		// The two habits of a SLABY mood (playerbot_persona.h): a player
+		// looking at a bot standing still is told why.
+		{
+			const DWORD now = get_dword_time();
+			if (state.persona.dwAfkUntil != 0 && now < state.persona.dwAfkUntil)
+			{
+				snprintf(status, statusSize, "%sAFK - zaraz wracam", prefix);
+				return;
+			}
+			if (state.persona.dwPauseUntil != 0 && now < state.persona.dwPauseUntil)
+			{
+				snprintf(status, statusSize, "%sChwila przerwy", prefix);
+				return;
+			}
+		}
+
+		// A contract says whom the bot is with, unless it is fighting: then the
+		// fight says what it is fighting.
+		if (state.bCurrentAction != BOT_ACTION_FIGHT &&
+				BuildPlayerBotMercStatus(ch, state, prefix, status, statusSize))
+			return;
 
 		LPCHARACTER target = state.dwTargetVID != 0
 				? CHARACTER_MANAGER::instance().Find(state.dwTargetVID) : NULL;
@@ -308,6 +437,33 @@ namespace
 								target->GetName());
 					else if (distance > range)
 						snprintf(status, statusSize, "%sGonie %s", prefix, target->GetName());
+					else
+						snprintf(status, statusSize, "%sWalcze z %s", prefix, target->GetName());
+				}
+				else if (target && target->IsPC())
+				{
+					// A player: the Anti-PK protocol says why (playerbot_anti_pk.h);
+					// otherwise a duel or a war, which this line used to call
+					// "looking for an opponent" in the middle of the fight.
+					if (state.persona.dwFoeVID == (DWORD)target->GetVID())
+						switch (state.persona.bFoeReason)
+						{
+							case BOT_FOE_STRUCK:
+								snprintf(status, statusSize, "%sBronie sie przed %s", prefix, target->GetName());
+								break;
+							case BOT_FOE_PARTY:
+								snprintf(status, statusSize, "%sBronie druzyny przed %s", prefix, target->GetName());
+								break;
+							case BOT_FOE_GRUDGE:
+								snprintf(status, statusSize, "%sWracam po rewanz na %s", prefix, target->GetName());
+								break;
+							case BOT_FOE_STONE_RIVAL:
+								snprintf(status, statusSize, "%sOdganiam %s od Metina", prefix, target->GetName());
+								break;
+							default:
+								snprintf(status, statusSize, "%sWalcze z %s", prefix, target->GetName());
+								break;
+						}
 					else
 						snprintf(status, statusSize, "%sWalcze z %s", prefix, target->GetName());
 				}
@@ -401,8 +557,24 @@ namespace
 				else
 					snprintf(status, statusSize, "%sZakladam przynete na wedke", prefix);
 				break;
+			case BOT_ACTION_MINING:
+				// Walking to a vein and digging at one are different things to
+				// watch, and "Kopie rude" over a bot crossing the valley is the
+				// shape of mistake the Monkey Dungeon exit line already made.
+				if (ch->GetWear(WEAR_WEAPON) &&
+						ch->GetWear(WEAR_WEAPON)->GetType() == ITEM_PICK)
+					snprintf(status, statusSize, "%sKopie rude", prefix);
+				else
+					snprintf(status, statusSize, "%sIde do zyly rudy", prefix);
+				break;
 			case BOT_ACTION_TOWN_REST:
-				snprintf(status, statusSize, "%sOgladam stragany", prefix);
+				// The linger after a town errand. It reads as browsing only
+				// where there are counters to browse; on a world too young
+				// for a single stall it was "what stalls, there are none".
+				if (GetPlayerBotStallsOnMap(ch->GetMapIndex()) > 0)
+					snprintf(status, statusSize, "%sOgladam stragany", prefix);
+				else
+					snprintf(status, statusSize, "%sOdpoczywam w miescie", prefix);
 				break;
 			case BOT_ACTION_MARKET:
 				if (state.dwMarketStallVID != 0)
@@ -461,14 +633,34 @@ namespace
 				else if (state.bLongTermGoal == BOT_GOAL_REFINE)
 					snprintf(status, statusSize, "%sIde do kowala ulepszyc ekwipunek", prefix);
 				else if (state.bLongTermGoal == BOT_GOAL_BIOLOGIST)
-					snprintf(status, statusSize, "%sIde do Biologa", prefix);
+				{
+					// The Biologist only for a bot carrying the hand-in or visiting
+					// him: 27 of 68 bots in Orc Valley read "Ide do Biologa" with no
+					// tooth in the bag, hunting the row's monsters (m2zip, 17
+					// September) - the Biologist stands in the first village.
+					size_t missionIndex = 0;
+					const TPlayerBotBiologistMission* mission =
+							GetActivePlayerBotBiologistMission(ch, &missionIndex);
+					if (mission && !state.bVisitingBiologist &&
+							!PlayerBotBiologistHoldsHandIn(ch, mission, missionIndex))
+						snprintf(status, statusSize, "%sZbieram dla Biologa: %s", prefix, mission->itemLabel);
+					else
+						snprintf(status, statusSize, "%sIde do Biologa", prefix);
+				}
 				else if (state.bLongTermGoal == BOT_GOAL_FISHING)
 					snprintf(status, statusSize, "%sIde nad rzeke lowic ryby", prefix);
 				else if (state.bLongTermGoal == BOT_GOAL_GET_EQUIPMENT)
 					snprintf(status, statusSize, "%sIde do miasta po ekwipunek", prefix);
 				else
 				{
-					const long wantMap = GetPlayerBotFrontierMapForLevel(ch);
+					// The frontier only for a bot the travel would actually
+					// send there: a medal dropper never leaves for it
+					// (ShouldPlayerBotLeaveForFrontier), and eleven of them at
+					// thirty-three read "Ide na Pustynie Yongbi (cel: rozwoj
+					// konia)" in Bokjung while riding to the Monkey Dungeon
+					// (16 September).
+					const long wantMap = ShouldPlayerBotLeaveForFrontier(ch)
+							? GetPlayerBotFrontierMapForLevel(ch) : 0;
 					const char* where = wantMap != 0 && wantMap != ch->GetMapIndex()
 							? GetPlayerBotMapDestinationPl(wantMap) : "";
 					// The frontier is reached from Bokjung through the
@@ -478,8 +670,8 @@ namespace
 					// reads as a bot that cannot find the portal.
 					if (where[0] && IsPlayerBotM2Map(ch->GetMapIndex()) &&
 							ch->GetGold() < GetPlayerBotTeleporterFee(ch))
-						snprintf(status, statusSize, "%sZbieram yang na Teleporter %s (%d/%d)",
-								prefix, where, ch->GetGold(), GetPlayerBotTeleporterFee(ch));
+						snprintf(status, statusSize, "%sZbieram yang na Teleporter %s (%lld/%d)",
+								prefix, where, (long long)ch->GetGold(), GetPlayerBotTeleporterFee(ch));
 					else if (where[0])
 						snprintf(status, statusSize, "%sIde %s (cel: %s)", prefix,
 								where, goal);
@@ -492,7 +684,8 @@ namespace
 				// The head carries the sign in the world; the panel read
 				// "Planuje: poziom" for a keeper at its counter and an operator
 				// counted thirty-nine idle bots in the Joan square.
-				snprintf(status, statusSize, "%sProwadze stragan", prefix);
+				snprintf(status, statusSize, "%sProwadze stragan (%s)", prefix,
+						GetPlayerBotShopReasonName(state.bShopOpenReason));
 				break;
 			default:
 				snprintf(status, statusSize, "%sPlanuje: %s", prefix, goal);
@@ -561,6 +754,60 @@ namespace
 		state.bLastStatusParty = inParty;
 		state.dwLastStatusTargetVID = relevantTargetVID;
 	}
+
+#if defined(PLAYERBOT_ENGINE_MT2009)
+	// A bot's personality where a player's alignment title stands (Pabloo's
+	// proof of concept of 15 September, "osobowosc zamiast rangi"): the server
+	// command "PlayerBotTitle <vid> <personality>", drawn by the client root with
+	// textTail.AttachTitle and put back whenever an alignment refresh takes the
+	// place (playerbot_status_tail.py). Its own pass and its own clock beside
+	// ManagePlayerBotStatusOverhead: the panel's switch for the status line and a
+	// keeper's early return belong to that line, not to the title. A player's
+	// alignment title is untouched.
+	std::map<DWORD, DWORD> s_mapPlayerBotTitleNext;
+
+	void ManagePlayerBotPersonalityTitle(LPCHARACTER ch, TPlayerBotAIState& state, DWORD dwNow)
+	{
+		if (!ch || !ch->GetSectree())
+			return;
+		DWORD& next = s_mapPlayerBotTitleNext[ch->GetPlayerID()];
+		if (next != 0 && dwNow < next)
+			return;
+		CCheckNearbyHumanPlayer humanChecker(ch, 2500);
+		ch->GetSectree()->ForEachAround(humanChecker);
+		if (!humanChecker.m_bFound)
+		{
+			next = dwNow + PLAYERBOT_TITLE_PROBE_MS;
+			return;
+		}
+
+		// Under Iwakura's personalities the title is the one that claims the
+		// bot now, at PERSONA_TITLE_BASE + its id: a client that does not know
+		// those ids draws nothing, rather than an old personality's name.
+		const unsigned int titleId = (IsPlayerBotPersonaEnabled() && state.persona.bRestored)
+				? playerbot_persona::PERSONA_TITLE_BASE + (unsigned int)state.persona.bPersona
+				: (unsigned int)state.bPersonality;
+		char command[64];
+		int commandLen = snprintf(command, sizeof(command), "PlayerBotTitle %u %u",
+				(unsigned int)ch->GetVID(), titleId);
+		if (commandLen <= 0 || commandLen >= (int)sizeof(command))
+			return;
+		++commandLen;   // the trailing NUL every chat packet carries
+
+		TPacketGCChat pack_command;
+		pack_command.header = HEADER_GC_CHAT;
+		pack_command.size = sizeof(TPacketGCChat) + commandLen;
+		pack_command.type = CHAT_TYPE_COMMAND;
+		pack_command.id = 0;   // the bot's VID travels in the command
+		pack_command.bEmpire = 0;
+
+		TEMP_BUFFER commandBuf;
+		commandBuf.write(&pack_command, sizeof(TPacketGCChat));
+		commandBuf.write(command, commandLen);
+		ch->PacketAround(commandBuf.read_peek(), commandBuf.size());
+		next = dwNow + (DWORD)number((int)PLAYERBOT_TITLE_RESEND_MIN_MS, (int)PLAYERBOT_TITLE_RESEND_MAX_MS);
+	}
+#endif
 }
 
 #endif

@@ -184,6 +184,25 @@ namespace
 	};
 	typedef std::map<DWORD, TPlayerBotMarketLedgerEntry> TPlayerBotMarketLedger;
 	TPlayerBotMarketLedger s_mapMarketLedger;
+	// The same units by the map their counter stands on. A player - and the
+	// item finder - sees one map's counters, and a core-wide count could call
+	// a material plentiful while whole villages had none of it: on m2zip on
+	// 18 September 167 of 564 pairs of a recipe material the bots held two
+	// hundred of and a village had nothing on sale, Czarny Uniform 62 065 in
+	// bags and none in Pyongmoo or Bakra.
+	std::map<unsigned long long, DWORD> s_mapMarketLocalSupply;
+
+	unsigned long long PlayerBotMarketLocalKey(long lMapIndex, DWORD vnum)
+	{
+		return ((unsigned long long)(DWORD)lMapIndex << 32) | vnum;
+	}
+
+	DWORD GetPlayerBotMarketLocalSupply(long lMapIndex, DWORD vnum)
+	{
+		std::map<unsigned long long, DWORD>::const_iterator it =
+				s_mapMarketLocalSupply.find(PlayerBotMarketLocalKey(lMapIndex, vnum));
+		return it == s_mapMarketLocalSupply.end() ? 0 : it->second;
+	}
 	DWORD s_dwMarketLedgerTime = 0;
 	DWORD s_dwMarketReportTime = 0;
 	// The median of what a shopping bot has to spend, from the same walk. Zero
@@ -204,9 +223,12 @@ namespace
 		PLAYERBOT_LIST_PROBE,
 		PLAYERBOT_LIST_NO_DEMAND,
 		PLAYERBOT_LIST_OVERSTOCK,
+		// Listed because this village's counters hold less than a player's
+		// floor of it, whatever the bots are short of.
+		PLAYERBOT_LIST_FLOOR,
 		PLAYERBOT_LIST_DECISIONS
 	};
-	DWORD s_auMarketDecisions[PLAYERBOT_LIST_DECISIONS] = { 0, 0, 0, 0 };
+	DWORD s_auMarketDecisions[PLAYERBOT_LIST_DECISIONS] = { 0, 0, 0, 0, 0 };
 	// When each bot's decisions were last counted. The bag is scored again on
 	// every tick of the walk to the pitch - four times a second for half a
 	// minute - and counting each of those made one keeper with five held
@@ -222,7 +244,7 @@ namespace
 		return true;
 	}
 	const char* const s_apszMarketDecisionNames[PLAYERBOT_LIST_DECISIONS] = {
-		"LIST", "PROBE", "NO_DEMAND", "OVERSTOCK"
+		"LIST", "PROBE", "NO_DEMAND", "OVERSTOCK", "FLOOR"
 	};
 
 	const TPlayerBotMarketLedgerEntry* GetPlayerBotMarketLedgerEntry(DWORD vnum)
@@ -235,13 +257,15 @@ namespace
 	// the next refresh: three keepers scoring the same material in the same
 	// minute would otherwise each see the counters empty of it and all three
 	// put it up.
-	void AddPlayerBotMarketSupply(DWORD vnum, WORD count)
+	void AddPlayerBotMarketSupply(DWORD vnum, WORD count, long lMapIndex)
 	{
 		if (vnum == 0 || count == 0)
 			return;
 		TPlayerBotMarketLedgerEntry& entry = s_mapMarketLedger[vnum];
 		entry.dwSupplyUnits += count;
 		++entry.dwSupplyStalls;
+		if (lMapIndex > 0)
+			s_mapMarketLocalSupply[PlayerBotMarketLocalKey(lMapIndex, vnum)] += count;
 	}
 
 	// The unit price the world's counters last asked for a thing, keyed like
@@ -257,6 +281,32 @@ namespace
 	};
 	typedef std::map<DWORD, TPlayerBotAskMemory> TPlayerBotAskMap;
 	TPlayerBotAskMap s_mapAskMemory;
+
+	// The yang rate both memories were learned under. Every price Iwakura's
+	// sheet sets is scaled by the rate, and the memories hold plain yang: the
+	// ask anchor moves five percent per ten minutes and the sale median blends
+	// in whatever was paid, so after the operator moved mob_gold the counters
+	// went on asking the old rate's numbers for hours - a zero too many, or one
+	// too few. A new rate is a new market, so both are forgotten.
+	int s_iPlayerBotPriceRate = 0;
+
+	void ForgetPlayerBotPricesOnRateChange()
+	{
+		const int rate = CHARACTER_MANAGER::instance().GetMobGoldAmountRate(NULL);
+		if (rate == s_iPlayerBotPriceRate)
+			return;
+		if (s_iPlayerBotPriceRate != 0)
+		{
+			sys_log(0, "PLAYERBOT_MARKET: yang rate changed from %d to %d, forgetting asks=%u sales=%u",
+					s_iPlayerBotPriceRate, rate, (unsigned int)s_mapAskMemory.size(),
+					(unsigned int)s_mapSaleMemory.size());
+			s_mapAskMemory.clear();
+			s_mapSaleMemory.clear();
+		}
+		else
+			sys_log(0, "PLAYERBOT_MARKET: yang rate %d", rate);
+		s_iPlayerBotPriceRate = rate;
+	}
 
 	DWORD GetPlayerBotLastAsk(DWORD vnum, BYTE refine, DWORD dwNow)
 	{
@@ -277,6 +327,8 @@ namespace
 	DWORD LimitPlayerBotAskStep(DWORD vnum, BYTE refine, DWORD wanted, DWORD dwNow,
 			DWORD skillVnum = 0)
 	{
+		// Before the reference below is taken: a new rate clears the map.
+		ForgetPlayerBotPricesOnRateChange();
 		TPlayerBotAskMemory& mem = s_mapAskMemory[PlayerBotSaleKey(vnum, refine, skillVnum)];
 		// An anchor under the floor is not a price to step away from, it is an
 		// accident to forget. One yang got onto the counters because the median
@@ -315,6 +367,53 @@ namespace
 			mem.dwMovedTime = dwNow;
 		}
 		return unit;
+	}
+
+	// How hot a commodity is: how many times in a row it has left a counter
+	// almost as soon as it was put there. Iwakura's "wysoki popyt" - the bot
+	// notices and asks more next time, and keeps asking more while it keeps
+	// happening.
+	//
+	// Keyed like the sale memory, so a skill book counts per skill. This is a
+	// market-wide count on purpose: what it measures is how fast buyers take
+	// the thing, which is a fact about the thing and not about the keeper.
+	struct TPlayerBotDemandMemory
+	{
+		BYTE bFastSales;
+		DWORD dwLastFastSale;
+		TPlayerBotDemandMemory() : bFastSales(0), dwLastFastSale(0) {}
+	};
+	typedef std::map<DWORD, TPlayerBotDemandMemory> TPlayerBotDemandMap;
+	TPlayerBotDemandMap s_mapDemandMemory;
+
+	void NotePlayerBotFastSale(DWORD vnum, BYTE refine, DWORD dwNow, DWORD skillVnum = 0)
+	{
+		if (vnum == 0)
+			return;
+		TPlayerBotDemandMemory& mem = s_mapDemandMemory[PlayerBotSaleKey(vnum, refine, skillVnum)];
+		// A rush that stopped an hour ago is not a rush. Counted from the last
+		// quick sale rather than decremented on a timer, because nothing here
+		// runs on a clock of its own.
+		if (mem.dwLastFastSale != 0 && dwNow - mem.dwLastFastSale >= PLAYERBOT_MARKET_DEMAND_DECAY)
+			mem.bFastSales = 0;
+		if (mem.bFastSales < PLAYERBOT_MARKET_DEMAND_MAX_STEPS)
+			++mem.bFastSales;
+		mem.dwLastFastSale = dwNow;
+	}
+
+	// What to add to this keeper's asking price, in percent, or zero. Drawn per
+	// listing inside Iwakura's band, so two counters of a wanted thing do not
+	// show the same number.
+	int GetPlayerBotDemandPercent(DWORD vnum, BYTE refine, DWORD dwNow, DWORD skillVnum = 0)
+	{
+		TPlayerBotDemandMap::const_iterator it =
+				s_mapDemandMemory.find(PlayerBotSaleKey(vnum, refine, skillVnum));
+		if (it == s_mapDemandMemory.end() || it->second.bFastSales == 0)
+			return 0;
+		if (dwNow - it->second.dwLastFastSale >= PLAYERBOT_MARKET_DEMAND_DECAY)
+			return 0;
+		return (int)it->second.bFastSales *
+				number(PLAYERBOT_MARKET_DEMAND_MIN_PERCENT, PLAYERBOT_MARKET_DEMAND_MAX_PERCENT);
 	}
 
 	// The race a map is made of, as the population has seen it, or

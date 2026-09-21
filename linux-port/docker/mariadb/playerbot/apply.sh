@@ -243,6 +243,33 @@ if [ -n "$stranded" ] && [ "$stranded" -gt 0 ] 2>/dev/null; then
     echo "[playerbot-migrate] moved $stranded bot(s) back to their own kingdom"
 fi
 
+# A negative alignment on a bot is a bug's footprint, not a history: a bot has
+# no quarrel with its own kingdom. From 2.0.39 a duellist's blow went through
+# CHARACTER::Damage without asking whether the engine would allow it, so a
+# challenger struck before the other side had agreed and a winner went on
+# striking the respawned loser. The engine counted each such kill as a murder -
+# minus twenty thousand, shared over the killer's party - and bots of level
+# nine walked about as "Zlosliwy" (98 on our own world, the lowest at -151002).
+# Cleared here, before any core holds the bots in memory: a running core writes
+# its cached alignment back over an UPDATE.
+negative=$(db -e "
+    SELECT COUNT(*)
+      FROM player.player p
+      JOIN account.account a ON a.id = p.account_id
+     WHERE LEFT(a.login, 10) = 'playerbot_'
+       AND p.alignment < 0;
+")
+if [ -n "$negative" ] && [ "$negative" -gt 0 ] 2>/dev/null; then
+    db -e "
+        UPDATE player.player p
+          JOIN account.account a ON a.id = p.account_id
+           SET p.alignment = 0
+         WHERE LEFT(a.login, 10) = 'playerbot_'
+           AND p.alignment < 0;
+    "
+    echo "[playerbot-migrate] cleared the negative alignment of $negative bot(s)"
+fi
+
 # There used to be a step here that pulled every bot outside Orc Valley's
 # central island back onto it, from the days when the navigation refused
 # water and the island was all a bot could reach. The bridges are crossings
@@ -354,4 +381,44 @@ if [ -s "$names" ]; then
     rm -f "$names_out"
 else
     echo "[playerbot-migrate] no playerbot_names.sql; bots keep their seed names"
+fi
+
+# ---------------------------------------------------------------------------
+# A game master for the tester account.
+#
+# GM rights are one row in common.gmlist naming an account AND a character,
+# and the mt2009 package ships neither a row nor a character on `admin' - so
+# a world initialised before initdb created one (2.0.0, 2.0.1) has an admin
+# who can log in and command nothing, and the first report was exactly that:
+# "loguje sie admin admin, a tam nie ma postaci gm". The character the player
+# made in the meantime is the one they want the rights on, so this grants
+# IMPLEMENTOR to the tester account's oldest character, once, and only while
+# the list is empty: a world that has ever named a GM is left as it is, and a
+# world whose tester account was removed (M2_KEEP_DEMO_ACCOUNTS=0) has nothing
+# to grant to. A world that has no character on the account yet gets the row
+# on the first start after one is created. The db core reads the list at
+# boot, and this runs before the game container starts.
+# ---------------------------------------------------------------------------
+gm_rows=$(db -e "SELECT COUNT(*) FROM common.gmlist;" 2>/dev/null || echo x)
+if [ "$gm_rows" = "0" ]; then
+    gm_name=$(db -e "
+        SELECT p.name
+          FROM player.player AS p
+          JOIN account.account AS a ON a.id = p.account_id
+         WHERE a.login = 'admin'
+         ORDER BY p.id
+         LIMIT 1;
+    " 2>/dev/null || true)
+    if [ -n "$gm_name" ]; then
+        if db -e "
+            INSERT INTO common.gmlist (mAccount, mName, mContactIP, mServerIP, mAuthority)
+            VALUES ('admin', '$gm_name', '', 'ALL', 'IMPLEMENTOR');
+        "; then
+            echo "[playerbot-migrate] gmlist was empty: '$gm_name' on the admin account is IMPLEMENTOR now"
+        else
+            echo "[playerbot-migrate] WARNING: could not grant GM rights to '$gm_name'" >&2
+        fi
+    else
+        echo "[playerbot-migrate] gmlist is empty and the admin account has no character yet; the first one it gets becomes GM on the next start"
+    fi
 fi
